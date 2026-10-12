@@ -2,6 +2,9 @@ const VERBOSE = false;
 const PLATFORM = Process.platform;  // 'darwin' | 'windows'
 const ARCH = Process.arch;          // 'arm64' | 'x64' | 'x86_64' | ...
 
+// 新版 flue 需要显式写回连地址，端口与 package/devtools/constants.py 的 DEBUG_PORT 一致。
+const DEBUG_PORT = 9421;
+
 // ── Module Resolution ──
 
 const getMainModule = (version) => {
@@ -24,8 +27,32 @@ const SCENE_WHITELIST = [
 
 // ── CDP Filter Patch (shared logic, platform-specific pointer access) ──
 
-const patchCDPFilter = (base, offset) => {
+// 新版 flue 不能只改过滤结果的字段，得把整个 CastToJson 调用换掉。
+// credit: @Redbeanw44602, evi0s/WMPFDebugger PR #262
+const patchCDPFilterByCastToJson = (base, config) => {
+    const castToJsonFunc = new NativeFunction(
+        base.add(config.CastToJsonHookOffset),
+        "pointer",
+        ["pointer", "pointer"]
+    );
+    const callback = new NativeCallback(
+        (thiz, jsonOut, cborInput) => {
+            castToJsonFunc(jsonOut, cborInput);
+            return jsonOut;
+        },
+        "pointer",
+        ["pointer", "pointer", "pointer"]
+    );
+    Interceptor.replace(base.add(config.CDPFilterHookOffset), callback);
+};
+
+const patchCDPFilter = (base, config) => {
     // xref: SendToClientFilter / devtools_message_filter_applet_webview.cc
+    if (config.CastToJsonHookOffset) {
+        patchCDPFilterByCastToJson(base, config);
+        return;
+    }
+    const offset = config.CDPFilterHookOffset;
     Interceptor.attach(base.add(offset), {
         onEnter(args) {
             if (PLATFORM === "windows") {
@@ -112,6 +139,60 @@ const darwinPatchLoadStart2 = (base, offset, structOffset) => {
 
 // ── OnLoadStart: Windows ──
 
+// scene 命中白名单就改写成 1101，未命中返回 false。
+const winRewriteScene = (scenePtr) => {
+    const scene = scenePtr.readInt();
+    send(`[hook] scene: ${scene}`);
+    if (!SCENE_WHITELIST.includes(scene)) {
+        return false;
+    }
+    send("[hook] hook scene -> 1101");
+    scenePtr.writeInt(1101);
+    return true;
+};
+
+// 旧版配置：SceneOffsets 指针链（保持原有链路不动）。
+const winHijackLegacyScene = (a1, offsets) => {
+    const ptr1 = a1.add(56).readPointer().add(offsets[0]).readPointer();
+    const scenePtr = ptr1.add(8).readPointer().add(offsets[1]).readPointer().add(16).readPointer().add(488);
+    winRewriteScene(scenePtr);
+};
+
+// std::string 两种布局：短串内联（23 字节 + 1 字节长度），长串在堆上（指针 + 长度）。
+const winWriteWebSocketUrl = (stringPtr) => {
+    const url = `ws://localhost:${DEBUG_PORT}`;
+    if (stringPtr.add(23).readS8() < 0) {
+        stringPtr.readPointer().writeUtf8String(url);
+        stringPtr.add(8).writeU64(url.length);
+    } else {
+        stringPtr.writeUtf8String(url);
+        stringPtr.add(23).writeU8(url.length);
+    }
+    send(`[hook] websocket url -> ${url}`);
+};
+
+// 新版配置：MiniAppConfigStructOffsets，按上游 evi0s/WMPFDebugger 的链路走。
+const winHijackMiniAppConfig = (a1, structOffsets) => {
+    const launch = structOffsets.LaunchConfigOffsets || [];
+    const remote = structOffsets.RemoteDebugConfigOffsets || [];
+    const launchConfigPtr = a1
+        .add(launch[0]).readPointer()
+        .add(launch[1]).readPointer()
+        .add(launch[2]).readPointer();
+    const remoteDebugPtr = launchConfigPtr
+        .add(remote[0]).readPointer()
+        .add(remote[1]).readPointer();
+
+    if (!winRewriteScene(remoteDebugPtr.add(structOffsets.SceneOffset))) {
+        return;
+    }
+    // 新版 flue 的回连地址不再固定，需要显式写入，否则 CDP 连不回来。
+    winWriteWebSocketUrl(launchConfigPtr.add(structOffsets.WebSocketURLStringOffset));
+    const remoteDebugModePtr = remoteDebugPtr.add(structOffsets.RemoteDebugModeOffset);
+    send(`[hook] remote debug mode: ${remoteDebugModePtr.readInt()} -> 1`);
+    remoteDebugModePtr.writeInt(1);
+};
+
 const winPatchLoadStart = (base, config) => {
     // xref: AppletIndexContainer::OnLoadStart
     // Windows combines debug flag + scene hijack in one hook
@@ -121,16 +202,11 @@ const winPatchLoadStart = (base, config) => {
             if ((this.context.rdx & 0xff) !== 1) {
                 this.context.rdx = (this.context.rdx & ~0xff) | 0x1;
             }
-            // Scene hijack via SceneOffsets pointer chain
             try {
-                const offsets = config.SceneOffsets;
-                const ptr1 = this.context.rcx.add(56).readPointer().add(offsets[0]).readPointer();
-                const scenePtr = ptr1.add(8).readPointer().add(offsets[1]).readPointer().add(16).readPointer().add(488);
-                const scene = scenePtr.readInt();
-                send(`[hook] scene: ${scene}`);
-                if (SCENE_WHITELIST.includes(scene)) {
-                    send("[hook] hook scene -> 1101");
-                    scenePtr.writeInt(1101);
+                if (config.MiniAppConfigStructOffsets) {
+                    winHijackMiniAppConfig(this.context.rcx, config.MiniAppConfigStructOffsets);
+                } else {
+                    winHijackLegacyScene(this.context.rcx, config.SceneOffsets);
                 }
             } catch (e) {
                 send(`[hook] scene hook error: ${e}`);
@@ -216,7 +292,7 @@ const main = () => {
     const base = mainModule.base;
 
     // CDP filter patch — both platforms
-    patchCDPFilter(base, config.CDPFilterHookOffset);
+    patchCDPFilter(base, config);
 
     if (PLATFORM === "darwin") {
         darwinPatchLoadStart(base, config.LoadStartHookOffset);
