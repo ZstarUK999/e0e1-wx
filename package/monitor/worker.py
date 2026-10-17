@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from package.monitor.constants import MONITOR_INTERVAL_SECONDS
+from package.monitor.debug import configure_debug_log, debug_log
 from package.monitor.worker_cleanup import MonitorCleanupMixin
 from package.monitor.worker_commands import MonitorCommandMixin
 from package.monitor.worker_database import MonitorDatabaseMixin
@@ -45,6 +46,8 @@ class AsyncMiniProgramMonitorWorker(
         """Run the monitor loop inside the child process."""
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path = configure_debug_log(self.db_path.parent / "monitor-debug.log")
+            debug_log(f"worker 启动 monitor_id={self.monitor_id} root={self.root_path} db={self.db_path} log={log_path}")
             self.conn = sqlite3.connect(self.db_path)
             self.conn.row_factory = sqlite3.Row
             self.ensure_schema()
@@ -58,6 +61,7 @@ class AsyncMiniProgramMonitorWorker(
                 await self.scan_once()
                 await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
         except Exception as exc:
+            debug_log(f"worker 异常：{exc!r}")
             self.emit({"type": "error", "message": f"小程序监控异常：{exc}"})
         finally:
             await self.shutdown_cleanup_tasks()

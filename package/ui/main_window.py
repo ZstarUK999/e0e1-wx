@@ -24,6 +24,7 @@ from package.ui.constants import MONITOR_RECORDS_COALESCE_MS, STARTUP_SERVICES_D
 from package.ui.crypto_dialog import CryptoDialog
 from package.ui.main_window_controls import MainWindowControlsMixin
 from package.ui.main_window_monitor import MainWindowMonitorMixin
+from package.ui.offset_dialog import OffsetDialogController
 from package.ui.paths import config_path, output_root_path as default_output_root_path
 from package.ui.rules_dialog import RegexRulesDialog
 from package.ui.window_chrome import ChromeMainWindow
@@ -65,6 +66,8 @@ class MainWindow(MainWindowControlsMixin, MainWindowMonitorMixin, ChromeMainWind
         self.devtools_service.cloud_static_scan_failed.connect(self.on_cloud_static_scan_failed_logged)
         self.devtools_service.js_injection_state_changed.connect(self.on_js_injection_state_logged)
         self.devtools_service.state_changed.connect(self.on_js_injection_devtools_state_changed)
+        self.devtools_service.offset_detecting_changed.connect(self.on_offset_detecting_changed)
+        self.offset_dialog = OffsetDialogController(self)
         self.js_injection_service = JsInjectionCatalogService(self)
         self.js_injection_service.catalog_changed.connect(self.on_js_catalog_changed)
         self.js_injection_service.catalog_error.connect(self.on_js_catalog_error)

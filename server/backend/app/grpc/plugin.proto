@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package e0e1.plugin;
+
+// 插件与服务器之间的通道：登录鉴权一次，更新检查一次。
+service PluginService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc CheckUpdate(UpdateRequest) returns (UpdateResponse);
+}
+
+message License {
+  string license_id = 1;
+  string player_id = 2;
+  string issued_at = 3;
+  string nonce = 4;
+  string signature = 5;
+}
+
+message HandshakeRequest {
+  License license = 1;
+  string login_player_id = 2;   // 游戏里读到的 heroId
+  string guild_name = 3;        // 阴司名，只记录不校验
+  string client_version = 4;
+}
+
+message HandshakeResponse {
+  bool allowed = 1;
+  string reason = 2;        // 拒绝原因码
+  string message = 3;       // 给玩家看的中文提示
+  int64 server_time = 4;
+  string latest_version = 5;
+  bool update_required = 6;
+}
+
+message FileEntry {
+  string path = 1;
+  string sha256 = 2;
+  int64 size = 3;
+  string url = 4;
+}
+
+message UpdateRequest {
+  string client_version = 1;
+  string player_id = 2;
+  repeated FileEntry files = 3;   // 本地 app 目录的 path+sha256
+}
+
+message UpdateResponse {
+  string version = 1;
+  bool mandatory = 2;
+  string changelog = 3;
+  repeated FileEntry changed = 4; // 需要下载的文件
+  repeated string removed = 5;    // 需要删除的路径
+}

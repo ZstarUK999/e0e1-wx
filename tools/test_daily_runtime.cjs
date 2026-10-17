@@ -1,0 +1,134 @@
+// 日常正常UI适配测试，不运行微信。
+const test=require('node:test'), assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),path=require('node:path');
+function fixture(){
+ const events=[],cfg=Object.fromEntries(['MineUI','MineListUI','MineOtherUI','ChatUI','ChatRecruitUI','ArenaUI','ArenaChallengeUI','MineBattleUI','MinePveBattleResultUI','ArenaBattleResultUI'].map(id=>[id,{id}]));
+ const constants={MineCfg:{config:{MineExploreNum:3,MineGoodNum:4}},ArtifactMineCfg:{config:{ArtifactExploreNum:2,ArtifactGoodNum:5}}};
+ const defs={MineService:{},MagicService:{},ArenaService:{}};
+ for(const key of ['MineService','MagicService'])for(const name of ['recDigReward','startDig','getNeighbors','legionHelp','startRob'])defs[key][name]=()=>{};
+ defs.ArenaService.getArenaOpponent=()=>{};defs.ArenaService.arenaChallenge=()=>{};
+ const types={unlock_finish:1,unlock_filling:2,unlock_idle:3,unlock_work:4};
+ const ROLE={mine:{battleNumDay:1,helpNumDay:2},artifactMine:{battleNumDay:0,helpNumDay:0},legion:{legionId:1},arena:{dayBattleNum:2,dayRefreshNum:0}};
+ const windows=new Map(),views=new Map(); const button=(name,fn)=>({name,run:fn});
+ const makeItems=kind=>[1,3].map(state=>{const item={state};item.node={getComponent:Type=>Type==='MineItem'?item:button('cell:'+kind,()=>{const next=item.state===types.unlock_idle?types.unlock_work:types.unlock_idle;for(const entry of pages[kind].items)entry.state=next;})};return item;});
+ const pages={};for(const kind of ['sanshi','artifact']){pages[kind]={node:{activeInHierarchy:true},items:[]};pages[kind].items=makeItems(kind);pages[kind].mine_content={node_items:{children:pages[kind].items.map(i=>i.node)}};}
+ const logs=[];
+ const list={_curSelect:0,_dataList:[{id:10,siteNum:16,name:'甲',sName:'561服',legionName:'无',fightPower:1000},
+  {id:11,siteNum:0,name:'乙',sName:'561服',legionName:'阴司A',fightPower:2000}],view:{}};
+ list.view.list_record={getItemByListId:i=>({getComponent:()=>({btn_goto:button('goto:'+list._dataList[i].id,()=>{other._targetId=list._dataList[i].id;other._loadedTargetId=other._targetId;windows.set(cfg.MineOtherUI,{view:{mine_other_sanshi:other,mine_other_magic_artifact:other}});})})})};
+ list.view.btnTabGroup={children:[0,1].map(index=>({getComponent:()=>button('list-tab:'+index,()=>{list._curSelect=index;other._sameLegion=index===1;})}))};
+ let refreshIndex=0,refreshProvider=null;
+ list.view.btn_refresh=button('list-refresh',()=>{refreshIndex++;list._dataList=refreshProvider?refreshProvider(refreshIndex):[list._dataList[0]];});
+ const other={_sameLegion:false,btn_help:button('help',()=>{if(other._sameLegion)ROLE.mine.helpNumDay++;else{windows.set(cfg.MineBattleUI,battle);}})};
+ for(const kind of ['sanshi','artifact']){pages[kind].btn_other=button('open-list:'+kind,()=>{windows.set(cfg.MineListUI,list);});pages[kind].btn_recruit=button('open-recruit',()=>{windows.set(cfg.ChatUI,chat);windows.set(cfg.ChatRecruitUI,recruit);});}
+ const root={_mineType:0,view:{mine_sanshi:pages.sanshi,mine_magic_artifact:pages.artifact}};
+ root.view.btn_sanshi=button('kind:sanshi',()=>root._mineType=0);root.view.btn_magic_artifact=button('kind:artifact',()=>root._mineType=1);
+ const chat={view:{btn_close:button('close-chat',()=>windows.delete(cfg.ChatUI))}};
+ const recruitItem={lbl_status:{string:'发布招募'},btn_recruit:button('publish',()=>windows.delete(cfg.ChatRecruitUI))};
+ const recruit={view:{list:{getItemByListId:()=>({getComponent:()=>recruitItem})},btn_close:button('close-recruit',()=>windows.delete(cfg.ChatRecruitUI))}};
+ const arena={opponents:[{id:10,rankId:1},{id:11,rankId:2}],robotList:[],inSyncIng:false,view:{label_refreshTime:{string:'5/5'}}};
+ arena.view.btn_refresh=button('arena-refresh',()=>{ROLE.arena.dayRefreshNum++;arena.view.label_refreshTime.string='4/5';});
+ const confirm={view:{btn_challenge:button('confirm-challenge',()=>{ROLE.arena.dayBattleNum--;windows.set(cfg.MineBattleUI,battle);})}};
+ arena.view.list_items={getItemByListId:index=>({getComponent:()=>({roleInfo:arena.opponents[index],btn_challenge:button('target-challenge',()=>windows.set(cfg.ArenaChallengeUI,confirm))})})};
+ let blankResult=false,blankTaps=0;
+ const result=(which)=>{const screen=blankResult?{view:{},node:{activeInHierarchy:true,emit(type){
+   if(type==='touch-end'){blankTaps++;windows.delete(which);}
+ }}}:{view:{btn_close:button('close-result',()=>windows.delete(which))}};views.set(which,{ui:screen,params:[{result:1}]});return screen;};
+ const battle={view:{btn_skip:{node:{activeInHierarchy:true},interactable:true,run:()=>{events.push('official-skip');windows.delete(cfg.MineBattleUI);windows.set(cfg.ArenaBattleResultUI,result(cfg.ArenaBattleResultUI));windows.set(cfg.MinePveBattleResultUI,result(cfg.MinePveBattleResultUI));}}}};
+ const ui={findOpen:c=>windows.get(c),find:c=>views.get(c)||{ui:windows.get(c)}};
+ const h={configuration:()=>({cfg,data:constants,defs,cc:{Button:'Button'},Button:'Button'}),ui:()=>ui,
+  open:async c=>{events.push('open:'+c.id);if(c===cfg.MineUI)return root;if(c===cfg.ArenaUI)return arena;throw Error('未知页面');},
+  click:async b=>{assert.ok(b&&b.run,'UI按钮存在');events.push(b.name||'skip');await b.run();},
+  uiClass:async(module,name)=>name,listNode:async(list,i)=>list.getItemByListId(i),
+  wait:async predicate=>{const value=predicate();assert.ok(value,'正常UI响应未完成');return value;},bounded:async promise=>await promise,
+  observe:async(expected,action,verify)=>{assert.ok(expected.every(fn=>typeof fn==='function'));await action();assert.ok(verify());return {items:[]};},
+  dismissRewards:async()=>{},home:async()=>{},log:message=>logs.push(String(message))};
+ const g={ROLE,System:{import:async()=>({MineItemState:types})}};
+ const sandbox={setTimeout,clearTimeout};vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../package/daily_tasks/daily_runtime.js'),'utf8'),sandbox);
+ return {api:sandbox.createDailyRuntime(g,h),events,ROLE,cfg,windows,views,h,recruitItem,other,pages,logs,
+  setRefreshList:fn=>{refreshProvider=fn;},refreshCount:()=>refreshIndex,
+  useBlankResult:()=>{blankResult=true;},blankTaps:()=>blankTaps,
+  setInitialList:fn=>{list._dataList=fn();}};
+}
+test('independent tomb counts and normal collect/start UI',async()=>{const f=fixture();let a=await f.api.dispatch('tomb_state',{kind:'sanshi'});assert.equal(a.raid_remaining,2);assert.equal(a.fill_remaining,2);let b=await f.api.dispatch('tomb_state',{kind:'artifact'});assert.equal(b.raid_remaining,2);assert.equal(b.fill_remaining,5);assert.equal((await f.api.dispatch('tomb_collect',{kind:'sanshi'})).confirmed,true);assert.equal((await f.api.dispatch('tomb_start',{kind:'sanshi'})).confirmed,true);assert.ok(f.events.includes('cell:sanshi'));});
+test('recruit UI publish then exit channel, cooldown never publishes',async()=>{const f=fixture();assert.equal((await f.api.dispatch('tomb_recruit',{kind:'sanshi'})).confirmed,true);assert.ok(f.events.indexOf('publish')<f.events.indexOf('close-chat'));f.recruitItem.lbl_status.string='招募冷却中';await assert.rejects(f.api.dispatch('tomb_recruit',{kind:'sanshi'}),/冷却/);assert.equal(f.events.filter(e=>e==='publish').length,1);});
+test('fill list selects correct tab and no site count restriction',async()=>{const f=fixture();f.setRefreshList(()=>[{id:10,siteNum:16},{id:11,siteNum:0}]);const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});assert.equal(scan.targets[1].site_num,0);assert.equal(scan.targets[1].can_fill,true);assert.equal((await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11})).confirmed,true);assert.ok(f.events.includes('goto:11'));});
+
+test('targets carry public player fields shown by the list',async()=>{const f=fixture();const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:false});assert.deepEqual(JSON.parse(JSON.stringify(scan.targets[0])),{id:10,site_num:16,can_fill:false,name:'甲',server:'561服',legion:'无',fight_power:1000});assert.equal(scan.refresh_count,0);});
+
+test('scan refreshes at least five times and stops when no new player appears',async()=>{const f=fixture();const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true});assert.equal(f.refreshCount(),5);assert.equal(scan.refresh_count,5);assert.equal(scan.new_players,1);assert.deepEqual(scan.targets.map(t=>t.id),[10]);assert.ok(f.logs.some(line=>line.includes('刷新第5次')));assert.ok(f.logs.some(line=>line.includes('甲')&&line.includes('16')));});
+
+test('scan stops as soon as a target reaches the threshold so it stays clickable',async()=>{
+  const f=fixture();
+  // 初始列表不达标；第1次刷出3棺，第2次刷出20棺（达标），应立即停止。
+  f.setInitialList(()=>[{id:900,siteNum:5}]);
+  f.setRefreshList(index=>index===1?[{id:201,siteNum:3}]:[{id:200+index,siteNum:20}]);
+  const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true,minimum:16});
+  assert.equal(scan.refresh_count,2,'刷到达标目标就该停');
+  assert.equal(scan.reached_minimum,true);
+  assert.equal(scan.targets[0].site_num,20);
+  assert.ok(f.logs.some(line=>line.includes('停止刷新')),f.logs.join('|'));
+});
+
+test('scan does not refresh at all when the current list already has a qualifying target',async()=>{
+  const f=fixture();
+  const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true,minimum:16});
+  assert.equal(scan.refresh_count,0);
+  assert.equal(scan.reached_minimum,true);
+  assert.ok(f.logs.some(line=>line.includes('无需刷新')));
+});
+
+test('fill scan refreshes only once so it cannot exceed the task timeout',async()=>{const f=fixture();f.setRefreshList(index=>[{id:100+index,siteNum:20}]);const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});assert.equal(scan.refresh_count,1);assert.equal(f.refreshCount(),1);});
+
+test('scan keeps refreshing until the tenth try when new players keep coming',async()=>{const f=fixture();f.setRefreshList(index=>[{id:100+index,siteNum:20}]);const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true});assert.equal(f.refreshCount(),10);assert.equal(scan.refresh_count,10);assert.equal(scan.new_players,10);});
+test('tomb state exposes ready time and server clock for timers',async()=>{
+  const f=fixture();
+  const state=await f.api.dispatch('tomb_state',{kind:'sanshi'});
+  assert.equal(typeof state.server_now,'number');
+  assert.ok('next_ready_at' in state,'需要暴露下次到期时间');
+  assert.ok('cross_day_at' in state,'需要暴露跨日时刻');
+  // 给墓设置到期时间后应能读到（秒）
+  f.ROLE.mine.siteTime=new Map([[1,(state.server_now+3600)*1000]]);
+  const timed=await f.api.dispatch('tomb_state',{kind:'sanshi'});
+  assert.ok(Math.abs(timed.next_ready_at-(state.server_now+3600))<2,'应返回最近到期时间(秒)');
+});
+
+test('arena refresh and challenge use official skip and close result',async()=>{const f=fixture();assert.equal((await f.api.dispatch('arena_state',{})).tickets,2);assert.equal((await f.api.dispatch('arena_refresh',{})).refresh_remaining,4);const result=await f.api.dispatch('arena_challenge',{id:10});assert.equal(result.win,true);assert.ok(f.events.includes('target-challenge'));assert.ok(f.events.includes('confirm-challenge'));assert.ok(f.events.includes('official-skip'));assert.ok(f.events.includes('close-result'));});
+test('arena battle is skipped, waits for result and leaves the result page by blank tap',async()=>{
+  const f=fixture();
+  f.useBlankResult();  // 结算页没有关闭按钮，只能像手动那样点空白处退出
+  const result=await f.api.dispatch('arena_challenge',{id:10});
+  assert.equal(result.win,true);
+  assert.ok(f.events.includes('official-skip'),'进入战斗后应点官方跳过');
+  assert.equal(f.blankTaps(),1,'结算页应通过点击空白处退出');
+  assert.equal(f.windows.has(f.cfg.ArenaBattleResultUI),false);
+  assert.equal(f.windows.has(f.cfg.MineBattleUI),false);
+});
+
+test('challenge allows a long wait for the battle transition',async()=>{
+  const f=fixture();
+  const waits=[];
+  const original=f.h.observe;
+  f.h.observe=async(expected,action,verify,waitMs)=>{waits.push(waitMs);return await original(expected,action,verify,waitMs);};
+  await f.api.dispatch('arena_challenge',{id:10});
+  assert.ok(waits.includes(30000),'战斗转场需要比普通请求更长的等待：'+waits.join(','));
+});
+
+test('battle screen is resolved from BattleUICfgId even when CommonUICfgId lacks it',async()=>{
+  const f=fixture();
+  // 真实游戏：战斗界面 id 只在 BattleUICfgId，CommonUICfgId 里查不到。
+  f.cfg.MineBattleUI={id:'NotARealBattleUI'};
+  const battleId={id:'MineBattleUI'};
+  f.h.battleCfg=async()=>({MineBattleUI:battleId});
+  const screen={view:{btn_close:{node:{activeInHierarchy:true},interactable:true,run(){f.windows.delete(f.cfg.ArenaBattleResultUI);}}}};
+  f.windows.set(battleId,{view:{btn_skip:{node:{activeInHierarchy:true},interactable:true,run(){
+    f.events.push('official-skip');
+    f.windows.delete(battleId);
+    f.views.set(f.cfg.ArenaBattleResultUI,{ui:screen,params:[{result:1}]});
+    f.windows.set(f.cfg.ArenaBattleResultUI,screen);
+  }}}});
+  const result=await f.api.dispatch('arena_challenge',{id:10});
+  assert.equal(result.win,true);
+  assert.ok(f.events.includes('official-skip'));
+});
+
+test('no challenge ticket never opens confirmation',async()=>{const f=fixture();f.ROLE.arena.dayBattleNum=0;await assert.rejects(f.api.dispatch('arena_challenge',{id:10}),/次数/);assert.ok(!f.events.includes('target-challenge'));});

@@ -1,0 +1,43 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Microsoft YaHei", system-ui, sans-serif;
+  background: #f6f7f9;
+  color: #1f2430;
+}
+header {
+  display: flex; align-items: center; gap: 18px;
+  padding: 0 20px; height: 54px;
+  background: #1f2430; color: #fff;
+}
+header .brand { font-weight: 600; }
+header nav { display: flex; gap: 14px; flex: 1; }
+header nav a { color: #b9c0cc; text-decoration: none; font-size: 14px; }
+header nav a.active, header nav a:hover { color: #fff; }
+header .who { font-size: 13px; color: #9aa3b2; }
+main { padding: 22px; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 16px; }
+.hidden { display: none !important; }
+.hint { color: #6b7280; font-size: 13px; margin: 4px 0 12px; }
+form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+input, button { padding: 7px 10px; font-size: 14px; border-radius: 5px; border: 1px solid #d3d8e0; }
+button { background: #2f6fed; color: #fff; border: none; cursor: pointer; }
+button:hover { background: #2559c8; }
+button.link { background: none; color: #2f6fed; padding: 2px 6px; }
+button.link:hover { text-decoration: underline; background: none; }
+button.danger { color: #d0342c; }
+label.inline { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+table.grid { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
+table.grid th, table.grid td { padding: 9px 10px; border-bottom: 1px solid #eceff3; text-align: left; }
+table.grid th { background: #f0f2f5; color: #4b5563; font-weight: 600; }
+td.ok { color: #1a7f37; }
+td.bad { color: #d0342c; }
+.error { color: #d0342c; font-size: 13px; }
+.toast {
+  position: fixed; right: 20px; bottom: 20px;
+  background: #1f2430; color: #fff; padding: 10px 16px; border-radius: 6px; font-size: 14px;
+}
+.toast.error { background: #b42318; }
+#login-view { max-width: 320px; margin: 60px auto; }
+#login-view form { flex-direction: column; align-items: stretch; }
+#login-view label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }

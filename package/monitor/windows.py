@@ -5,12 +5,25 @@ import ctypes.wintypes
 import sys
 from pathlib import Path
 
+from package.monitor.debug import debug_log
+
 try:
     import psutil
 except ImportError:
     psutil = None
 
 INVALID_WINDOW_TITLES = {"微信", "HintWnd", "Sogou_TSF_UI", "MSCTFIME UI", "Default IME"}
+
+
+def wechat_app_process_count() -> int:
+    """统计当前运行的 WeChatAppEx.exe 进程数量。"""
+    if psutil is None:
+        return -1
+    return sum(
+        1
+        for process in psutil.process_iter(["name"])
+        if str(process.info.get("name") or "").lower() == "wechatappex.exe"
+    )
 
 
 def process_details(pid: int) -> dict:
@@ -162,4 +175,6 @@ def list_wechat_app_windows() -> list[dict]:
 
     user32.EnumWindows(enum_window, 0)
     windows.sort(key=lambda item: (item.get("start_time") or 0.0, item.get("pid") or 0))
+    if not windows:
+        debug_log(f"未枚举到小程序窗口（WeChatAppEx.exe 进程数={wechat_app_process_count()}）")
     return windows

@@ -10,6 +10,7 @@ from package.decompiler.auto_cache import delete_auto_process_entries
 from package.decompiler.cache_keys import auto_process_cache_path
 from package.decompiler.core import path_inside_root, safe_output_folder_path
 from package.monitor.constants import FOLDER_GROUP_TOLERANCE_SECONDS
+from package.monitor.debug import debug_log
 from package.monitor.paths import build_monitor_scan_roots, cleanup_wx_directories, resolve_packages_roots
 from package.monitor.utils import is_safe_applet_packages_dir
 
@@ -22,7 +23,12 @@ class MonitorFileMixin:
     def monitor_scan_roots(self) -> list[Path]:
         """Return candidate roots that may contain WeChat applet packages."""
         home_dir = getattr(self, "home_dir", None)
-        return build_monitor_scan_roots(self.configured_packages_root(), home_dir=home_dir)
+        roots = build_monitor_scan_roots(self.configured_packages_root(), home_dir=home_dir)
+        summary = ", ".join(f"{root}{'' if root.exists() else ' [不存在]'}" for root in roots)
+        if summary != getattr(self, "_last_scan_roots_summary", None):
+            self._last_scan_roots_summary = summary
+            debug_log(f"扫描根目录({len(roots)}): {summary or '无'}")
+        return roots
 
     def packages_roots(self, create_missing: bool = False) -> list[Path]:
         """Resolve candidate roots into real packages roots."""
@@ -49,6 +55,11 @@ class MonitorFileMixin:
                     continue
                 seen.add(key)
                 roots.append(candidate)
+        roots_key = tuple(str(root) for root in roots)
+        if roots_key != getattr(self, "_last_packages_roots_key", None):
+            self._last_packages_roots_key = roots_key
+            summary = ", ".join(f"{root}{'' if root.exists() else ' [不存在]'}" for root in roots)
+            debug_log(f"有效 packages 根目录({len(roots)}): {summary or '无'}")
         return roots
 
     def discover_package_dirs(self, base: Path | None = None, *, packages_root: Path | None = None) -> dict[str, float]:
@@ -99,6 +110,11 @@ class MonitorFileMixin:
             discovered = self.discover_package_dirs(packages_root, packages_root=packages_root)
             if discovered:
                 snapshot[str(packages_root)] = discovered
+        total = sum(len(dirs) for dirs in snapshot.values())
+        signature = tuple(sorted((root, tuple(sorted(dirs))) for root, dirs in snapshot.items()))
+        if signature != getattr(self, "_last_snapshot_signature", None):
+            self._last_snapshot_signature = signature
+            debug_log(f"包目录快照: 共 {total} 个 " + str({root: sorted(dirs) for root, dirs in snapshot.items()} or "空"))
         return snapshot
 
     def flatten_snapshot_dirs(self, snapshot: dict[str, dict[str, float]]) -> list[tuple[str, str, float]]:

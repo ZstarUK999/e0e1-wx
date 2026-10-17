@@ -11,6 +11,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from package.devtools import offset_autodetect
 from package.devtools.connection_stability import MiniappConnectionStabilizer
 from package.devtools.protocol_codec import wrap_debug_message_data, unwrap_debug_message_data
 from package.devtools.protocol_userscript import (
@@ -505,12 +506,45 @@ class DebugEngine:
 
         return frida
 
+    @staticmethod
+    def _is_radium_wmpf_path(proc_path: str) -> bool:
+        """判断进程路径是否属于微信小程序运行环境（排除企业微信 WXWork 的同名进程）。"""
+        normalized = str(proc_path or "").replace("/", "\\").lower()
+        return "radiumwmpf" in normalized and "wmpf_applet" not in normalized
+
+    def _detect_wmpf_version(self, proc_path: str) -> int:
+        """从 RadiumWMPF 目录解析运行环境版本，取数字最大的版本目录。
+
+        不能按「有没有配置文件」挑版本：那样会拿旧版本的偏移去 hook 新版本运行时
+        （例如用 25715 的配置 hook 实际加载的 25799），直接把小程序搞崩。
+        缺配置时由 _start_frida_sync 走自动检测兜底。
+        """
+        runtime_dir = Path(str(proc_path or "")).parent
+
+        # 1) 路径里带纯数字目录段（如 ...\RadiumWMPF\25715\WeChatAppEx.exe）
+        for part in reversed(runtime_dir.parts):
+            if part.isdigit():
+                return int(part)
+
+        # 2) 可执行文件直接放在 RadiumWMPF 根目录时，扫它的数字子目录
+        candidates = sorted(
+            (int(entry.name) for entry in runtime_dir.iterdir() if entry.is_dir() and entry.name.isdigit()),
+            reverse=True,
+        ) if runtime_dir.is_dir() else []
+        if not candidates:
+            raise RuntimeError("[frida] cannot detect WMPF version from path")
+        return candidates[0]
+
     def _find_wmpf_pids_win(self):
         """Windows: find the main WeChatAppEx.exe PID via PPID frequency."""
         frida = self._load_frida()
         device = frida.get_local_device()
         processes = device.enumerate_processes(scope="metadata")
-        wmpf_procs = [process for process in processes if process.name == "WeChatAppEx.exe"]
+        wmpf_procs = [
+            process
+            for process in processes
+            if process.name == "WeChatAppEx.exe" and self._is_radium_wmpf_path(process.parameters.get("path", ""))
+        ]
         if not wmpf_procs:
             raise RuntimeError("[frida] WeChatAppEx.exe process not found")
 
@@ -524,10 +558,7 @@ class DebugEngine:
             raise RuntimeError("[frida] could not locate main WMPF process")
 
         proc_path = main_proc.parameters.get("path", "")
-        numbers = re.findall(r"\d+", proc_path)
-        if not numbers:
-            raise RuntimeError("[frida] cannot detect WMPF version from path")
-        version = int(numbers[-1])
+        version = self._detect_wmpf_version(proc_path)
         if version == 0:
             raise RuntimeError("[frida] invalid WMPF version")
 
@@ -584,7 +615,26 @@ class DebugEngine:
 
         config_path = tools_root() / "config" / platform_dir / f"addresses.{wmpf_version}.json"
         if not config_path.exists():
-            raise RuntimeError(f"[frida] version config not found: {platform_dir}/{wmpf_version}")
+            # 兜底：本机出现新版本运行时时，现算偏移并落盘，之后照常从磁盘读。
+            if is_mac:
+                raise RuntimeError(
+                    f"[frida] macOS 不支持自动检测，请手动补充 tools/config/mac/addresses.{wmpf_version}.json"
+                )
+            self._notify_status("message", f"正在自动检测 {wmpf_version} 偏移…")
+            self._notify_status("offset_detect", True)
+            try:
+                detected = offset_autodetect.detect_offsets_sync(pids[0], frida=frida)
+                normalized = offset_autodetect.normalize_detected_config(wmpf_version, detected)
+                saved_path = offset_autodetect.persist_addresses_config(
+                    wmpf_version, normalized, platform_dir
+                )
+                logger.info(f"[frida] 自动检测完成，偏移已写入 {saved_path}")
+            except Exception as exc:
+                raise RuntimeError(f"[frida] 版本 {wmpf_version} 偏移自动检测失败：{exc}") from None
+            finally:
+                # 不清空的话 bridge 结束时还会再推一次状态，界面会一直挂着检测提示。
+                self._notify_status("offset_detect", False)
+                self._notify_status("message", "")
 
         script_content = hook_path.read_text(encoding="utf-8")
         config_content = json.dumps(json.loads(config_path.read_text(encoding="utf-8")))

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name 玩家信息导出
-// @description 打开玩家信息界面（Setting / setting_ui）时，按界面显示方式解析该玩家 GDRoleSnap 快照（天书/三尸/脸谱/鬼仆阵法/法器），输出可读文本；含被对方隐藏的部分。注入后可手动调用 dumpPlayerInfo()。
+// @description 打开玩家信息界面（Setting）时，按界面显示方式解析 GDRoleSnap 快照（天书/三尸/脸谱/鬼仆阵法/法器），用配置表把 ID 翻成中文名并展开词条效果。含被对方隐藏的部分。注入后可手动调用 dumpPlayerInfo()。
 // @match *
 // @run-at document-start
 // @e0e1-mode once
@@ -8,70 +8,26 @@
 
 // 说明：本脚本以语句形式直接执行（e0e1 的注入包装是 async 函数，可直接使用 await）。
 // 数据来源：UISetting.onOpen → RoleService.getRolePreviewInfo → resp.preview（GDRoleSnap，game.js:39868）
-// 名称解析：System.import("chunks:///_virtual/configs.ts") 取配置表，用 getById 把 ID 翻成名字。
-// 工具默认注入到 top 上下文，游戏在 name="gameContext" 的 iframe 里，需要跨进去拿全局。
+// 名称解析：System.import("chunks:///_virtual/configs.ts") 拿配置表，getById 翻译。
+// 结构映射由 tools/cdp_deep_probe.py 实测内存结构确认。
+// 工具默认注入到 top 上下文，游戏在 name="gameContext" 的 iframe 里，需跨进去取全局。
 
 // EPreviewHideType（game.js:37382）
 var E0E1_HIDE_NAMES = { 0: "天书", 1: "三尸", 2: "脸谱", 3: "鬼仆阵法", 4: "法器" };
 
-// 各分区字段 → 用于翻译 ID 的配置表（均导出自 configs.ts，game.js:30096 起）
-var E0E1_SECTIONS = [
-  {
-    name: "天书",
-    fields: [
-      { field: "skillLevel", cfg: "SkillBookCfg", kind: "level" },
-      { field: "skillCombineLevel", cfg: "RareskillCombCfg", kind: "level" },
-      { field: "equipSkill", cfg: "EvolutionSkillCfg", kind: "level" },
-      { field: "extEquipSkill", cfg: "EvolutionSkillCfg", kind: "level" },
-      { field: "epicLevel", cfg: "SkillBookCfg", kind: "level" },
-      { field: "epicAwakening", cfg: "SkillBookCfg", kind: "level" }
-    ]
-  },
-  {
-    name: "三尸",
-    fields: [
-      { field: "desirePlan", cfg: "DesireCfg", kind: "obj" },
-      { field: "allDesirePlan", cfg: "DesireCfg", kind: "obj" }
-    ]
-  },
-  {
-    name: "脸谱",
-    fields: [
-      { field: "equipment", cfg: "EquipmentCfg", kind: "equip" },
-      { field: "equipmentSuit", cfg: "EquipmentSuitCfg", kind: "level" },
-      { field: "equipmentPlanSkill", cfg: "SkillBookCfg", kind: "level" }
-    ]
-  },
-  {
-    name: "鬼仆阵法",
-    fields: [
-      { field: "pet", cfg: "PetCfg", kind: "pet" },
-      { field: "formationPetInfo", cfg: "PetCfg", kind: "raw" },
-      { field: "formationPetSkill", cfg: "PetSkillCfg", kind: "level" }
-    ]
-  },
-  {
-    name: "法器",
-    fields: [
-      { field: "magic", cfg: "MagicArtifactBaseCfg", kind: "raw" }
-    ]
-  },
-  {
-    name: "其他",
-    fields: [
-      { field: "attribute", cfg: "AttrCfg", kind: "raw" },
-      { field: "achieve", cfg: "AchieveCfg", kind: "raw" },
-      { field: "fashion", cfg: "FashionCfg", kind: "raw" },
-      { field: "unlockModuleIds", cfg: null, kind: "module" }
-    ]
-  }
-];
-
-// ModuleType（game.js:30269 起），只列玩家信息里常见的几个
+// ModuleType（game.js:30273），官方没有中文注释表，这里按枚举名翻译
 var E0E1_MODULE_NAMES = {
-  1: "关卡", 2: "属性成长", 3: "技能", 4: "招募", 7: "图鉴", 9: "鬼仆", 10: "阴司",
-  16: "心愿", 18: "百鬼夜行", 23: "脸谱", 25: "摸金行动", 26: "好友", 27: "组队",
-  30: "跨服", 31: "赛季竞技", 33: "走阴", 34: "斗法", 36: "法器", 38: "赛季"
+  1: "关卡", 2: "属性成长", 3: "技能", 4: "招募", 5: "天书特技", 6: "外观", 7: "图鉴",
+  8: "基础属性", 9: "鬼仆", 10: "阴司", 11: "技能超限", 12: "挑战", 14: "丹药",
+  15: "鬼仆随机", 16: "心愿", 17: "人气招募", 18: "百鬼夜行", 19: "奖励渠道", 20: "影院",
+  21: "鬼仆阵法", 22: "稀有技组合", 23: "脸谱", 24: "天书觉醒", 25: "摸金行动",
+  26: "好友", 27: "组队", 28: "成就", 29: "更多", 30: "跨服", 31: "赛季竞技",
+  32: "基础水晶", 33: "走阴", 34: "斗法", 35: "斗法切磋", 36: "法器", 37: "好友对战",
+  38: "赛季", 39: "赛季副本",
+  101: "邮件", 102: "商店", 103: "聊天", 104: "七日", 105: "任务", 106: "随机商店",
+  107: "特权", 108: "背包", 109: "战令", 110: "首充", 111: "排行", 112: "挂机",
+  113: "世界BOSS", 114: "挑战副本", 115: "鬼仆副本", 116: "开服七日", 117: "周末",
+  118: "阴墟", 119: "阴司货运", 120: "推送礼包", 121: "皮肤礼包"
 };
 
 var E0E1_BASE_FIELDS = [
@@ -81,7 +37,14 @@ var E0E1_BASE_FIELDS = [
   ["chargeTotal", "累计充值"], ["stageWave", "关卡波次"], ["loginOutAt", "最后登出"]
 ];
 
-// ── 跨上下文：工具注入到 top，游戏在 name="gameContext" 的 iframe 里 ──
+// 未确认归属的 ID 用这张有序候选表兜底，取第一个能翻出中文名的
+var E0E1_FALLBACK_TABLES = [
+  "PetSkillCfg", "PetRandomSkillCfg", "PetSamsaraCfg", "SkillBookCfg",
+  "MagicArtifactEntryCfg", "MagicArtifactStoneCfg", "MagicArtifactTemperCfg",
+  "MagicArtifactCollectionCfg", "MagicArtifactBaseCfg", "EquipmentEntryCfg", "ItemCfg"
+];
+
+// ── 跨上下文 ──
 
 function e0e1ResolveGameWindow() {
   try {
@@ -102,7 +65,20 @@ function e0e1ResolveGameWindow() {
   return null;
 }
 
-// ── 配置表：把 ID 翻成人能看的名字 ──
+function e0e1IsMap(value) {
+  return !!value && Object.prototype.toString.call(value) === "[object Map]";
+}
+
+function e0e1ForEachMap(value, limit, fn) {
+  if (!e0e1IsMap(value)) return;
+  var i = 0;
+  value.forEach(function (item, key) {
+    if (i++ >= limit) return;
+    fn(item, key);
+  });
+}
+
+// ── 配置表 ──
 
 var e0e1CfgModule = null;
 var e0e1CfgTried = false;
@@ -115,8 +91,7 @@ async function e0e1LoadCfg() {
     var loader = game && game.System;
     if (loader && typeof loader.import === "function") {
       var timeout = new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 3000); });
-      var loaded = loader.import("chunks:///_virtual/configs.ts");
-      e0e1CfgModule = await Promise.race([loaded, timeout]) || null;
+      e0e1CfgModule = await Promise.race([loader.import("chunks:///_virtual/configs.ts"), timeout]) || null;
     }
   } catch (error) {
     e0e1CfgModule = null;
@@ -124,7 +99,7 @@ async function e0e1LoadCfg() {
   return e0e1CfgModule;
 }
 
-function e0e1CfgRow(cfgName, id) {
+function e0e1Row(cfgName, id) {
   if (!cfgName || id === undefined || id === null) return null;
   try {
     var table = e0e1CfgModule && e0e1CfgModule[cfgName];
@@ -135,110 +110,339 @@ function e0e1CfgRow(cfgName, id) {
   }
 }
 
-function e0e1CfgName(cfgName, id) {
-  var row = e0e1CfgRow(cfgName, id);
+function e0e1IsCjk(text) {
+  return !!text && /[\u4e00-\u9fa5]/.test(String(text));
+}
+
+// 只认包含中文的名字，避免把 "ID1001" 这类占位值当名字。
+// AttrCfg 的 name 是数字，真正的中文名在 note（如 106 → "技能攻击时的暴击概率"）。
+function e0e1NameOf(row) {
   if (!row) return null;
-  return row.name || row.Name || row.cfgName || null;
+  var candidates = [row.name, row.Name, row.cfgName, row.title];
+  if (row.itemId && typeof row.itemId === "object") candidates.push(row.itemId.name);
+  candidates.push(row.note);
+  for (var i = 0; i < candidates.length; i++) {
+    if (e0e1IsCjk(candidates[i])) return String(candidates[i]);
+  }
+  return null;
 }
 
-// ── 渲染小工具 ──
-
-function e0e1KindOf(value) {
-  return Object.prototype.toString.call(value);
+function e0e1DescOf(row) {
+  if (!row) return null;
+  var candidates = [row.desc, row.des, row.description];
+  if (row.itemId && typeof row.itemId === "object") candidates.push(row.itemId.desc);
+  for (var i = 0; i < candidates.length; i++) {
+    if (e0e1IsCjk(candidates[i])) return String(candidates[i]);
+  }
+  return null;
 }
 
-function e0e1IsMap(value) {
-  return !!value && e0e1KindOf(value) === "[object Map]";
+function e0e1ResolveName(cfgName, id) {
+  var name = e0e1NameOf(e0e1Row(cfgName, id));
+  if (name) return name;
+  for (var i = 0; i < E0E1_FALLBACK_TABLES.length; i++) {
+    var fallback = e0e1NameOf(e0e1Row(E0E1_FALLBACK_TABLES[i], id));
+    if (fallback) return fallback;
+  }
+  return null;
 }
 
-function e0e1Name(cfgName, id) {
-  var name = e0e1CfgName(cfgName, id);
-  return name || ("ID" + id + (e0e1CfgModule ? "" : ""));
+function e0e1ResolveDesc(cfgName, id) {
+  return e0e1DescOf(e0e1Row(cfgName, id));
 }
 
-function e0e1Attrs(obj, keys) {
-  var parts = [];
-  keys.forEach(function (key) {
-    var value = obj && obj[key];
-    if (value === undefined || value === null || value === 0 || value === "") return;
-    var label = { level: "等级", lv: "等级", quality: "品质", star: "星", step: "阶", num: "数量", count: "数量" }[key] || key;
-    parts.push(label + value);
-  });
-  return parts;
+// AttrCfg.style === 2 表示百分比，原始值是 ×100 后的整数（如 66057 → 660.57%）
+function e0e1FormatAttr(attrId, value) {
+  var row = e0e1Row("AttrCfg", attrId);
+  var style = row && row.style !== undefined ? Number(row.style) : 0;
+  if (style !== 2 || value === undefined || value === null) return String(value);
+  var percent = Number(value) / 100;
+  return String(Math.round(percent * 100) / 100) + "%";
 }
 
-// 把 Map/对象按 kind 翻成可读行
-function e0e1RenderField(entry, snapshot) {
-  var cfg = entry.cfg;
-  var value = snapshot[entry.field];
-  if (value === undefined || value === null) return [];
-  if (e0e1IsMap(value) && value.size === 0) return [];
-  if (Array.isArray(value) && value.length === 0) return [];
+// ── 各分区解析（结构经内存实测确认）──
 
+// 天书：equipSkill = 槽位→天书ID，skillLevel = 天书ID→等级
+function e0e1ParseEquippedSkills(snapshot) {
   var lines = [];
-
-  if (e0e1IsMap(value)) {
-    value.forEach(function (item, key) {
-      if (lines.length >= 40) return;
-      if (entry.kind === "level") {
-        lines.push("· " + e0e1Name(cfg, key) + " Lv." + item);
-        return;
-      }
-      if (entry.kind === "equip") {
-        // 脸谱：equipment 里存 cfgId/品质，等级在 equipmentLevel 里按位取
-        var levelMap = snapshot.equipmentLevel;
-        var level = e0e1IsMap(levelMap) ? levelMap.get(key) : undefined;
-        var row = e0e1CfgRow(cfg, item && item.cfgId !== undefined ? item.cfgId : key);
-        var parts = [e0e1Name(cfg, item && item.cfgId !== undefined ? item.cfgId : key)];
-        if (level !== undefined && level !== null) parts.push("等级" + level);
-        parts = parts.concat(e0e1Attrs(item, ["quality", "level", "lv", "star", "step"]));
-        if (row && row.quality !== undefined && item && item.quality === undefined) parts.push("品质" + row.quality);
-        lines.push("· " + parts.join(" "));
-        return;
-      }
-      if (entry.kind === "obj") {
-        if (item && typeof item === "object") {
-          var head = e0e1Name(cfg, item.cfgId !== undefined ? item.cfgId : key);
-          lines.push("· " + [head].concat(e0e1Attrs(item, ["level", "lv", "quality", "star", "step"])).join(" "));
-        } else {
-          lines.push("· " + e0e1Name(cfg, key) + " " + item);
-        }
-        return;
-      }
-      lines.push("· " + e0e1Name(cfg, key) + " " + JSON.stringify(item));
-    });
-    return lines;
-  }
-
-  if (Array.isArray(value) && entry.kind === "module") {
-    lines.push("· 已解锁玩法: " + value.slice(0, 40).map(function (id) {
-      return E0E1_MODULE_NAMES[id] || ("ID" + id);
-    }).join("、"));
-    return lines;
-  }
-
-  if (Array.isArray(value)) {
-    value.slice(0, 20).forEach(function (item) {
-      if (item && typeof item === "object" && item.cfgId !== undefined) {
-        lines.push("· " + [e0e1Name(cfg, item.cfgId)].concat(e0e1Attrs(item, ["level", "lv", "quality", "star", "num"])).join(" "));
-      } else {
-        lines.push("· " + JSON.stringify(item));
-      }
-    });
-    return lines;
-  }
-
-  if (typeof value === "object") {
-    if (value.cfgId !== undefined) {
-      lines.push("· " + [e0e1Name(cfg, value.cfgId)].concat(e0e1Attrs(value, ["level", "lv", "quality", "star"])).join(" "));
-    } else {
-      lines.push("· " + JSON.stringify(value).slice(0, 400));
-    }
-    return lines;
-  }
-
-  lines.push("· " + value);
+  e0e1ForEachMap(snapshot.equipSkill, 12, function (skillId, slot) {
+    var name = e0e1ResolveName("SkillBookCfg", skillId);
+    if (!name) return;
+    lines.push("· 槽位" + slot + " " + name);
+  });
   return lines;
+}
+
+function e0e1ParseSkillLevels(snapshot) {
+  var lines = [];
+  e0e1ForEachMap(snapshot.skillLevel, 40, function (level, skillId) {
+    var name = e0e1ResolveName("SkillBookCfg", skillId);
+    if (!name) return;
+    lines.push("· " + name + " Lv." + level);
+  });
+  return lines;
+}
+
+function e0e1ParseEpicLevels(snapshot) {
+  var lines = [];
+  e0e1ForEachMap(snapshot.epicLevel, 20, function (level, id) {
+    var name = e0e1ResolveName("SkillBookCfg", id);
+    if (!name) return;
+    lines.push("· " + name + " Lv." + level);
+  });
+  return lines;
+}
+
+// 顶级天书觉醒：外层天书ID → 内层 觉醒分支ID→等级（多分支）
+function e0e1ParseEpicAwakening(snapshot) {
+  var lines = [];
+  e0e1ForEachMap(snapshot.epicAwakening, 20, function (branches, bookId) {
+    var bookName = e0e1ResolveName("SkillBookCfg", bookId);
+    if (!bookName || !e0e1IsMap(branches)) return;
+    var parts = [];
+    e0e1ForEachMap(branches, 20, function (level, branchId) {
+      var branchName = e0e1ResolveName("SkillBookEvolutionCfg", branchId);
+      if (branchName) parts.push(branchName + " Lv." + level);
+    });
+    if (!parts.length) return;
+    lines.push("· " + bookName + "：" + parts.join("、"));
+  });
+  return lines;
+}
+
+function e0e1ParseSkillCombine(snapshot) {
+  var lines = [];
+  e0e1ForEachMap(snapshot.skillCombineLevel, 20, function (level, id) {
+    var name = e0e1ResolveName("RareskillCombCfg", id) || e0e1ResolveName("SkillBookCfg", id);
+    if (!name) return;
+    lines.push("· " + name + " Lv." + level);
+  });
+  return lines;
+}
+
+// 三尸效果只有描述文本，从文本里抠「N%pvp增伤」/「pvp增伤+N%」这类数值
+function e0e1PickPercent(desc, keyword) {
+  if (!desc) return 0;
+  var text = String(desc).toLowerCase().replace(/\s+/g, "");
+  var kw = String(keyword).toLowerCase();
+  var patterns = [
+    "([0-9]+(?:\\.[0-9]+)?)%" + kw,
+    kw + "[+＋]?([0-9]+(?:\\.[0-9]+)?)%"
+  ];
+  for (var i = 0; i < patterns.length; i++) {
+    var re = new RegExp(patterns[i], "g");
+    var match, total = 0, found = false;
+    while ((match = re.exec(text)) !== null) {
+      total += parseFloat(match[1]);
+      found = true;
+    }
+    if (found) return Math.round(total * 100) / 100;
+  }
+  return 0;
+}
+
+// 三尸：key = 槽位<<16 | 序号，value = 三尸ID（DesireCfg 行的 itemId 里带名字和效果描述）
+function e0e1ParseDesirePlan(planMap, label) {
+  var lines = [];
+  if (!e0e1IsMap(planMap)) return lines;
+  var grouped = {};
+  e0e1ForEachMap(planMap, 60, function (desireId, key) {
+    var slot = Math.floor(Number(key) / 65536);
+    var row = e0e1Row("DesireCfg", desireId);
+    var name = e0e1NameOf(row);
+    if (!name) return;
+    var desc = e0e1ResolveDesc("DesireCfg", desireId);
+    var quality = row && row.itemId ? row.itemId.quality : 0;
+    var text = name + (quality ? "(品质" + quality + ")" : "") +
+      (desc ? " —— " + desc.replace(/\s+/g, " ").slice(0, 60) : "");
+    if (!grouped[slot]) grouped[slot] = [];
+    grouped[slot].push(text);
+  });
+  Object.keys(grouped).sort().forEach(function (slot) {
+    grouped[slot].forEach(function (text, index) {
+      lines.push("· " + label + " 槽" + slot + "#" + (index + 1) + " " + text);
+    });
+  });
+
+  // 每套方案汇总 PVP 增伤 / 减伤
+  var pvpUp = 0, pvpDown = 0;
+  e0e1ForEachMap(planMap, 80, function (desireId) {
+    var desc = e0e1ResolveDesc("DesireCfg", desireId);
+    pvpUp += e0e1PickPercent(desc, "pvp增伤");
+    // 文本里两种写法都有：PVP减伤 / PVP减免
+    pvpDown += e0e1PickPercent(desc, "pvp减伤") + e0e1PickPercent(desc, "pvp减免");
+  });
+  if (pvpUp || pvpDown) {
+    var summary = "· " + label + " 汇总：PVP增伤 " + pvpUp + "%";
+    if (pvpDown) summary += "、PVP减伤 " + pvpDown + "%";
+    lines.push(summary);
+  }
+  return lines;
+}
+
+// allDesirePlan 是 Map<方案ID, Map<槽位键, 三尸ID>>，可能有多套方案
+function e0e1ParseAllDesirePlans(snapshot) {
+  var lines = [];
+  if (!e0e1IsMap(snapshot.allDesirePlan)) return lines;
+  snapshot.allDesirePlan.forEach(function (planMap, planId) {
+    var planLines = e0e1ParseDesirePlan(planMap, "[方案" + planId + "]");
+    planLines.forEach(function (line) { lines.push(line); });
+    if (planLines.length) lines.push("");
+  });
+  return lines;
+}
+
+// 脸谱：槽位→{configId, entry:[{id,value,unlock}]}，等级在 equipmentLevel
+function e0e1ParseEquipment(snapshot) {
+  var lines = [];
+  var levelMap = snapshot.equipmentLevel;
+  e0e1ForEachMap(snapshot.equipment, 10, function (item, slot) {
+    if (!item || item.configId === undefined) return;
+    var row = e0e1Row("EquipmentCfg", item.configId);
+    var name = e0e1NameOf(row);
+    if (!name) return;
+    var level = e0e1IsMap(levelMap) ? levelMap.get(slot) : undefined;
+    var parts = ["· " + name];
+    if (level !== undefined && level !== null) parts.push("等级" + level);
+    if (row && row.quality) parts.push("品质" + row.quality);
+    if (row && row.star) parts.push(row.star + "星");
+    lines.push(parts.join(" "));
+    if (Array.isArray(item.entry)) {
+      var entries = [];
+      item.entry.slice(0, 8).forEach(function (entry) {
+        var entryRow = e0e1Row("EquipmentEntryCfg", entry.id);
+        var entryName = e0e1NameOf(entryRow);
+        if (!entryName) return;
+        // entryRow.group 指向 AttrCfg，用来判断要不要按百分比显示
+        var shown = e0e1FormatAttr(entryRow && entryRow.group, entry.value);
+        entries.push(entryName + " " + shown + (entry.unlock ? "(已解锁)" : ""));
+      });
+      if (entries.length) lines.push("   词条：" + entries.join("、"));
+    }
+  });
+  return lines;
+}
+
+function e0e1ParseEquipmentSuit(snapshot) {
+  var lines = [];
+  e0e1ForEachMap(snapshot.equipmentSuit, 10, function (count, id) {
+    var name = e0e1ResolveName("EquipmentSuitCfg", id);
+    if (!name) return;
+    lines.push("· " + name + " " + count + "件");
+  });
+  return lines;
+}
+
+// 鬼仆：{cfgId, quality, level, entry:[词条ID], skillLevel:Map<技能ID,等级>}
+function e0e1ParsePet(snapshot) {
+  var lines = [];
+  var pet = snapshot.pet;
+  if (!pet || pet.cfgId === undefined) return lines;
+  var name = e0e1ResolveName("PetCfg", pet.cfgId);
+  if (!name) return lines;
+  lines.push("· 出战 " + name + " 等级" + pet.level + (pet.quality ? " 品质" + pet.quality : ""));
+  if (Array.isArray(pet.entry) && pet.entry.length) {
+    var entries = [];
+    pet.entry.slice(0, 8).forEach(function (id) {
+      var entryName = e0e1ResolveName("PetEntryCfg", id);
+      if (!entryName) return;
+      var desc = e0e1ResolveDesc("PetEntryCfg", id);
+      entries.push(entryName + (desc ? "(" + desc.replace(/鬼仆获得|成长能力|的/g, "").slice(0, 24) + ")" : ""));
+    });
+    if (entries.length) lines.push("   词条：" + entries.join("、"));
+  }
+  var skills = [];
+  e0e1ForEachMap(pet.skillLevel, 10, function (level, id) {
+    var skillName = e0e1ResolveName("SkillBookCfg", id);
+    if (skillName) skills.push(skillName + " Lv." + level);
+  });
+  if (skills.length) lines.push("   技能：" + skills.join("、"));
+  return lines;
+}
+
+// 阵法：formationPetInfo.formationPetInfo 槽位→鬼仆
+function e0e1ParseFormation(snapshot) {
+  var lines = [];
+  var info = snapshot.formationPetInfo;
+  if (!info) return lines;
+  if (info.formationLevel !== undefined) lines.push("· 阵法等级 " + info.formationLevel);
+  var inner = info.formationPetInfo;
+  if (!e0e1IsMap(inner)) return lines;
+  e0e1ForEachMap(inner, 6, function (pet, slot) {
+    if (!pet || pet.cfgId === undefined) return;
+    var name = e0e1ResolveName("PetCfg", pet.cfgId);
+    if (!name) return;
+    var parts = ["· 阵位" + slot + " " + name + " 等级" + pet.level];
+    if (Array.isArray(pet.entry) && pet.entry.length) {
+      var entries = [];
+      pet.entry.slice(0, 6).forEach(function (id) {
+        var entryName = e0e1ResolveName("PetEntryCfg", id);
+        if (entryName) entries.push(entryName);
+      });
+      if (entries.length) parts.push("[" + entries.join("、") + "]");
+    }
+    lines.push(parts.join(" "));
+  });
+  return lines;
+}
+
+// 法器：{onUseMagic, refineLevel, plan: Map<方案ID,{name, entry:Map<槽,{cfgId,value}>}>}
+function e0e1ParseMagic(snapshot) {
+  var lines = [];
+  var magic = snapshot.magic;
+  if (!magic) return lines;
+  var current = e0e1ResolveName("MagicArtifactBaseCfg", magic.onUseMagic);
+  var head = [];
+  if (current) head.push("当前法器 " + current);
+  if (magic.refineLevel !== undefined) head.push("精炼" + magic.refineLevel + "阶");
+  if (magic.refineCount !== undefined) head.push("精炼次数" + magic.refineCount);
+  if (head.length) lines.push("· " + head.join(" "));
+
+  if (!e0e1IsMap(magic.plan)) return lines;
+  e0e1ForEachMap(magic.plan, 8, function (item, planId) {
+    if (!item) return;
+    var parts = [];
+    if (e0e1IsMap(item.entry)) {
+      // 方案条目 cfgId 属于 MagicArtifactEntryCfg，des 是词条名，attrType 指向 AttrCfg
+      var pvpUp = 0, pvpDown = 0;
+      e0e1ForEachMap(item.entry, 8, function (entry, slot) {
+        if (!entry || entry.cfgId === undefined) return;
+        var entryRow = e0e1Row("MagicArtifactEntryCfg", entry.cfgId);
+        var name = entryRow && e0e1IsCjk(entryRow.des) ? entryRow.des : null;
+        var shown = e0e1FormatAttr(entryRow && entryRow.attrType, entry.value);
+        parts.push((name || ("词条ID" + entry.cfgId)) + " " + shown);
+        if (!name) return;
+        if (/pvp增伤/i.test(name)) pvpUp += Number(entry.value) / 100;
+        else if (/pvp减伤|pvp减免/i.test(name)) pvpDown += Number(entry.value) / 100;
+      });
+    }
+    lines.push("· 方案「" + (item.name || planId) + "」" + (parts.length ? "：" + parts.join("、") : ""));
+    if (pvpUp || pvpDown) {
+      var summary = "   └ 汇总：PVP增伤 " + (Math.round(pvpUp * 100) / 100) + "%";
+      if (pvpDown) summary += "、PVP减伤 " + (Math.round(pvpDown * 100) / 100) + "%";
+      lines.push(summary);
+    }
+  });
+  return lines;
+}
+
+function e0e1ParseAttributes(snapshot) {
+  var lines = [];
+  // attribute 实际有 50+ 条（含 PVP增伤/减免等），上限要够大
+  e0e1ForEachMap(snapshot.attribute, 80, function (value, attrId) {
+    var name = e0e1ResolveName("AttrCfg", attrId);
+    if (!name) return;
+    lines.push("· " + name + " " + e0e1FormatAttr(attrId, value));
+  });
+  return lines;
+}
+
+function e0e1ParseModules(snapshot) {
+  var ids = snapshot.unlockModuleIds;
+  if (!Array.isArray(ids) || !ids.length) return [];
+  return ["· 已解锁玩法：" + ids.slice(0, 40).map(function (id) {
+    return E0E1_MODULE_NAMES[id] || ("ID" + id);
+  }).join("、")];
 }
 
 // ── 组装与输出 ──
@@ -268,14 +472,38 @@ async function e0e1BuildDump(snapshot, isSelf) {
     if (value === undefined || value === null || value === "" || value === 0) return;
     dump.base.push([pair[1], value]);
   });
-  E0E1_SECTIONS.forEach(function (section) {
-    var blocks = [];
-    section.fields.forEach(function (entry) {
-      var lines = e0e1RenderField(entry, snapshot);
-      if (lines.length) blocks.push({ label: entry.field, lines: lines });
-    });
-    if (blocks.length) dump.sections.push({ name: section.name, blocks: blocks });
-  });
+
+  function add(name, blocks) {
+    var filled = blocks.filter(function (block) { return block.lines.length; });
+    if (filled.length) dump.sections.push({ name: name, blocks: filled });
+  }
+
+  add("天书", [
+    { label: "装备中", lines: e0e1ParseEquippedSkills(snapshot) },
+    { label: "天书等级", lines: e0e1ParseSkillLevels(snapshot) },
+    { label: "顶级天书", lines: e0e1ParseEpicLevels(snapshot) },
+    { label: "顶级天书觉醒", lines: e0e1ParseEpicAwakening(snapshot) },
+    { label: "天书组合", lines: e0e1ParseSkillCombine(snapshot) }
+  ]);
+  add("三尸", [
+    { label: "当前装备", lines: e0e1ParseDesirePlan(snapshot.desirePlan, "[当前]") },
+    { label: "全部方案", lines: e0e1ParseAllDesirePlans(snapshot) }
+  ]);
+  add("脸谱", [
+    { label: "已穿戴", lines: e0e1ParseEquipment(snapshot) },
+    { label: "套装", lines: e0e1ParseEquipmentSuit(snapshot) }
+  ]);
+  add("鬼仆阵法", [
+    { label: "出战鬼仆", lines: e0e1ParsePet(snapshot) },
+    { label: "阵法", lines: e0e1ParseFormation(snapshot) }
+  ]);
+  add("法器", [
+    { label: "法器", lines: e0e1ParseMagic(snapshot) }
+  ]);
+  add("其他", [
+    { label: "属性", lines: e0e1ParseAttributes(snapshot) },
+    { label: "玩法", lines: e0e1ParseModules(snapshot) }
+  ]);
   return dump;
 }
 
@@ -284,7 +512,7 @@ function e0e1RenderText(dump) {
   lines.push("===== 玩家信息 " + dump.dumpedAt + " =====");
   lines.push(dump.base.map(function (pair) { return pair[0] + "=" + pair[1]; }).join("  "));
   lines.push("对方隐藏: " + (dump.hide.names.length ? dump.hide.names.join("、") + "（位掩码 " + dump.hide.raw + "）" : "无"));
-  lines.push(dump.cfgReady ? "名称解析: 已加载配置表" : "名称解析: 未拿到配置表，仅显示 ID");
+  lines.push(dump.cfgReady ? "名称解析: 已加载配置表" : "名称解析: 未拿到配置表，仅显示能解析出的项");
   lines.push("※ 下面各分区来自本地快照，不受对方隐藏设置影响");
   if (!dump.sections.length) {
     lines.push("[快照中没有可展示的数据]");
@@ -294,6 +522,7 @@ function e0e1RenderText(dump) {
     lines.push("");
     lines.push("── " + section.name + " ──");
     section.blocks.forEach(function (block) {
+      lines.push("  [" + block.label + "]");
       block.lines.forEach(function (line) {
         lines.push("  " + line);
       });
@@ -315,12 +544,35 @@ function e0e1Emit(dump) {
   return dump;
 }
 
+// 只返回渲染好的文本，方便通过 CDP 直接取回（命令行注入时用）
+async function e0e1DumpPlayerInfoText() {
+  var game = e0e1ResolveGameWindow();
+  if (!game) return "未找到 gameContext";
+  var ui = e0e1FindSettingUi();
+  if (!ui) return "当前没有打开玩家信息界面（Setting）";
+  var snapshot = ui.info;
+  for (var attempt = 0; attempt < 16 && !snapshot && !ui.isSelf; attempt++) {
+    await new Promise(function (resolve) { setTimeout(resolve, 250); });
+    snapshot = ui.info;
+  }
+  if (!snapshot) snapshot = e0e1SelfSnapshot(game);
+  if (!snapshot) return "没拿到快照数据";
+  return e0e1RenderText(await e0e1BuildDump(snapshot, ui.isSelf));
+}
+
+function e0e1Fail(message) {
+  console.log("[e0e1][玩家信息] " + message);
+  if (typeof globalThis.__e0e1JsInjectionReport === "function") {
+    globalThis.__e0e1JsInjectionReport(message);
+  }
+  return null;
+}
+
 // ── 定位界面与快照 ──
 
 function e0e1FindSettingUi() {
   var game = e0e1ResolveGameWindow();
-  var manager = game && game.UIManager;
-  var ins = manager && manager.ins;
+  var ins = game && game.UIManager && game.UIManager.ins;
   if (!ins || !ins.viewParams) return null;
   for (var key in ins.viewParams) {
     var param = ins.viewParams[key];
@@ -342,37 +594,21 @@ function e0e1SelfSnapshot(game) {
 
 async function e0e1DumpPlayerInfo() {
   var game = e0e1ResolveGameWindow();
-  if (!game) {
-    return e0e1Fail("未找到 gameContext，游戏可能还没加载");
-  }
+  if (!game) return e0e1Fail("未找到 gameContext，游戏可能还没加载");
   var ui = e0e1FindSettingUi();
-  if (!ui) {
-    return e0e1Fail("当前没有打开玩家信息界面（Setting）");
-  }
-  // 他人信息是 getRolePreviewInfo 异步回来的，等一下
+  if (!ui) return e0e1Fail("当前没有打开玩家信息界面（Setting）");
   var snapshot = ui.info;
   for (var attempt = 0; attempt < 16 && !snapshot && !ui.isSelf; attempt++) {
     await new Promise(function (resolve) { setTimeout(resolve, 250); });
     snapshot = ui.info;
   }
   if (!snapshot) snapshot = e0e1SelfSnapshot(game);
-  if (!snapshot) {
-    return e0e1Fail("没拿到快照数据（info 为空且不是本人界面）");
-  }
+  if (!snapshot) return e0e1Fail("没拿到快照数据（info 为空且不是本人界面）");
   return e0e1Emit(await e0e1BuildDump(snapshot, ui.isSelf));
-}
-
-function e0e1Fail(message) {
-  console.log("[e0e1][玩家信息] " + message);
-  if (typeof globalThis.__e0e1JsInjectionReport === "function") {
-    globalThis.__e0e1JsInjectionReport(message);
-  }
-  return null;
 }
 
 // ── 安装 / 卸载 ──
 
-// 工具注入到 top 上下文，但 Console 可能停在 gameContext，两边都挂一份
 function e0e1Expose(name, value) {
   globalThis[name] = value;
   try {
@@ -384,6 +620,9 @@ function e0e1Expose(name, value) {
 async function e0e1Install() {
   e0e1Expose("dumpPlayerInfo", function () {
     return e0e1DumpPlayerInfo();
+  });
+  e0e1Expose("dumpPlayerInfoText", function () {
+    return e0e1DumpPlayerInfoText();
   });
   if (globalThis.__playerInfoAutoDump === undefined || globalThis.__playerInfoAutoDump === null) {
     globalThis.__playerInfoAutoDump = true;
@@ -469,7 +708,8 @@ if (typeof globalThis.__e0e1RegisterRuntimeToggle === "function") {
 } else {
   var e0e1PlayerResult = await e0e1Install();
   console.log("[e0e1][玩家信息] " + e0e1PlayerResult.message);
-  if (typeof globalThis.__e0e1JsInjectionReport === "function") {
+  // 已经导出过就别再覆盖上报内容，否则只能看到状态消息
+  if (!e0e1LastReport && typeof globalThis.__e0e1JsInjectionReport === "function") {
     globalThis.__e0e1JsInjectionReport(e0e1PlayerResult.message);
   }
 }

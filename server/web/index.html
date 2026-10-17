@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>e0e1 插件服务器</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <span class="brand">e0e1 插件服务器</span>
+    <nav>
+      <a href="#players" data-view="players">玩家白名单</a>
+      <a href="#releases" data-view="releases">版本发布</a>
+      <a href="#logs" data-view="logs">握手日志</a>
+    </nav>
+    <span id="who" class="who"></span>
+    <button id="logout" class="link">退出</button>
+  </header>
+
+  <main>
+    <section id="login-view" class="view">
+      <h1>登录</h1>
+      <form id="login-form">
+        <label>账号<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">登录</button>
+        <p id="login-error" class="error"></p>
+      </form>
+    </section>
+
+    <section id="players-view" class="view hidden">
+      <h1>玩家白名单</h1>
+      <form id="player-form">
+        <input name="player_id" placeholder="玩家ID（游戏内 heroId）" required>
+        <input name="nickname" placeholder="备注名">
+        <input name="note" placeholder="说明">
+        <label class="inline"><input type="checkbox" name="with_package" checked> 创建后直接下载分发包</label>
+        <button type="submit">加入白名单</button>
+      </form>
+      <p class="hint">分发包 = 当前生效版本的文件 + 这个玩家的 license，解压即用。勾了就会在创建完成后自动开始下载。</p>
+      <table class="grid">
+        <thead><tr><th>玩家ID</th><th>备注</th><th>最近公会</th><th>说明</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="players-body"></tbody>
+      </table>
+    </section>
+
+    <section id="releases-view" class="view hidden">
+      <h1>版本发布</h1>
+      <p class="hint">上传的是 build_exe.py 产出的<strong>不含 license</strong> 的构建 zip；新版本默认不启用，确认无误再点发布。</p>
+      <form id="release-form" enctype="multipart/form-data">
+        <input type="file" name="archive" accept=".zip" required>
+        <input name="version" placeholder="版本号，如 1.2.0" required>
+        <input name="changelog" placeholder="更新日志">
+        <label class="inline"><input type="checkbox" name="mandatory"> 强制更新</label>
+        <button type="submit">上传</button>
+      </form>
+      <table class="grid">
+        <thead><tr><th>版本</th><th>文件数</th><th>体积</th><th>强制</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="releases-body"></tbody>
+      </table>
+    </section>
+
+    <section id="logs-view" class="view hidden">
+      <h1>握手日志</h1>
+      <p class="hint">只记录最近 200 条；公会名（阴司）只记录，不参与鉴权。</p>
+      <table class="grid">
+        <thead><tr><th>时间</th><th>玩家ID</th><th>绑定ID</th><th>公会</th><th>版本</th><th>来源</th><th>结果</th></tr></thead>
+        <tbody id="logs-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

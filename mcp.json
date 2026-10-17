@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rea": {
+      "command": "npx",
+      "args": ["-y", "rea-agents@6.5.0", "mcp"],
+	  "env": {
+		"GHIDRA_INSTALL_DIR": "C:\\Tools\\ghidra_12.1.4_PUBLIC",
+		"JAVA_HOME": "C:\\JDK\\jdk-21.0.12.1+1",
+		"REA_ANALYSIS_PROVIDER": "ghidra"
+	  }
+    }
+  }
+}

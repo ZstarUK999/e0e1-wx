@@ -40,6 +40,8 @@ from package.js_injection.runtime import inject_js_file
 from package.js_injection.runtime_toggle import disable_runtime_js_file, enable_runtime_js_file
 
 MINIAPP_RESTART_HINT = "如小程序已提前打开，请重启小程序后再试"
+# CDP 端口换端口重试的上限：不再把 62000~65535 一路试穿。
+CDP_PORT_RETRY_LIMIT = 25
 ROUTE_ACTION_LABELS = {
     "switch_tab": "切换标签页",
     "navigate_to": "打开新页面",
@@ -61,16 +63,31 @@ TRANSIENT_MINIAPP_DISCONNECT_MARKERS = (
 
 
 def find_available_cdp_port(start: int = CDP_PORT_START) -> int:
-    """查找首个可用的 CDP 代理端口。"""
+    """查找首个可用的 CDP 代理端口。
+
+    不能带 SO_REUSEADDR：Windows 上它会让人绑到已被占用的端口，
+    探测说“可用”、引擎真正 bind 时却报 10048，于是重试一路把端口段试穿。
+    探测也用 0.0.0.0，和引擎实际 bind 的地址保持一致。
+    """
     for port in range(int(start), CDP_PORT_END + 1):
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind(("127.0.0.1", port))
-            except OSError:
-                continue
+        if port_available(port, host="0.0.0.0"):
             return port
     raise RuntimeError("No available CDP port found")
+
+
+def port_available(port: int, host: str = "0.0.0.0") -> bool:
+    """判断端口能否真正绑定。
+
+    不加 SO_REUSEADDR（Windows 上它会让人绑到已占用的端口），并且默认探测
+    0.0.0.0 —— 与引擎实际 bind 的地址一致；Windows 下 0.0.0.0 与 127.0.0.1
+    的冲突判定并不等价，探测必须和真正的使用方对齐。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, int(port)))
+    except OSError:
+        return False
+    return True
 
 
 def is_address_in_use_error(exc: BaseException) -> bool:
@@ -974,7 +991,14 @@ class AsyncDevtoolsWorker:
 
         debug_port = self.debug_port_from_command(command)
         cdp_port = 0
+        port_retries = 0
         try:
+            # 9421 这类固定调试端口被别的实例占着时，换 CDP 端口重试多少次都没用，
+            # 只会把 62000~65535 一路试穿并刷屏，所以先直接判掉。
+            if not port_available(debug_port):
+                raise RuntimeError(
+                    f"调试端口 {debug_port} 已被占用：多半是另一个调试实例或残留进程在跑，请先停止它"
+                )
             # 端口探测可能遍历多个端口，放入线程避免拖慢 DevTools worker 事件循环。
             cdp_port = await asyncio.to_thread(self.cdp_port_finder, self.cdp_port_start_from_command(command))
             while True:
@@ -987,9 +1011,21 @@ class AsyncDevtoolsWorker:
                     await self.release_startup_bridge(bridge)
                     if not is_address_in_use_error(exc):
                         raise
+                    if not port_available(debug_port):
+                        raise RuntimeError(
+                            f"调试端口 {debug_port} 已被占用：请停止另一个调试实例后重试"
+                        ) from exc
+                    # 换端口重试要有上限：否则占用的端口段会被一路试穿，状态刷屏。
+                    port_retries += 1
+                    if port_retries >= CDP_PORT_RETRY_LIMIT:
+                        raise RuntimeError(
+                            f"CDP 端口连续 {port_retries} 次被占用（最后尝试 {cdp_port}），"
+                            "请检查本机 62000-65535 端口占用情况"
+                        ) from exc
                     retry_start = int(cdp_port) + 1
                     if retry_start > CDP_PORT_END:
                         raise
+                    await asyncio.sleep(0.2)
                     retry_port = await asyncio.to_thread(self.cdp_port_finder, retry_start)
                     self.apply_session_state(
                         session,
@@ -2238,8 +2274,18 @@ class AsyncDevtoolsWorker:
         self.state["miniapp_epoch"] = next_epoch
         if next_miniapp_connected and next_epoch != previous_epoch:
             self.schedule_runtime_toggle_auto_restore(owner_key=owner_key, record_id=record_id)
-        if self.state.get("status") in {"starting", "running"}:
+        # 偏移自动检测标志：GUI 靠它决定要不要弹「正在适配」独占窗口。
+        detect_flag = status.get("offset_detect")
+        flag_changed = detect_flag is not None and bool(detect_flag) != bool(self.state.get("offset_detect"))
+        if detect_flag is not None:
+            self.state["offset_detect"] = bool(detect_flag)
+        # engine 会借 message 传一次性提示（如「正在自动检测偏移…」），优先展示。
+        hint = str(status.get("message") or "")
+        if hint:
+            self.state["message"] = hint
+        elif self.state.get("status") in {"starting", "running"}:
             self.state["message"] = self.running_message()
+        if hint or flag_changed or self.state.get("status") in {"starting", "running"}:
             self.emit_state()
 
     def running_message(self) -> str:

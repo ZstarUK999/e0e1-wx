@@ -38,6 +38,7 @@ class DevtoolsService(QObject):
     cloud_static_scan_completed = Signal(int, list)
     cloud_static_scan_failed = Signal(int, str)
     js_injection_state_changed = Signal(int, dict)
+    offset_detecting_changed = Signal(bool)
 
     def __init__(self, parent: QObject | None = None) -> None:
         """初始化 UI 侧 DevTools 服务状态、事件队列和轮询定时器。"""
@@ -63,6 +64,12 @@ class DevtoolsService(QObject):
     def snapshot(self) -> dict:
         """返回共享 DevTools 全局状态快照。"""
         return copy_state(self.state)
+
+    def offset_detecting(self) -> bool:
+        """是否正在自动重算偏移；会话已停/失败时不算，避免独占窗口关不掉。"""
+        if self.state.get("status") in {"stopped", "failed"}:
+            return False
+        return bool(self.state.get("offset_detect"))
 
     def state_for_record(self, record: dict) -> dict:
         """返回附带当前卡片归属判断的 DevTools 状态。"""
@@ -447,8 +454,12 @@ class DevtoolsService(QObject):
             self.event_queue = None
             self.command_queue = None
             if self.state.get("worker_alive"):
+                was_detecting = bool(self.state.get("offset_detect"))
                 self.state = default_state(message="调试 worker 已退出")
                 self.state_changed.emit(self.snapshot())
+                if was_detecting:
+                    # worker 中途没了也要把独占窗口收掉，不能把界面卡死在“正在适配”。
+                    self.offset_detecting_changed.emit(False)
             if self.cloud_state.get("worker_alive"):
                 self.cloud_state = default_cloud_state(message="云审计 worker 已退出")
                 self.cloud_state_changed.emit(copy_cloud_state(self.cloud_state))
@@ -491,8 +502,11 @@ class DevtoolsService(QObject):
             next_state = event.get("state") if isinstance(event.get("state"), dict) else default_state()
             if next_state == self.state:
                 return
+            was_detecting = bool(self.state.get("offset_detect"))
             self.state = copy_state(next_state)
             self.state_changed.emit(self.snapshot())
+            if self.offset_detecting() != was_detecting:
+                self.offset_detecting_changed.emit(self.offset_detecting())
             return
         if event_type == "route_state":
             record_id = int(event.get("record_id") or 0)

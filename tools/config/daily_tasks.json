@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "enabled": true,
+  "timezone": "Asia/Shanghai",
+  "poll_seconds": 1,
+  "summary_interval_seconds": 3600,
+  "tasks": {
+    "sanshi_tombs": {
+      "name": "三尸墓藏收取与重开",
+      "enabled": true,
+      "priority": 20,
+      "timeout_seconds": 60,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {
+        "recruit": true
+      }
+    },
+    "artifact_tombs": {
+      "name": "法器墓藏收取与重开",
+      "enabled": true,
+      "priority": 20,
+      "timeout_seconds": 60,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {
+        "recruit": true
+      }
+    },
+    "sanshi_raid": {
+      "name": "三尸盗掠扫描",
+      "enabled": true,
+      "priority": 50,
+      "timeout_seconds": 180,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {
+        "minimum_tombs": 16,
+        "rescan_seconds": 60,
+        "skip_failed_players": true
+      }
+    },
+    "artifact_raid": {
+      "name": "法器盗掠扫描",
+      "enabled": true,
+      "priority": 50,
+      "timeout_seconds": 180,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {
+        "minimum_tombs": 10,
+        "rescan_seconds": 60,
+        "skip_failed_players": true
+      }
+    },
+    "sanshi_fill": {
+      "name": "三尸填土扫描",
+      "enabled": true,
+      "priority": 60,
+      "timeout_seconds": 60,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {}
+    },
+    "artifact_fill": {
+      "name": "法器填土扫描",
+      "enabled": true,
+      "priority": 60,
+      "timeout_seconds": 60,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {}
+    },
+    "energy": {
+      "name": "体力检查与扫荡",
+      "enabled": true,
+      "priority": 30,
+      "timeout_seconds": 120,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 60
+      },
+      "params": {
+        "trigger_ratio": 0.9,
+        "spend_mode": "all_available",
+        "sanshi_plan_scope": "existing",
+        "artifact_plan_scope": "existing",
+        "formation_eye_name": "双子僵尸",
+        "restore_original": true,
+        "energy_recover_seconds": 420
+      }
+    },
+    "offline_reward": {
+      "name": "每小时领取挂机收益",
+      "enabled": true,
+      "priority": 40,
+      "timeout_seconds": 60,
+      "retry_seconds": 60,
+      "schedule": {
+        "kind": "interval",
+        "interval_seconds": 3600
+      },
+      "params": {
+        "claim_interval_seconds": 3600,
+        "restore_original": true
+      }
+    },
+    "arena": {
+      "name": "最后两分钟斗法",
+      "enabled": true,
+      "priority": 10,
+      "timeout_seconds": 30,
+      "retry_seconds": 5,
+      "schedule": {
+        "kind": "daily_window",
+        "start": "10:28",
+        "end": "10:30",
+        "interval_seconds": 1
+      },
+      "params": {
+        "excluded_player_ids": [],
+        "continuous": true,
+        "skip_battle": true
+      }
+    }
+  }
+}

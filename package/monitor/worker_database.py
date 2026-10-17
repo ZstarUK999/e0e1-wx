@@ -7,6 +7,7 @@ import sqlite3
 import time
 
 from package.monitor.constants import MONITOR_INTERVAL_SECONDS
+from package.monitor.debug import debug_log
 from package.monitor.windows import pid_is_running
 
 
@@ -300,6 +301,7 @@ class MonitorDatabaseMixin:
                 self.upsert_applet(wxids, window, created_at, packages_root)
                 matched_window_keys.add((pid, title))
 
+        debug_log(f"refresh: 窗口={len(windows)} 匹配已有记录={len(matched_window_keys)} 数据库记录={self.conn.execute('SELECT COUNT(*) FROM applet').fetchone()[0]}")
         active_rows = self.conn.execute("SELECT id, pid, window_title, last_seen FROM applet WHERE status = 1").fetchall()
         for row in active_rows:
             pid = int(row["pid"] or 0)
@@ -370,6 +372,7 @@ class MonitorDatabaseMixin:
         if not force and signature == self.last_records_signature:
             return
         self.last_records_signature = signature
+        debug_log(f"发布记录({len(records)}): " + str([(r.get("id"), r.get("name") or r.get("window_title"), r.get("wxids_display"), r.get("status")) for r in records]))
         self.emit({"type": "monitor_records", "records": records})
 
     def publish_cached_records(self, force: bool = False) -> None:

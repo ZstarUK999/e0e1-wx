@@ -637,6 +637,10 @@ class MainWindowMonitorMixin:
             if widget is not None and hasattr(widget, "refresh_logs"):
                 widget.refresh_logs()
 
+    def on_offset_detecting_changed(self, active: bool) -> None:
+        """自动重算调试偏移期间弹出/关闭独占窗口。"""
+        self.offset_dialog.set_active(bool(active))
+
     def on_devtools_state_logged(self, state: dict) -> None:
         """记录 devtools-cdp 状态变化日志。"""
         self.append_feature_state_log("devtools_cdp", state, "devtools-cdp 状态更新")

@@ -1,0 +1,26 @@
+{
+  "_说明": "构建期功能开关。false = 该功能不进默认配置、不注册调度、不显示面板。未列出的项一律视为开启。",
+  "tasks": {
+    "sanshi_tombs": true,
+    "artifact_tombs": true,
+    "sanshi_raid": true,
+    "artifact_raid": true,
+    "sanshi_fill": true,
+    "artifact_fill": true,
+    "energy": true,
+    "offline_reward": true,
+    "arena": false
+  },
+  "panels": {
+    "global": true,
+    "daily": true,
+    "bloodmoon": true,
+    "player": true,
+    "treasure": true,
+    "damage": true,
+    "debug": true,
+    "energy": true,
+    "mines": true,
+    "arena": false
+  }
+}

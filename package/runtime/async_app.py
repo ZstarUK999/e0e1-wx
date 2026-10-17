@@ -17,10 +17,10 @@ from package.ui.styles import APP_STYLESHEET
 WindowFactory = Callable[[], QMainWindow]
 
 
-def configure_application(app: QApplication) -> None:
+def configure_application(app: QApplication, *, app_name: str = "e0e1-wx-gui", organization: str = "e0e1") -> None:
     """配置应用元数据与全局样式。"""
-    app.setApplicationName("e0e1-wx-gui")
-    app.setOrganizationName("e0e1")
+    app.setApplicationName(app_name)
+    app.setOrganizationName(organization)
     app.setStyleSheet(APP_STYLESHEET)
 
 
@@ -46,11 +46,11 @@ async def wait_for_application_exit(window_factory: WindowFactory) -> int:
     return 0
 
 
-def run_qasync_window(window_factory: WindowFactory) -> int:
+def run_qasync_window(window_factory: WindowFactory, *, app_name: str = "e0e1-wx-gui", organization: str = "e0e1") -> int:
     """启动 QApplication，并以 qasync 事件循环托管主窗口。"""
     configure_high_dpi_for_qt()
     app = QApplication.instance() or QApplication(sys.argv)
-    configure_application(app)
+    configure_application(app, app_name=app_name, organization=organization)
     loop = create_qasync_loop(app)
     shutdown_bridge = install_ctrl_c_shutdown(app)
     try:

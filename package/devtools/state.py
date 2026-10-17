@@ -31,6 +31,7 @@ def default_state(*, worker_alive: bool = False, message: str = "未启动调试
         "devtools": False,
         "message": message,
         "error": "",
+        "offset_detect": False,
     }
 
 

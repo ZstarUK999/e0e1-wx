@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from package.monitor.constants import MATCH_WINDOW_SECONDS, TITLE_RETRY_COUNT, TITLE_RETRY_INTERVAL_SECONDS
+from package.monitor.debug import debug_log
 from package.monitor.windows import list_wechat_app_windows
 
 
@@ -24,11 +25,21 @@ class MonitorScanMixin:
             ]
             windows = await self.stable_windows(retry=bool(new_entries))
             new_groups = self.group_new_dir_entries(new_entries)
+            dir_count = sum(len(dirs) for dirs in current_dirs.values())
+            debug_log(f"scan: 包目录={dir_count} 新增={len(new_entries)} 窗口={len(windows)} 分组={len(new_groups)}")
+            if new_entries or windows:
+                debug_log(f"  新增目录={new_entries}")
+                debug_log(f"  窗口={[(w.get('title'), w.get('pid'), round(float(w.get('start_time') or 0), 2)) for w in windows]}")
+            summary = f"根目录 {len(current_dirs)} / 包目录 {dir_count} / 窗口 {len(windows)} / 新增 {len(new_entries)}"
+            if summary != getattr(self, "_last_scan_summary", None):
+                self._last_scan_summary = summary
+                self.emit({"type": "info", "message": summary})
             self.bind_new_dir_groups(new_groups, windows)
             self.refresh_existing_records(windows, current_dirs=current_dirs)
             self.previous_dirs = current_dirs
             self.publish_records()
         except Exception as exc:
+            debug_log(f"scan 异常：{exc!r}")
             self.emit({"type": "error", "message": f"小程序扫描失败：{exc}"})
 
     async def stable_windows(self, retry: bool = False) -> list[dict]:
@@ -121,4 +132,7 @@ class MonitorScanMixin:
             window = candidate[1] if candidate else None
             if window:
                 used_window_indexes.add(candidate[0])
+                debug_log(f"绑定新目录: wxids={wxids} root={packages_root} -> 窗口 {window.get('title')!r} pid={window.get('pid')}")
                 self.upsert_applet(wxids, window, created_at, packages_root)
+            else:
+                debug_log(f"无窗口可绑定: wxids={wxids} root={packages_root} created_at={created_at} 可用窗口={len(titled_windows)}")

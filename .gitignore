@@ -1,2 +1,13 @@
 
 tools/__pycache__
+dist/
+build/
+
+# 证书含私钥，发布数据含构建产物，.env 含密码与 JWT 密钥，都不入库
+server/backend/certs/
+server/backend/data/
+server/backend/.env
+.venv
+__pycache__
+logs
+output

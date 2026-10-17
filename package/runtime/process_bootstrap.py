@@ -8,17 +8,25 @@ from pathlib import Path
 
 
 def pythonw_child_executable() -> Path | None:
-    """Return pythonw.exe for Windows source-mode child processes when available."""
+    """Return pythonw.exe for Windows source-mode child processes when available.
+
+    虚拟环境里的 pythonw.exe 是 venvwlauncher 启动器，它会再拉起一个真正的解释器，
+    multiprocessing 复制给它的信号量/锁句柄传不到孙进程，mp.Queue 会失去同步
+    （表现为 get_nowait 抛 ValueError: semaphore or lock released too many times）。
+    因此优先使用基础解释器（sys._base_executable）旁边的 pythonw.exe。
+    """
     if sys.platform != "win32" or getattr(sys, "frozen", False):
         return None
 
-    current_executable = Path(sys.executable)
-    if current_executable.name.casefold() == "pythonw.exe":
-        return None
-
-    candidate = current_executable.with_name("pythonw.exe")
-    if candidate.exists():
-        return candidate
+    executables = [Path(getattr(sys, "_base_executable", "") or ""), Path(sys.executable)]
+    for executable in executables:
+        if not executable.name:
+            continue
+        if executable.name.casefold() == "pythonw.exe":
+            continue
+        candidate = executable.with_name("pythonw.exe")
+        if candidate.exists():
+            return candidate
     return None
 
 

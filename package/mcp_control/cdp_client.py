@@ -122,9 +122,10 @@ class LocalCdpClient:
         try:
             await self.websocket.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             return await asyncio.wait_for(future, timeout=max(0.1, float(timeout_ms) / 1000.0))
-        except Exception:
+        finally:
             self.pending.pop(request_id, None)
-            raise
+            if not future.done():
+                future.cancel()
 
     async def wait_until_ready(self, *, timeout_ms: int = 10_000) -> None:
         """?????????????????????"""
