@@ -71,7 +71,13 @@ async function refreshPlayers() {
   body.replaceChildren();
   rows.forEach((player) => {
     const tr = document.createElement('tr');
-    tr.append(cell(player.player_id), cell(player.nickname), cell(player.guild), cell(player.note));
+    tr.append(
+      cell(player.player_id),
+      cell(player.role_name || '—'),
+      cell(player.nickname),
+      cell(player.guild),
+      cell(player.note),
+    );
     tr.append(cell(player.enabled ? '启用' : '已停用'));
 
     const actions = document.createElement('td');
@@ -233,8 +239,8 @@ async function refreshLogs() {
   rows.forEach((row) => {
     const tr = document.createElement('tr');
     tr.append(
-      cell(row.created_at), cell(row.player_id), cell(row.bound_player_id),
-      cell(row.guild), cell(row.client_version), cell(row.remote),
+      cell(row.created_at), cell(row.player_id), cell(row.player_name || '—'),
+      cell(row.bound_player_id), cell(row.guild), cell(row.client_version), cell(row.remote),
     );
     const result = document.createElement('td');
     result.textContent = row.allowed ? '放行' : `拒绝（${row.reason}）`;

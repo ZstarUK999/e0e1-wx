@@ -504,6 +504,56 @@ def test_task_buttons_replace_context_menus_and_advanced_fields_start_collapsed(
     assert energy.test_button.isEnabled()
 
 
+def test_main_ui_stays_hidden_until_gate_releases(window):
+    """启动只显示门禁占位面板；主 UI 必须显式放行后才切过去。"""
+    assert window.main_ui_shown is False
+    root = window.centralWidget()
+    assert root.currentWidget() is window.gate
+    window.show_main_ui()
+    assert window.main_ui_shown is True
+    assert root.currentWidget() is not window.gate
+    # 放行之后再退回门禁，主 UI 要收回去（游戏会话断开就是这条路径）。
+    window.set_gate('wait_game', '游戏会话已变化')
+    assert window.main_ui_shown is False
+    assert root.currentWidget() is window.gate
+
+
+def test_gate_phase_text_and_spinner(window):
+    import package.plugin_manager.gate as gate_module
+
+    panel = window.gate
+    window.set_gate(gate_module.PHASE_INIT, '正在建立调试链路')
+    assert panel.title.text() == '初始化中'
+    assert panel.detail.text() == '正在建立调试链路'
+    assert not panel.spinner.isHidden()          # 只有"初始化中"才转圈
+    window.set_gate(gate_module.PHASE_WAIT_GAME)
+    assert panel.title.text() == '请打开游戏'
+    assert panel.detail.text() == ''
+    assert panel.spinner.isHidden()
+    window.set_gate(gate_module.PHASE_MOUNTING, '大厅已确认，正在挂载插件脚本')
+    assert panel.title.text() == '游戏已打开，正在挂载脚本'
+    assert panel.spinner.isHidden()
+    window.set_gate(gate_module.PHASE_DENIED, 'license 绑定账号 1，当前登录账号 2')
+    assert panel.title.text() == '此账号未授权'
+    assert panel.spinner.isHidden()
+
+
+def test_bound_player_id_never_trusts_unsigned_payload(tmp_path, monkeypatch):
+    """没签名的 license 改 player_id 就能白用，所以必须先验签再取绑定ID。"""
+    import package.plugin_manager.license as license_module
+
+    monkeypatch.setattr(license_module, 'license_path', lambda: tmp_path / 'license.bin')
+    bound, reason = license_module.bound_player_id()
+    assert bound is None and reason
+    (tmp_path / 'license.bin').write_text('{"player_id": "123"}', encoding='utf-8')
+    assert license_module.bound_player_id()[0] is None
+    monkeypatch.setattr(license_module, 'verify', lambda payload: True)
+    assert license_module.bound_player_id() == ('123', '')
+    monkeypatch.setattr(license_module, 'verify', lambda payload: True)
+    (tmp_path / 'license.bin').write_text('{"license_id": "x"}', encoding='utf-8')
+    assert license_module.bound_player_id()[0] is None       # 验过了但没有 player_id
+
+
 def test_launch_entry_does_not_import_old_main_window(app):
     modules()
     import inspect

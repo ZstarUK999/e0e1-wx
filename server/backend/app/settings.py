@@ -10,7 +10,10 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="E0E1_", env_file=".env", extra="ignore")
+    # env_file 用绝对路径：服务化后工作目录不一定是 backend，相对路径会读不到 .env
+    model_config = SettingsConfigDict(
+        env_prefix="E0E1_", env_file=str(BACKEND_ROOT / ".env"), extra="ignore"
+    )
 
     # HTTP 管理端与前端
     http_host: str = "127.0.0.1"

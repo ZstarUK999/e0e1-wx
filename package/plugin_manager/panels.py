@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .feature_flags import task_enabled
-from .store import PRIORITY_MAX, RATIO_MIN, SECONDS_MAX, PluginConfigStore
+from .store import BLOODMOON_POWER_MAX, PRIORITY_MAX, RATIO_MIN, SECONDS_MAX, PluginConfigStore
 
 
 def set_checked(box: QCheckBox, enabled: bool) -> None:
@@ -475,9 +475,17 @@ class BloodmoonPanel(QWidget):
                       "不读取、不展示被游戏隐藏的敌方隐匿行军，隐匿目标不作为自动攻击的选敌来源。")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.enabled = QCheckBox("启用血月战场功能")
+        self.enabled = QCheckBox("血月总开关（探测、加速、挑战、隐匿标注）")
         self.enabled.setObjectName("bloodmoon.enabled")
         layout.addWidget(self.enabled)
+
+        self.master_note = QLabel("关闭总开关会暂停全部血月功能，并保留下方设置；开启后只运行单独启用的功能。\n"
+                                 "战旗探测需点击“开始探测”；诊断和复位不受总开关控制。")
+        self.master_note.setWordWrap(True)
+        layout.addWidget(self.master_note)
+        self.master_status = QLabel()
+        self.master_status.setWordWrap(True)
+        layout.addWidget(self.master_status)
 
         self.probe_box = QGroupBox("入场战旗探测（按阴司分组，战力降序）")
         probe_layout = QVBoxLayout(self.probe_box)
@@ -548,8 +556,9 @@ class BloodmoonPanel(QWidget):
         self.attack_ratio.setSuffix(" %")
         self.attack_ratio.setObjectName("bloodmoon.attack.power_ratio")
         attack_form.addRow("目标战力低于我方的比例", self.attack_ratio)
-        self.attack_limit = QSpinBox()
-        self.attack_limit.setRange(0, PRIORITY_MAX)
+        self.attack_limit = QDoubleSpinBox()
+        self.attack_limit.setDecimals(0)
+        self.attack_limit.setRange(0, BLOODMOON_POWER_MAX)
         self.attack_limit.setSpecialValueText("不限制")
         self.attack_limit.setObjectName("bloodmoon.attack.power_limit")
         attack_form.addRow("目标战力绝对上限", self.attack_limit)
@@ -571,9 +580,9 @@ class BloodmoonPanel(QWidget):
         attack_layout.addWidget(self.attack_status)
         layout.addWidget(self.attack_box)
 
-        self.mark_box = QGroupBox("水旗标注")
+        self.mark_box = QGroupBox("隐匿状态标注")
         mark_layout = QVBoxLayout(self.mark_box)
-        self.mark_enabled = QCheckBox("给已可见的隐身单位画「隐身水旗」标识")
+        self.mark_enabled = QCheckBox("给已可见的隐身单位画「隐匿中」标识")
         self.mark_enabled.setObjectName("bloodmoon.stealth_mark.enabled")
         mark_layout.addWidget(self.mark_enabled)
         mark_note = QLabel("只标注当前本来就能看到的单位（已到达本节点、已在可见队列里）。"
@@ -634,7 +643,7 @@ class BloodmoonPanel(QWidget):
                              "safety_margin_seconds": self.speed_margin.value()}}
 
     def _attack_patch(self) -> dict:
-        return {"attack": {"power_ratio": self.attack_ratio.value(), "power_limit": self.attack_limit.value(),
+        return {"attack": {"power_ratio": self.attack_ratio.value(), "power_limit": int(self.attack_limit.value()),
                            "max_battles": self.attack_max.value(), "wait_seconds": self.attack_wait.value()}}
 
     def sync(self, state):
@@ -649,7 +658,7 @@ class BloodmoonPanel(QWidget):
         set_checked(self.mark_enabled, bool(mark.get("enabled")))
         for widget, value in ((self.probe_refresh, probe.get("refresh_seconds", 5)),
                               (self.probe_top, probe.get("top_members", 3)),
-                              (self.speed_times, speed.get("max_times", 3)),
+                              (self.speed_times, speed.get("max_times", 15)),
                               (self.speed_margin, speed.get("safety_margin_seconds", 2)),
                               (self.attack_ratio, attack.get("power_ratio", 100)),
                               (self.attack_limit, attack.get("power_limit", 0)),
@@ -657,6 +666,7 @@ class BloodmoonPanel(QWidget):
                               (self.attack_wait, attack.get("wait_seconds", 3))):
             if widget.value() != value:
                 widget.setValue(int(value))
+        self.set_ready(getattr(self, '_ready', False))
 
     def set_ready(self, ready: bool) -> None:
         """游戏与插件未就绪时，除总开关外一律禁用。"""
@@ -664,12 +674,21 @@ class BloodmoonPanel(QWidget):
                        self.speed_enabled, self.speed_save, self.attack_enabled, self.attack_save,
                        self.mark_enabled):
             widget.setEnabled(bool(ready))
+        self._ready = bool(ready)
+        master = bool((self.store.snapshot().get('bloodmoon') or {}).get('enabled'))
+        active = bool(ready) and master
+        for widget in (self.speed_enabled, self.attack_enabled, self.mark_enabled):
+            widget.setEnabled(active)
+        self.probe_start.setEnabled(active and not getattr(self, '_probe_running', False))
+        self.probe_stop.setEnabled(bool(ready) and getattr(self, '_probe_running', False))
+        self.master_status.setText('总开关已关闭：全部血月功能暂停' if not master else
+                                   ('总开关已开启：按下方开关运行' if ready else '总开关已开启：等待游戏与插件就绪'))
         if not ready:
             self.probe_stop.setEnabled(False)
 
     def set_probe_running(self, running: bool) -> None:
-        self.probe_start.setEnabled(not running)
-        self.probe_stop.setEnabled(bool(running))
+        self._probe_running = bool(running)
+        self.set_ready(getattr(self, '_ready', False))
         if not running:
             self.probe_subject.setText("已停止探测")
 
@@ -681,7 +700,8 @@ class BloodmoonPanel(QWidget):
         self.probe_tree.clear()
         for group in rows or []:
             members = list(group.get("members", []) or [])
-            summary = " ".join(f"{m.get('name') or '?'}·{m.get('flag') or '?'}" for m in members[:3])
+            top_count = int((self.store.snapshot().get('bloodmoon') or {}).get('flag_probe', {}).get('top_members', 3))
+            summary = " ".join(f"{m.get('name') or '?'}·{m.get('flag') or '?'}" for m in members[:top_count])
             top = QTreeWidgetItem([str(group.get("title") or "未命名阴司"),
                                    str(group.get("power") or ""), summary,
                                    "展开看全部" if members else str(group.get("note") or "")])

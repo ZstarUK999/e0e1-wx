@@ -133,7 +133,7 @@ class PluginTransport:
                 self.invalidate()
                 return {'appid': '', 'ready': False, 'context_id': None, 'resident_id': None}
             appid = await self._appid()
-            if appid != TARGET_APPID:
+            if appid != self.TARGET_APPID:
                 self.invalidate()
                 return {'appid': appid, 'ready': False, 'context_id': None, 'resident_id': None}
             candidates = ([self.context_id] if self.context_id is not None else []) + list(self.contexts)
@@ -158,7 +158,7 @@ class PluginTransport:
 
     async def install(self):
         probe = await self.probe()
-        if not probe['ready'] or probe['appid'] != TARGET_APPID:
+        if not probe['ready'] or probe['appid'] != self.TARGET_APPID:
             raise RuntimeError('必须确认遗弃之地大厅就绪后才能注入')
         if probe['resident_id'] and probe['resident_id'] != self.session_id:
             raise RuntimeError('此游戏上下文已有其他插件实例；请关闭旧实例并重启游戏')
@@ -235,7 +235,7 @@ return {{resident_id:id, capabilities:['energy']}};
                 raise RuntimeError('当前游戏会话尚未注入或已经失效')
             generation = self._generation
             # 每次动作先核对实际目标；只读探针可以重试，用户动作绝不重发。
-            if await self._appid() != TARGET_APPID:
+            if await self._appid() != self.TARGET_APPID:
                 self.invalidate()
                 raise RuntimeError('实际目标已变化，不执行插件命令')
             if generation != self._generation or self.context_id is None or self.session_id is None:

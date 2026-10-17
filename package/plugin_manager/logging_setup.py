@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import queue
+import sys
 from pathlib import Path
 
 
@@ -38,4 +39,10 @@ def start_file_logging(path: Path) -> FileLogging:
 def configure_logging(path: Path | None = None) -> FileLogging | None:
     """配置控制台与插件日志文件；传 None 时只配置控制台。"""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    if getattr(sys, "frozen", False):
+        # 打包后日志只落文件：--windowed 没有控制台，从命令行启动时也不该有残留输出
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            if isinstance(handler, logging.StreamHandler):
+                root.removeHandler(handler)
     return start_file_logging(path) if path is not None else None

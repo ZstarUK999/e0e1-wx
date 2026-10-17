@@ -154,7 +154,7 @@ class AutomationScheduler:
             self.state.blocked = str(exc)
             self.state.blocked_session = self.state.installed or self.state.blocked_session
             message = '已暂停：' + str(exc)
-            self.view.set_connection(connected=self.view.game_connected, target_appid=TARGET_APPID, runtime_ready=False)
+            self.view.set_connection(connected=self.view.game_connected, target_appid=getattr(self.transport, 'TARGET_APPID', TARGET_APPID), runtime_ready=False)
             LOG.warning('插件任务暂停：%s', exc)
         finally:
             self._task_due[task_id] = time.monotonic() + delay

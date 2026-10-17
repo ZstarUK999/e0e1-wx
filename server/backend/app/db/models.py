@@ -19,8 +19,10 @@ class Player(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     player_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    nickname: Mapped[str] = mapped_column(String(64), default="")
-    guild: Mapped[str] = mapped_column(String(64), default="")  # 最近一次上报的阴司名
+    nickname: Mapped[str] = mapped_column(String(64), default="")   # 管理员自己填的备注
+    # 下面两个由客户端上报自动刷新，管理员不用填
+    role_name: Mapped[str] = mapped_column(String(64), default="")  # 游戏角色名（昵称）
+    guild: Mapped[str] = mapped_column(String(64), default="")      # 最近一次上报的阴司名
     note: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -34,6 +36,7 @@ class HandshakeLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     player_id: Mapped[str] = mapped_column(String(64), index=True, default="")
     bound_player_id: Mapped[str] = mapped_column(String(64), default="")
+    player_name: Mapped[str] = mapped_column(String(64), default="")  # 上报时的角色名
     guild: Mapped[str] = mapped_column(String(64), default="")
     client_version: Mapped[str] = mapped_column(String(32), default="")
     remote: Mapped[str] = mapped_column(String(64), default="")

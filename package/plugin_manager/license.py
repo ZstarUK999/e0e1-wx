@@ -56,3 +56,21 @@ def verify(payload: dict | None) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     return ed25519.verify(LICENSE_PUBLIC_KEY, signature, message)
+
+
+def bound_player_id(payload: dict | None = None) -> tuple[str | None, str]:
+    """验签后取出绑定的 player_id，返回 (绑定ID, 失败原因)。
+
+    必须先验签再比对：少了这一步，别人把 license.bin 里的 player_id 改成自己的号
+    就能白用。ID 与原因二选一——返回了 ID 就说明这份授权可信，原因必然为空。
+    """
+    if payload is None:
+        payload = load()
+    if payload is None:
+        return None, "缺少授权文件 license.bin"
+    if not verify(payload):
+        return None, "授权文件无效或已被篡改"
+    bound = str(payload.get("player_id") or "")
+    if not bound:
+        return None, "license.bin 里没有 player_id"
+    return bound, ""

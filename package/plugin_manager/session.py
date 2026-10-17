@@ -76,7 +76,7 @@ class GameSession:
         if message and message != self._last_state_message and not _is_routine_status(message):
             self._last_state_message = message
             LOG.info('调试状态：%s', message)
-        epoch = (state.get('cdp_port'), state.get('miniapp_epoch'))
+        epoch = (state.get('cdp_port') or state.get('transport_key'), state.get('miniapp_epoch'))
         if self.state.installed is not None and (not state.get('miniapp') or epoch != self.state.epoch):
             self.state.stop_operation = True
             self.transport.invalidate()
@@ -92,7 +92,7 @@ class GameSession:
         只有一直拿不到 CDP 时才重发一次会话请求。
         """
         state = self.engine_state
-        if state.get('cdp_port') and state.get('miniapp'):
+        if (state.get('cdp_port') or state.get('transport_ready')) and state.get('miniapp'):
             self._debug_retries = 0
             return
         if not self._started:
@@ -124,4 +124,4 @@ class GameSession:
 
     def stale(self, epoch) -> bool:
         """引擎状态是否已经变了：每次 await 之后都要用它复核再改界面或发命令。"""
-        return epoch != (self.engine_state.get('cdp_port'), self.engine_state.get('miniapp_epoch'))
+        return epoch != (self.engine_state.get('cdp_port') or self.engine_state.get('transport_key'), self.engine_state.get('miniapp_epoch'))

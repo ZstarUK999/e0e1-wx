@@ -16,6 +16,7 @@ class LogOut(BaseModel):
     id: int
     player_id: str
     bound_player_id: str
+    player_name: str
     guild: str
     client_version: str
     remote: str
@@ -41,6 +42,7 @@ def list_logs(
             id=item.id,
             player_id=item.player_id or "",
             bound_player_id=item.bound_player_id or "",
+            player_name=item.player_name or "",
             guild=item.guild or "",
             client_version=item.client_version or "",
             remote=item.remote or "",

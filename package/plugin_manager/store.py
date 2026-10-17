@@ -17,7 +17,12 @@ from .paths import default_config_path
 
 SECONDS_MAX = 604800
 PRIORITY_MAX = 1000000
+BLOODMOON_POWER_MAX = 9007199254740991  # JavaScript safe integer; independent from task priorities.
 RATIO_MIN = 0.01
+
+# 九个已定义任务；构建期开关关掉的那些不进配置（见 default_config）。
+TASK_IDS = ("energy", "offline_reward", "sanshi_tombs", "artifact_tombs",
+            "sanshi_raid", "artifact_raid", "sanshi_fill", "artifact_fill", "arena")
 
 
 def _check_seconds(value, label):
@@ -71,7 +76,7 @@ def default_config() -> dict:
                        "max_attempts": 200, "expected_rate": 30.0},
             "bloodmoon": {"enabled": False,
                           "flag_probe": {"refresh_seconds": 5, "top_members": 3},
-                          "speed_up": {"enabled": False, "max_times": 3,
+                          "speed_up": {"enabled": False, "max_times": 15,
                                        "safety_margin_seconds": 2, "poll_seconds": 2},
                           "attack": {"enabled": False, "power_ratio": 100, "power_limit": 0,
                                      "max_battles": 10, "wait_seconds": 3},
@@ -87,15 +92,36 @@ def _unique(pairs):
     return result
 
 
+def _build_daily_tasks(raw_tasks) -> dict:
+    """按本次构建的开关裁出任务表：没打包的丢掉，缺的用默认值补上。
+
+    构建期关掉的任务不进默认配置（玩家也就无从打开），所以校验不能按「九个任务」
+    硬卡——否则任何关掉过任务的产物，在没写过配置的机器上都会因为默认配置少了
+    任务而加载失败。反过来，从完整版换到精简版时老配置里多出来的任务也不该把
+    整份配置判死。认不到的任务 id 仍然拒绝。
+    """
+    tasks = raw_tasks if isinstance(raw_tasks, dict) else {}
+    unknown = set(tasks) - set(TASK_IDS)
+    if unknown:
+        raise ValueError(f"插件GUI配置含未知任务：{'、'.join(sorted(unknown))}")
+    defaults = default_config()["daily"]["tasks"]
+    return {
+        task_id: copy.deepcopy(tasks.get(task_id, defaults[task_id]))
+        for task_id in TASK_IDS
+        if task_enabled(task_id)
+    }
+
+
 def validate_config(raw: dict) -> dict:
     if not isinstance(raw, dict) or not {"version", "daily", "player"}.issubset(raw) or set(raw) - {"version", "daily", "player", "ui", "treasure", "damage", "desire", "bloodmoon"}:
         raise ValueError("插件配置仅允许 version/daily/player/ui/treasure/damage/desire/bloodmoon，不接受运行状态")
     if type(raw["version"]) is not int or raw["version"] != 1:
         raise ValueError("插件配置 version 必须是1")
-    daily = parse_config(raw["daily"])
-    expected = {"energy", "offline_reward", "sanshi_tombs", "artifact_tombs", "sanshi_raid", "artifact_raid", "sanshi_fill", "artifact_fill", "arena"}
-    if set(daily.tasks) != expected:
-        raise ValueError("插件GUI配置必须包含九个已定义任务")
+    raw_daily = raw["daily"]
+    if isinstance(raw_daily, dict):
+        raw_daily = dict(raw_daily)
+        raw_daily["tasks"] = _build_daily_tasks(raw_daily.get("tasks"))
+    daily = parse_config(raw_daily)
     for task_id, task in daily.tasks.items():
         kind = "daily_window" if task_id == "arena" else "interval"
         if task.schedule.kind != kind:
@@ -225,7 +251,7 @@ def _validate_bloodmoon(raw) -> dict:
         raise ValueError("bloodmoon.attack.enabled 必须是布尔开关")
     if type(attack["power_ratio"]) is not int or not 10 <= attack["power_ratio"] <= 200:
         raise ValueError("自动攻击战力比例必须是10至200的整数百分数")
-    if type(attack["power_limit"]) is not int or not 0 <= attack["power_limit"] <= PRIORITY_MAX:
+    if type(attack["power_limit"]) is not int or not 0 <= attack["power_limit"] <= BLOODMOON_POWER_MAX:
         raise ValueError("自动攻击战力上限必须是非负整数（0表示不限制）")
     if type(attack["max_battles"]) is not int or not 0 <= attack["max_battles"] <= 999:
         raise ValueError("自动攻击单轮最多场次必须是0至999的整数（0表示不限制）")

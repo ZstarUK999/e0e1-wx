@@ -26,7 +26,10 @@ APP_NAME = "e0e1-wx-plugins"
 class PluginApplication:
     """插件管理器的一次运行：持有配置路径、单实例锁与文件日志。"""
 
-    def __init__(self, config_path: Path | None = None) -> None:
+    def __init__(self, config_path: Path | None = None, *, platform: str | None = 'wechat') -> None:
+        if platform not in (None, 'wechat', 'douyin'):
+            raise ValueError('未知游戏平台')
+        self.platform = platform
         self.config_path = Path(config_path) if config_path is not None else default_config_path()
         self.log_file = log_path(self.config_path)
         self._guard = InstanceGuard(lock_path(self.config_path))
@@ -56,7 +59,23 @@ class PluginApplication:
         store = PluginConfigStore(self.config_path)
         window = window_module.PluginWindow(store)
         # 通过模块属性解析，保证测试替换 PluginRuntime / PluginWindow 与导入顺序无关。
-        runtime_module.PluginRuntime(window).start()
+        def connect(platform):
+            self.platform = platform
+            window.setWindowTitle('遗弃之地 · 插件管理器 · ' + ('抖音 PC' if platform == 'douyin' else '微信'))
+            if platform == 'douyin':
+                from .douyin import DouyinCache, DouyinService, DouyinTransport, douyin_ready
+                cache = DouyinCache(self.config_path.parent)
+                service = DouyinService(cache, window)
+                # Display is independent from authorization; only the Douyin branch subscribes.
+                service.player_id_changed.connect(window.set_bound_player_id)
+                runtime_module.PluginRuntime(window, service=service,
+                    transport=DouyinTransport(cache), process_ready=douyin_ready).start()
+            else:
+                runtime_module.PluginRuntime(window).start()
+        if self.platform is None:
+            window.select_platform(connect)
+        else:
+            connect(self.platform)
         return window
 
     @staticmethod
@@ -68,6 +87,8 @@ class PluginApplication:
             QMessageBox.information(None, title, text)
 
 
-def main(config_path: Path | None = None) -> int:
+def main(config_path: Path | None = None, *, platform: str | None = None) -> int:
     """插件管理器入口；config_path 用于测试指定配置位置。"""
-    return PluginApplication(config_path).run()
+    # Explicit config_path keeps embedded/test callers' existing WeChat default.
+    selected = platform if platform is not None else ('wechat' if config_path is not None else None)
+    return PluginApplication(config_path, platform=selected).run()

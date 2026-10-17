@@ -97,3 +97,31 @@ def test_profile_ignores_unknown_keys(tmp_path, monkeypatch):
         _write_profile(tmp_path, {"tasks": {"不存在的任务": False, "arena": False}})
     )
     assert profile["tasks"] == {"arena": False}
+
+
+def test_fresh_config_loads_when_a_task_is_disabled(features_at, tmp_path):
+    """关掉过任务的产物，在没写过配置的机器上也必须能起来。"""
+    features_at({"tasks": {"arena": False}})
+    tasks = store.PluginConfigStore(tmp_path / "plugins.json").snapshot()["daily"]["tasks"]
+    assert "arena" not in tasks and "energy" in tasks
+
+
+def test_old_config_survives_downgrade_to_a_trimmed_build(features_at, tmp_path):
+    """完整版配置换到精简版产物：多出来的任务不该把整份配置判死。"""
+    path = tmp_path / "plugins.json"
+    path.write_text(json.dumps(store.default_config(), ensure_ascii=False), encoding="utf-8")
+    features_at({"tasks": {"arena": False}})
+    features.reset_cache()  # 开关是进程内只读一次的，写完文件要重新读
+    tasks = store.PluginConfigStore(path).snapshot()["daily"]["tasks"]
+    assert "arena" not in tasks and "energy" in tasks
+
+
+def test_unknown_task_id_is_still_rejected(features_at):
+    raw = store.default_config()
+    raw["daily"]["tasks"]["ghost"] = raw["daily"]["tasks"]["energy"]
+    try:
+        store.validate_config(raw)
+    except ValueError as exc:
+        assert "ghost" in str(exc)
+    else:
+        raise AssertionError("认不到的任务 id 未被拒绝")

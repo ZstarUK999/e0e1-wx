@@ -22,6 +22,18 @@ from package.devtools.protocol_userscript import (
 from package.devtools.third_party import wmpf_debug_pb2 as proto
 
 
+def render_hook_debug_port(source: str, port: int) -> str:
+    """Keep the hook callback URL identical to the actual listening port."""
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError('Invalid debug port')
+    rendered, count = re.subn(r'(?m)^(\s*const\s+DEBUG_PORT\s*=\s*)\d+(\s*;)',
+                             lambda m: m.group(1) + str(port) + m.group(2), source)
+    if count != 1 and port != 9421:
+        raise RuntimeError('Hook 回连端口声明未核实，停止启动以避免端口不一致')
+    return rendered
+
+
 class DebugMessageBus:
     """Bridge messages between the miniapp debug server and DevTools proxy."""
 
@@ -639,6 +651,8 @@ class DebugEngine:
         script_content = hook_path.read_text(encoding="utf-8")
         config_content = json.dumps(json.loads(config_path.read_text(encoding="utf-8")))
         final_script = script_content.replace("@@CONFIG@@", config_content)
+        debug_port = getattr(getattr(self, 'options', None), 'debug_port', 9421)
+        final_script = render_hook_debug_port(final_script, debug_port)
 
         device = frida.get_local_device()
         session = None

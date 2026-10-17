@@ -18,9 +18,10 @@ message License {
 
 message HandshakeRequest {
   License license = 1;
-  string login_player_id = 2;   // 游戏里读到的 heroId
+  string login_player_id = 2;   // 游戏里读到的账号ID（g.ROLE.id）
   string guild_name = 3;        // 阴司名，只记录不校验
   string client_version = 4;
+  string player_name = 5;       // 角色名（昵称），只记录不校验
 }
 
 message HandshakeResponse {

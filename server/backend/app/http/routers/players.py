@@ -29,6 +29,7 @@ class PlayerOut(BaseModel):
     id: int
     player_id: str
     nickname: str
+    role_name: str   # 客户端上报的游戏角色名
     guild: str
     note: str
     enabled: bool
@@ -39,6 +40,7 @@ class PlayerOut(BaseModel):
             id=player.id,
             player_id=player.player_id,
             nickname=player.nickname or "",
+            role_name=player.role_name or "",
             guild=player.guild or "",
             note=player.note or "",
             enabled=bool(player.enabled),

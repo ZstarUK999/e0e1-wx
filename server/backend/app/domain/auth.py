@@ -67,12 +67,14 @@ def record(
     guild: str,
     client_version: str,
     remote: str,
+    player_name: str = "",
 ) -> None:
-    """落审计日志；公会名只记录不校验。"""
+    """落审计日志；公会名和角色名只记录不校验。"""
     session.add(
         HandshakeLog(
             player_id=verdict.player_id or bound_player_id,
             bound_player_id=bound_player_id,
+            player_name=player_name or "",
             guild=guild or "",
             client_version=client_version or "",
             remote=remote or "",
@@ -82,5 +84,8 @@ def record(
     )
     if verdict.allowed:
         player = session.query(Player).filter(Player.player_id == verdict.player_id).one_or_none()
-        if player is not None and guild:
-            player.guild = guild
+        if player is not None:
+            if guild:
+                player.guild = guild
+            if player_name:
+                player.role_name = player_name

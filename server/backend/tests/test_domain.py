@@ -107,13 +107,17 @@ def test_record_stores_guild_and_result(db):
         guild="测试阴司",
         client_version="1.2.0",
         remote="127.0.0.1:50000",
+        player_name="夜行客",
     )
     db.flush()
     from app.db.models import HandshakeLog
 
     row = db.query(HandshakeLog).one()
     assert row.allowed and row.guild == "测试阴司" and row.client_version == "1.2.0"
-    assert db.query(Player).one().guild == "测试阴司"
+    assert row.player_name == "夜行客"
+    player = db.query(Player).one()
+    assert player.guild == "测试阴司"
+    assert player.role_name == "夜行客"
 
 
 # ── 更新 ──

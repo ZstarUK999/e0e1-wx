@@ -824,3 +824,76 @@ def test_transport_refuses_foreign_target_and_invalidates_destroyed_context():
         with pytest.raises(RuntimeError):await transport.call('sweep')
         await transport.close()
     asyncio.run(run())
+
+
+def test_license_match_opens_ui_and_handshake_never_blocks(app,tmp_path,monkeypatch):
+    """门禁只认 license 绑定ID；后台 handshake 是上报，在飞或失败都不许拖住主 UI。"""
+    import threading
+    m=runtime()
+    from package.plugin_manager import build_info as build_info_module
+    from package.plugin_manager import license as license_module
+    from package.plugin_manager import server_client
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        entered,release=threading.Event(),threading.Event()
+        try:
+            monkeypatch.setattr(m,'build_info',lambda:build_info_module.BuildInfo('release','1.0.0','localhost:1'))
+            monkeypatch.setattr(m.updater,'check',lambda **kwargs:None)
+            monkeypatch.setattr(license_module,'load',lambda:{'player_id':'role-7'})
+            monkeypatch.setattr(license_module,'verify',lambda payload:True)
+            calls=[]
+            def slow_handshake(**kwargs):
+                calls.append(kwargs)
+                entered.set()
+                release.wait(5)   # 后台很慢，但主 UI 不能等它
+                return server_client.HandshakeResult(False,'denied','后台未放行','9.9.9',True)
+            monkeypatch.setattr(server_client,'handshake',slow_handshake)
+            original=t.call
+            async def call(op,args=None):
+                if op=='identity':return {'player_id':'role-7','legion_name':'阴司'}
+                return await original(op,args)
+            t.call=call
+            await ready(c,s)
+            # 上报还在飞（甚至还没调度到），主 UI 已经放出来了。
+            assert w.main_ui_shown
+            assert not c.state.blocked
+            for _ in range(200):
+                if entered.is_set():break
+                await asyncio.sleep(0.01)
+            assert entered.is_set(),'登录信息应该报给后台'
+            release.set()
+            await asyncio.wait_for(c._handshake_job, 10)   # 等它真正跑完，别留个被取消的任务
+            assert calls==[{'player_id':'role-7','legion_name':'阴司','player_name':''}]
+            assert not c.state.blocked,'后台不放行／要求更新都不能拦住已放行的用户'
+            assert w.main_ui_shown
+        finally:
+            release.set()
+            await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+def test_license_mismatch_keeps_ui_on_gate(app,tmp_path,monkeypatch):
+    m=runtime()
+    from package.plugin_manager import build_info as build_info_module
+    from package.plugin_manager import license as license_module
+    from package.plugin_manager import server_client
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        try:
+            monkeypatch.setattr(m,'build_info',lambda:build_info_module.BuildInfo('release','1.0.0','localhost:1'))
+            monkeypatch.setattr(license_module,'load',lambda:{'player_id':'role-7'})
+            monkeypatch.setattr(license_module,'verify',lambda payload:True)
+            monkeypatch.setattr(server_client,'handshake',lambda **kwargs:pytest.fail('门禁没过就不该上报'))
+            original=t.call
+            async def call(op,args=None):
+                if op=='identity':return {'player_id':'role-9'}
+                return await original(op,args)
+            t.call=call
+            await ready(c,s)
+            assert not w.main_ui_shown
+            assert w.gate.title.text()=='此账号未授权'
+            assert 'role-9' in w.gate.detail.text()
+            assert c.state.blocked
+        finally:
+            await c.shutdown();w.close()
+    asyncio.run(run())

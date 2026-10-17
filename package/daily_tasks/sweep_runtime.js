@@ -794,7 +794,9 @@ function createEnergyRuntime(g, timing) {
     const role=r.id!=null?String(r.id):'';
     const hero=r.heroId!=null?String(r.heroId):'';
     const legion=(r.legion && (r.legion.legionName||r.legion.name)) || r.legionName || '';
-    return {player_id:role||hero, role_id:role, hero_id:hero, legion_name:String(legion||'')};
+    // name 是玩家的角色名（昵称），后台用它显示"是谁在用来"
+    return {player_id:role||hero, role_id:role, hero_id:hero,
+            name:String(r.name||''), legion_name:String(legion||'')};
   }
 
   function playerInformation() {

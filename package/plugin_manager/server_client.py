@@ -63,7 +63,7 @@ def _stub(target: str):
     return plugin_pb2_grpc.PluginServiceStub(channel), channel
 
 
-def handshake(*, player_id: str, legion_name: str) -> HandshakeResult:
+def handshake(*, player_id: str, legion_name: str, player_name: str = "") -> HandshakeResult:
     """启动时的一次性鉴权。
 
     后台连得上就以后台裁决为准（白名单生效）；连不上则退化为本地比对——
@@ -79,7 +79,7 @@ def handshake(*, player_id: str, legion_name: str) -> HandshakeResult:
         return HandshakeResult(False, "no_license", "缺少授权文件 license.bin", "", False)
 
     try:
-        return _rpc_handshake(payload, player_id, legion_name, info)
+        return _rpc_handshake(payload, player_id, legion_name, info, player_name)
     except Exception as exc:
         LOG.warning('后台不可用，转本地校验：%s', exc)
         return _offline_verdict(payload, player_id)
@@ -90,17 +90,17 @@ def _offline_verdict(payload: dict, player_id: str) -> HandshakeResult:
 
     少了验签这一步，别人拿到包把 player_id 改成自己的号就能离线白用。
     """
-    if not license_module.verify(payload):
+    bound, reason = license_module.bound_player_id(payload)
+    if bound is None:
         return HandshakeResult(
             False,
             "invalid_license",
-            "授权文件无效或已被篡改",
+            reason,
             "",
             False,
             offline=True,
         )
-    bound = str(payload.get("player_id") or "")
-    if bound and bound == str(player_id or ""):
+    if bound == str(player_id or ""):
         return HandshakeResult(
             True, "offline_ok", "后台不可用，已按本地绑定放行", "", False, offline=True
         )
@@ -109,7 +109,9 @@ def _offline_verdict(payload: dict, player_id: str) -> HandshakeResult:
     )
 
 
-def _rpc_handshake(payload: dict, player_id: str, legion_name: str, info) -> HandshakeResult:
+def _rpc_handshake(
+    payload: dict, player_id: str, legion_name: str, info, player_name: str = ""
+) -> HandshakeResult:
     try:
         stub, channel = _stub(info.target)
     except ImportError as exc:
@@ -130,6 +132,7 @@ def _rpc_handshake(payload: dict, player_id: str, legion_name: str, info) -> Han
             ),
             login_player_id=str(player_id or ""),
             guild_name=str(legion_name or ""),
+            player_name=str(player_name or ""),
             client_version=info.version,
         )
         response = stub.Handshake(request, timeout=15)

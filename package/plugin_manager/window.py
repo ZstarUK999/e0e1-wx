@@ -9,11 +9,12 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QGridLayout, QLabel, QMainWindow, QMessageBox,
-    QScrollArea, QSplitter, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QPushButton, QHBoxLayout, QScrollArea, QSplitter, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from package.ui.offset_dialog import OffsetDialogController
 from .debug_link import open_chrome, valid_debug_link
+from .gate import PHASE_INIT, StartupGate
 from .feature_flags import panel_enabled, task_enabled
 from .panels import BloodmoonPanel, DailyPanel, DamagePanel, DebugPanel, DesirePanel, GlobalPanel, PlayerPanel, TaskPanel, TreasurePanel
 from .store import PluginConfigStore
@@ -68,7 +69,15 @@ class PluginWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([210, 870])
-        self.setCentralWidget(splitter)
+        # 调试链路与账号校验就绪前只显示门禁占位面板，不把整套功能面板铺开。
+        self.gate = StartupGate()
+        self.gate.set_phase(PHASE_INIT, "正在建立调试链路")
+        self._splitter = splitter
+        self._root = QStackedWidget()
+        self._root.addWidget(self.gate)
+        self._root.addWidget(splitter)
+        self.setCentralWidget(self._root)
+        self._main_shown = False
         self.pages, self.task_panels, self.items = {}, {}, {}
         self._test_actions = {}
         self._add_page("global", GlobalPanel(self.store))
@@ -108,6 +117,8 @@ class PluginWindow(QMainWindow):
         self.statusBar().addWidget(self.action_label, 1)
         self.statusBar().addPermanentWidget(self.bound_id_label)
         self.statusBar().addPermanentWidget(self.connection_label)
+        # 门禁阶段状态栏也一起收起来，占位面板才是真的"空白"。
+        self.statusBar().setVisible(False)
         self.store.changed.connect(self.configuration_changed.emit)
         self.pages["daily"].automation_requested.connect(self.automation_requested.emit)
         treasure = self.pages["treasure"]
@@ -135,6 +146,39 @@ class PluginWindow(QMainWindow):
         player = self.pages["player"]
         player.copy_button.clicked.connect(self._copy_information)
         player.export_button.clicked.connect(self._export_information)
+
+    def select_platform(self, callback):
+        """Choose the host before constructing any debug service or patching files."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addStretch()
+        title = QLabel('选择游戏平台')
+        title.setObjectName('panelTitle')
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        note = QLabel('请选择《遗弃之地》当前运行的平台')
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        row.addStretch()
+        buttons = []
+        def choose(platform):
+            for button in buttons:
+                button.setEnabled(False)
+            self._root.setCurrentWidget(self.gate)
+            callback(platform)
+        for platform, label in (('wechat', '微信小游戏'), ('douyin', '抖音 PC 小游戏')):
+            button = QPushButton(label)
+            button.setMinimumSize(180, 52)
+            button.clicked.connect(lambda checked=False, key=platform: choose(key))
+            row.addWidget(button)
+            buttons.append(button)
+        row.addStretch()
+        layout.addLayout(row)
+        layout.addStretch()
+        self.platform_buttons = dict(zip(('wechat', 'douyin'), buttons))
+        self._root.addWidget(page)
+        self._root.setCurrentWidget(page)
 
     def _add_page(self, key, widget):
         self.pages[key] = widget
@@ -173,6 +217,33 @@ class PluginWindow(QMainWindow):
     def _select_page(self, item, previous):
         if item is not None:
             self.stack.setCurrentWidget(self.pages[item.data(0, Qt.ItemDataRole.UserRole)])
+
+    def set_gate(self, phase: str, detail: str = "") -> None:
+        """退回门禁占位面板；已经进过主 UI 的先把主 UI 收回去。
+
+        由 PluginRuntime 按真实连接进度调用：链路未就绪 → init，链路就绪等游戏 →
+        wait_game，游戏已接入挂载脚本 → mounting，账号授权对不上 → denied
+        （带读到的ID，不做任何伪装）。
+        """
+        self.gate.set_phase(phase, detail)
+        if self._main_shown:
+            self._main_shown = False
+            self.statusBar().setVisible(False)
+        if self._root.currentWidget() is not self.gate:
+            self._root.setCurrentWidget(self.gate)
+
+    def show_main_ui(self) -> None:
+        """连接与账号校验都通过后，切到真正的面板；重复调用无副作用。"""
+        if self._main_shown:
+            return
+        self._main_shown = True
+        self.gate.spinner.stop()
+        self.statusBar().setVisible(True)
+        self._root.setCurrentWidget(self._splitter)
+
+    @property
+    def main_ui_shown(self) -> bool:
+        return self._main_shown
 
     def attach_runtime(self, capabilities):
         self._runtime_attached = True

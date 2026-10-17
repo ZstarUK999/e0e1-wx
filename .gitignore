@@ -7,6 +7,8 @@ build/
 server/backend/certs/
 server/backend/data/
 server/backend/.env
+# 发布脚本里写了管理员密码，不入库
+publish.bat
 .venv
 __pycache__
 logs

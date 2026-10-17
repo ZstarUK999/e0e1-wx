@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name 血月战场·战旗探测／正常加速／正常挑战／水旗标注
-// @description 只读战场同步数据（阴司成员战旗、行军、节点队列）；加速与挑战只点正常按钮，保留冷却、最小剩余时间、道具与状态限制；水旗标识只画在原本就可见的单位上。
+// @name 血月战场·战旗探测／正常加速／正常挑战／隐匿状态标注
+// @description 只读战场同步数据（阴司成员战旗、行军、节点队列）；加速与挑战只点正常按钮，保留冷却、最小剩余时间、道具与状态限制；隐匿标识只画在原本就可见的单位上。
 // @match *
 // @run-at document-start
 // @e0e1-mode runtime_toggle
@@ -20,10 +20,49 @@
   if (g.e0e1Season) return;
 
   var lib = {};
+  var actionTrace = null, serial = 0;
+  function trace(step, values) {
+    // Freeze before awaiting: later map sync must not rewrite earlier evidence.
+    var snapshot;
+    try { snapshot = JSON.parse(JSON.stringify(values || {})); }
+    catch (e) { snapshot = { serializationError: String(e), fields: Object.keys(values || {}) }; }
+    var row = { step: step, at: Date.now(), values: snapshot };
+    if (actionTrace) actionTrace.push(row);
+    try { g.console.info('[bloodmoon]', JSON.stringify(row)); } catch (e) { }
+  }
+  function traceException(step, error, values) {
+    trace(step, { error: String(error), stack: error && error.stack, context: values || {} });
+  }
+  function exportCall(name, fn) {
+    return async function (args) {
+      var mutating = name === 'speedUp' || name === 'attack';
+      var ownTrace = [], id = ++serial;
+      // A concurrent read must not replace the in-flight action's trace.
+      if (!actionTrace) actionTrace = ownTrace;
+      trace(name + '.begin', { id: id, args: args || {}, pending: state.pending,
+        uncertain: state.uncertain, outstanding: state.outstanding,
+        marchKey: state.marchKey, speedTimes: state.speedTimes, battles: state.battles,
+        systemPresent: !!g.System, uiPresent: !!g.UIManager, rolePresent: !!g.ROLE,
+        modulePresent: !!g.seasonModule, warId: g.seasonModule && g.seasonModule.enteredMapId });
+      var result;
+      try { result = await fn(args); }
+      catch (e) {
+        trace(name + '.exception', { message: String(e), stack: e && e.stack });
+        result = bad(String(e), mutating ? 'uncertain' : 'unavailable');
+      }
+      trace(name + '.end', { id: id, result: JSON.parse(JSON.stringify(result)) });
+      result.trace = ownTrace.slice();
+      if (actionTrace === ownTrace) actionTrace = null;
+      return result;
+    };
+  }
   var state = {
+    dispatched: false,
+    markError: null,
+    outstanding: 0,
     pending: false,        // 有动作在途，禁止并发
     uncertain: false,      // 上次动作结果未知，停止后续自动动作
-    marks: [],             // 已挂的「隐身水旗」节点
+    marks: [],             // 已挂的「隐匿中」节点
     markTimer: null,
     speedTimes: 0,         // 本次行军已成功加速次数
     marchKey: '',          // 当前行军标识，变了就重置计数
@@ -32,7 +71,7 @@
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function log(m) { try { g.console.info('[plugin.ui]', String(m)); } catch (e) { } }
-  function bad(message, status) { return { ok: false, status: status || 'unavailable', message: String(message) }; }
+  function bad(message, status) { if (status === 'uncertain') state.uncertain = true; trace('branch.stop', {status: status || 'unavailable', message: String(message)}); return { ok: false, status: status || 'unavailable', message: String(message) }; }
   function done(payload) { var out = { ok: true, status: 'ok' }; for (var k in (payload || {})) out[k] = payload[k]; return out; }
   function chunk(name) { return g.System.import('chunks:///_virtual/' + name); }
 
@@ -42,6 +81,7 @@
     if (!lib.defs) lib.defs = await chunk('define-index.ts');
     if (!lib.data) lib.data = await chunk('configs.ts');
     if (!lib.helper) lib.helper = (await chunk('role-helper.ts')).roleHelper;
+    if (!lib.shop) lib.shop = (await chunk('shop-helper.ts')).shopHelper;
     if (!lib.manager) lib.manager = (await chunk('service-manager.ts')).ServiceManager.ins;
     if (!lib.ButtonPlus) lib.ButtonPlus = (await chunk('button-plus.ts')).default;
     if (!lib.signalMod) lib.signalMod = await chunk('season-map-signal.ts');
@@ -53,14 +93,14 @@
   function mapData() {
     var m = module_();
     if (m && typeof m.getSeasonMapData === 'function') {
-      try { var d = m.getSeasonMapData(); if (d) return d; } catch (e) { }
+      try { var d = m.getSeasonMapData(); if (d) return d; } catch (e) { traceException('mapData.exception', e); }
     }
     return g.SEASON_MAP || null;
   }
   function myRole() {
     var m = module_();
     if (m && typeof m.getSeasonMapMyRole === 'function') {
-      try { var r = m.getSeasonMapMyRole(); if (r) return r; } catch (e) { }
+      try { var r = m.getSeasonMapMyRole(); if (r) return r; } catch (e) { traceException('myRole.exception', e); }
     }
     return null;
   }
@@ -71,12 +111,13 @@
   }
   function num(v, d) { var n = Number(v); return isFinite(n) ? n : (d || 0); }
 
-  async function serverNow() {
+  async function serverNow(strict) {
     try {
       var mod = await chunk('date-util.ts');
       var clock = mod && mod.default;
       if (clock && Number(clock.serverTime) > 0) return Number(clock.serverTime);
-    } catch (e) { }
+    } catch (e) { trace('clock.exception', { strict: !!strict, message: String(e), stack: e && e.stack }); }
+    if (strict) return 0;
     return Date.now();
   }
 
@@ -86,7 +127,7 @@
       var data = m && m.seasonBattleFlagData;
       var cfg = data && typeof data.getFlagConfig === 'function' ? data.getFlagConfig(id) : null;
       return cfg || null;
-    } catch (e) { return null; }
+    } catch (e) { traceException('flagConfig.exception', e, {flagId:id}); return null; }
   }
   function flagName(id) {
     var cfg = flagConfig(id);
@@ -107,37 +148,87 @@
       var ext = role && role.ext;
       var v = ext && typeof ext.get === 'function' ? ext.get(4) : (ext ? ext[4] : 0);
       return parseInt(v, 10) > 0;
-    } catch (e) { return false; }
+    } catch (e) { traceException('stealth.exception', e, {roleId:role && role.id}); return false; }
   }
   function stateName(s) {
     return { 0: '未入场', 1: '待命', 2: '行军', 3: '战斗', 4: '阵亡', 5: '观战' }[num(s, 0)] || ('状态' + s);
   }
   function constants() {
-    try { return (lib.data && lib.data.SeasonConstantCfg && lib.data.SeasonConstantCfg.config) || null; } catch (e) { return null; }
+    try { return (lib.data && lib.data.SeasonConstantCfg && lib.data.SeasonConstantCfg.config) || null; } catch (e) { traceException('constants.exception', e); return null; }
   }
   function openUI(id) { return g.UIManager && g.UIManager.ins ? g.UIManager.ins.findOpen(id) : null; }
 
-  async function serviceCall(action) {
-    // 旁观真实请求：把 ServiceManager.service 包一层，拿这次点击实际发出的请求回执。
+  async function serviceCall(action, name, expected) {
     var manager = lib.manager, original = manager.service, calls = [];
+    var fnExpected = lib.defs.SeasonService && lib.defs.SeasonService[name];
+    if (typeof fnExpected !== 'function') throw new Error('请求方法未核实：' + name);
     var wrapper = function (fn) {
-      var args = Array.prototype.slice.call(arguments, 1);
-      var promise = original.apply(this, [fn].concat(args));
+      var args = Array.prototype.slice.call(arguments, 1), params = args[0] || {};
+      var matches = fn === fnExpected && Object.keys(expected).every(function (key) {
+        return String(params[key]) === String(expected[key]);
+      });
+      if (!matches) {
+        trace('rpc.ignored', { expected: name, sameMethod: fn === fnExpected,
+          warId: params.warId, targetId: params.targetId });
+        return original.apply(this, [fn].concat(args));
+      }
       var record = { settled: false, error: '', value: null };
-      calls.push(record);
-      Promise.resolve(promise).then(function (v) { record.settled = true; record.value = v || null; },
-        function (e) { record.settled = true; record.error = String((e && e.message) || e || ''); });
+      calls.push(record); state.outstanding++; state.dispatched = true;
+      trace('rpc.sent', { method: name, params: expected, matchedCalls: calls.length });
+      var promise;
+      try { promise = original.apply(this, [fn].concat(args)); }
+      catch (e) { state.outstanding--; record.settled = true; record.error = String(e); throw e; }
+      Promise.resolve(promise).then(function (v) {
+        record.settled = true; record.value = v; state.outstanding--;
+        trace('rpc.settled', { method: name, value: v });
+      }, function (e) {
+        record.settled = true; record.error = String((e && e.message) || e); state.outstanding--;
+        trace('rpc.exception', { method: name, error: record.error, stack: e && e.stack });
+      });
       return promise;
     };
     manager.service = wrapper;
-    try { await action(); } finally {
-      var end = Date.now() + 1000;
-      while (Date.now() < end && (!calls.length || !calls[0].settled)) await sleep(50);
-      manager.service = original;
-    }
-    if (!calls.length) return { called: false, error: '' };
+    try {
+      await action();
+      // One bounded observation window; an expired request is never replayed.
+      var end = Date.now() + 1500;
+      while (Date.now() < end && !calls.length) await sleep(50);
+      end = Date.now() + 8000;
+      while (Date.now() < end && calls.length && !calls[0].settled) await sleep(50);
+    } finally { if (manager.service === wrapper) manager.service = original; }
     var first = calls[0];
-    return { called: true, settled: first.settled, error: first.error, value: first.value };
+    var out = { called: !!first, settled: !!(first && first.settled),
+      error: first ? first.error : '', value: first ? first.value : null, count: calls.length };
+    trace('rpc.observed', { method: name, expected: expected, receipt: out });
+    return out;
+  }
+
+  function checkReceipt(receipt, label) {
+    if (!receipt.called || !receipt.settled || receipt.count !== 1 || receipt.error)
+      return bad(label + '请求没有唯一明确回执：' + JSON.stringify(receipt), 'uncertain');
+    var value = receipt.value;
+    if (!value || !Object.prototype.hasOwnProperty.call(value, 'err'))
+      return bad(label + '回执格式未核实', 'uncertain');
+    if (value.err) return bad(label + '被拒绝：' + JSON.stringify(value.err), 'rejected');
+    if (value.err !== null) return bad(label + '成功标志未核实', 'uncertain');
+    return null;
+  }
+
+  function marchIdentity(m, me, move) {
+    if (!me || num(me.state) !== 2) return '';
+    if (!move) return state.marchKey;
+    // arrive changes after speed-up; start may also be supplied by a later sync.
+    // Retain the budget until an idle state or a different route is observed.
+    return [m.enteredMapId, me.id, move.to && move.to.x, move.to && move.to.y].join(':');
+  }
+  function syncMarch(m, me, move) {
+    var key = marchIdentity(m, me, move);
+    if (key !== state.marchKey) {
+      trace('march.budget', { previous: state.marchKey, next: key, previousTimes: state.speedTimes,
+        start: move && move.start, arrive: move && move.arrive });
+      state.marchKey = key; state.speedTimes = 0;
+    }
+    return key;
   }
 
   function asButton(control) {
@@ -147,22 +238,36 @@
       try {
         var b = (lib.ButtonPlus && control.getComponent(lib.ButtonPlus)) || control.getComponent(lib.cc.Button);
         if (b) return b;
-      } catch (e) { }
+      } catch (e) { traceException('button.component.exception', e); }
     }
     return control;
   }
 
-  async function clickButton(control) {
+  async function clickButton(control, guard) {
     var button = asButton(control);
     var node = button && (button.node || button);
+    trace('button.preflight', { control: !!control, button: !!button, node: !!node,
+      name: node && node.name, emit: !!(node && typeof node.emit === 'function'),
+      interactable: button && button.interactable, enabled: button && button.enabledInHierarchy,
+      active: node && node.activeInHierarchy, continuous: button && button.continuous,
+      clickInteractable: button && button.clickInteractable });
     if (!node || typeof node.emit !== 'function') throw new Error('按钮节点不可用');
     if (button.interactable === false || button.enabledInHierarchy === false || node.activeInHierarchy === false)
       throw new Error('按钮当前不可点击');
     var waited = 0;
     while (button.continuous || button.clickInteractable === false) {
-      if (waited >= 3000) throw new Error('按钮仍在防连点/等待操作');
+      if (waited >= 3000) {
+        trace('button.waitTimeout', { waited: waited, continuous: button.continuous, clickInteractable: button.clickInteractable });
+        throw new Error('按钮仍在防连点/等待操作');
+      }
       await sleep(100); waited += 100;
     }
+    if (button.interactable === false || button.enabledInHierarchy === false || node.activeInHierarchy === false)
+      throw new Error('等待后按钮已不可点击');
+    if (guard) await guard();
+    trace('button.click', { name: node.name || '', interactable: button.interactable,
+      enabled: button.enabledInHierarchy, active: node.activeInHierarchy,
+      continuous: button.continuous, clickInteractable: button.clickInteractable });
     for (var i = 0; i < 2; i++) {
       var type = i === 0 ? lib.cc.Node.EventType.TOUCH_START : lib.cc.Node.EventType.TOUCH_END;
       var ev = lib.cc.EventTouch ? new lib.cc.EventTouch([], true, type) : { type: type };
@@ -176,7 +281,7 @@
     var end = Date.now() + (ms || 5000);
     while (Date.now() < end) {
       var v = null;
-      try { v = predicate(); } catch (e) { v = null; }
+      try { v = predicate(); } catch (e) { traceException('wait.predicate.exception', e, {message:message, timeoutMs:ms}); v = null; }
       if (v) return v;
       await sleep(100);
     }
@@ -265,9 +370,9 @@
     if (!m) return bad('血月模块尚未初始化');
     var data = mapData(), me = myRole();
     if (!me) return bad('当前没有自己的战场角色（可能还未入场）');
-    var now = await serverNow();
+    var now = await serverNow(true);
     var move = null;
-    try { move = (data && data.moveInfos && data.moveInfos.get) ? data.moveInfos.get(me.id) : null; } catch (e) { move = null; }
+    try { move = (data && data.moveInfos && data.moveInfos.get) ? data.moveInfos.get(me.id) : null; } catch (e) { traceException('march.read.exception', e, {roleId:me.id}); move = null; }
     var conf = constants() || {};
     var cd = num(conf.MarchSpeedUpCD, 0), minTime = num(conf.MarchSpeedUpMinTime, 0);
     var op = null, ui = openUI('SeasonMapUI');
@@ -275,12 +380,13 @@
     var cooldownUntil = op ? num(op._speedCooldownUntil, 0) : 0;
     var remainMs = move && move.arrive ? num(move.arrive) - now : 0;
     var item = conf.MarchSpeedUpItem || null;
-    var itemReady = true, itemNeed = '';
+    var itemReady = false, itemNeed = '';
     if (Array.isArray(item) && item.length >= 2) {
-      try { itemReady = num(lib.helper.getItemCount(item[0]), 0) >= num(item[1], 0); } catch (e) { itemReady = true; }
+      try { itemReady = num(lib.shop.getItemCount(item[0]), 0) >= num(item[1], 0); } catch (e) { itemReady = false; trace('item.exception', {message: String(e)}); }
       itemNeed = item[0] + '×' + item[1];
     }
     var reasons = [];
+    if (!now) reasons.push('服务器时钟未就绪');
     if (!constants()) reasons.push('加速配置未读取到，不自动点击');
     if (num(me.state) !== 2) reasons.push('自己不在行军中');
     if (!move) reasons.push('没有行军数据');
@@ -289,8 +395,7 @@
     if (!itemReady) reasons.push('加速道具不足（' + itemNeed + '）');
     if (op && op._speedUpDisabledReason) reasons.push(String(op._speedUpDisabledReason));
     if (!op) reasons.push('血月地图界面未打开');
-    var key = move ? (num(move.arrive) + ':' + (move.to ? move.to.x + '_' + move.to.y : '')) : '';
-    if (key !== state.marchKey) { state.marchKey = key; state.speedTimes = 0; }
+    syncMarch(m, me, move);
     return done({
       war_id: m.enteredMapId || '', server_now: now,
       self: { roleId: num(me.id), name: me.name || '', power: num(me.power), state: num(me.state),
@@ -314,7 +419,7 @@
     args = args || {};
     if (state.pending) return bad('上一条命令尚未结束', 'uncertain');
     if (state.uncertain) return bad('前次操作结果未知，已停止自动操作', 'uncertain');
-    state.pending = true;
+    state.pending = true; state.dispatched = false;
     try {
       await libs();
       var m = module_();
@@ -326,6 +431,9 @@
       var me = myRole();
       var data = mapData();
       var move = (data && data.moveInfos && data.moveInfos.get && me) ? data.moveInfos.get(me.id) : null;
+      trace('speed.context', { module: !!m, ui: !!ui, op: !!op, me: me, move: move,
+        conf: constants(), cooldownUntil: op._speedCooldownUntil, disabledReason: op._speedUpDisabledReason,
+        shopCountAvailable: !!(lib.shop && typeof lib.shop.getItemCount === 'function') });
       if (!move || !move.to) return bad('当前没有正在进行的行军', 'rejected');
       if (num(me.state) !== 2) return bad('自己不在行军中', 'rejected');
       var sig = null, mod = lib.signalMod;
@@ -334,35 +442,54 @@
       else { for (var k in mod || {}) { var v = mod[k]; if (v && v.buildingInteracted) { sig = v.buildingInteracted; break; } } }
       if (!sig) return bad('地图信号未解析，未点击');
       if (op._speedUpDisabledReason) return bad(String(op._speedUpDisabledReason), 'rejected');
-      var now = await serverNow();
+      var now = await serverNow(true);
+      if (!now) return bad('服务器时钟未就绪，不点击', 'rejected');
       if (num(op._speedCooldownUntil, 0) > now) return bad('加速冷却未结束', 'rejected');
       var conf = constants();
       if (!conf) return bad('加速配置未读取到，不点击');
-      var marginMs = num(args.safety_margin_seconds, 0) * 1000;
+      syncMarch(m, me, move);
+      var limit = num(args.max_times, 0);
+      if (limit > 0 && state.speedTimes >= limit) return bad('本次行军加速已达上限', 'rejected');
+      var item = conf.MarchSpeedUpItem;
+      var itemCount = Array.isArray(item) ? num(lib.shop.getItemCount(item[0]), -1) : -1;
+      trace('speed.preflight', { warId: m.enteredMapId, selfState: me.state, move: move,
+        now: now, cooldownUntil: op._speedCooldownUntil, disabledReason: op._speedUpDisabledReason,
+        conf: conf, itemCount: itemCount, times: state.speedTimes, limit: limit, args: args });
+      if (!Array.isArray(item) || item.length < 2 || itemCount < num(item[1]))
+        return bad('加速道具配置或数量不足', 'rejected');
+      if (!isFinite(Number(conf.MarchSpeedUpMinTime)) || !isFinite(Number(conf.MarchSpeedUpCD)))
+        return bad('加速时间配置未核实', 'rejected');
+      var marginMs = Math.max(0, num(args.safety_margin_seconds, 0)) * 1000;
       var minRemainMs = num(conf.MarchSpeedUpMinTime, 0) * 1000 + marginMs;
       if (num(move.arrive) - now < minRemainMs) return bad('剩余时间不足（含安全余量）', 'rejected');
       sig.emit({ buildingId: num(move.to.x) + '_' + num(move.to.y), x: num(move.to.x), y: num(move.to.y) });
       await waitFor(function () { return op.btn_speed_up && op.btn_speed_up.node && op.btn_speed_up.node.activeInHierarchy !== false; }, '加速按钮未出现', 3000);
+      var expected = { warId: m.enteredMapId }, marchKey = state.marchKey;
+      async function guardSpeed() {
+        var fresh = await march();
+        trace('speed.clickGuard', { snapshot: fresh, expectedKey: marchKey, actualKey: state.marchKey });
+        if (!fresh.ok || !fresh.speed_up.available || state.marchKey !== marchKey ||
+            fresh.move.remain_ms < minRemainMs) throw new Error('点击前行军条件已变化，未点击');
+      }
       var receipt = await serviceCall(async function () {
-        await clickButton(op.btn_speed_up);
-      });
+        await clickButton(op.btn_speed_up, guardSpeed);
+      }, 'moveSpeedUp', expected);
       if (!receipt.called) {
         // 没直接发请求通常是弹了确认框，按正常流程在确认框里点。
         var dialog = null;
-        try { dialog = await waitFor(function () { return openUI('SeasonMarchSpeedUpUI'); }, '', 1500); } catch (e) { dialog = null; }
+        try { dialog = await waitFor(function () { return openUI('SeasonMarchSpeedUpUI'); }, '', 1500); } catch (e) { traceException('speed.dialog.exception', e); dialog = null; }
         if (!dialog) return bad('未观察到加速请求，也未弹出确认框，结果未知', 'uncertain');
         if (!dialog.view || !dialog.view.btn_speed_up) return bad('确认框按钮未核实，未点击');
-        receipt = await serviceCall(async function () { await clickButton(dialog.view.btn_speed_up); });
+        receipt = await serviceCall(async function () { await clickButton(dialog.view.btn_speed_up, guardSpeed); }, 'moveSpeedUp', expected);
       }
-      if (!receipt.called) return bad('未观察到加速请求，结果未知', 'uncertain');
-      if (receipt.error) return bad('加速请求出错：' + receipt.error, 'rejected');
-      if (receipt.value && receipt.value.err) return bad('加速被拒绝：' + receipt.value.err, 'rejected');
+      var failure = checkReceipt(receipt, '加速');
+      if (failure) return failure;
       await sleep(600);
       state.speedTimes += 1;
       return done({ confirmed: true, times: state.speedTimes, error: '' });
     } catch (e) {
-      if (e && e.status === 'uncertain') state.uncertain = true;
-      return bad((e && e.message) || e, (e && e.status) || 'unavailable');
+      trace('action.exception', {message: String(e), stack: e && e.stack, outstanding: state.outstanding});
+      return bad((e && e.message) || e, (e && e.status) || (state.dispatched ? 'uncertain' : 'unavailable'));
     } finally {
       state.pending = false;
     }
@@ -378,13 +505,13 @@
     if (!me) return bad('当前没有自己的战场角色');
     var x = num(me.position && me.position.x), y = num(me.position && me.position.y);
     var snap = null;
-    try { snap = m.getBuildingOpSnapshot(x, y); } catch (e) { snap = null; }
+    try { snap = m.getBuildingOpSnapshot(x, y); } catch (e) { traceException('queue.snapshot.exception', e, {x:x,y:y}); snap = null; }
     if (!snap) return bad('当前节点没有可用的队列快照');
     var data = mapData();
     var building = null;
-    try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { building = null; }
+    try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { traceException('building.read.exception', e, {x:x,y:y}); building = null; }
     var inMembers = false;
-    try { inMembers = !!(building && building.members && building.members.has && building.members.has(me.id)); } catch (e) { inMembers = false; }
+    try { inMembers = !!(building && building.members && building.members.has && building.members.has(me.id)); } catch (e) { traceException('membership.self.exception', e, {roleId:me.id}); inMembers = false; }
     var mySide = num(me.lId, 0);
     function rows(list) {
       var out = [];
@@ -397,7 +524,7 @@
         if (num(me.state) !== 1) reasons.push('自己不是待命状态');
         if (!inMembers) reasons.push('自己不在此节点驻留');
         var inBuilding = false;
-        try { inBuilding = !!(building && building.members && building.members.has && building.members.has(role.id)); } catch (e) { inBuilding = false; }
+        try { inBuilding = !!(building && building.members && building.members.has && building.members.has(role.id)); } catch (e) { traceException('membership.target.exception', e, {roleId:role.id}); inBuilding = false; }
         if (!inBuilding) reasons.push('目标不在此节点驻留');
         // 隐匿只作为展示信息：可见队列里的目标能不能打，仍按上面的公开资格判断。
         out.push({
@@ -427,22 +554,23 @@
     if (state.pending) return bad('上一条命令尚未结束', 'uncertain');
     if (state.uncertain) return bad('前次操作结果未知，已停止自动操作', 'uncertain');
     if (!roleId) return bad('缺少目标 roleId', 'rejected');
-    state.pending = true;
+    state.pending = true; state.dispatched = false;
     try {
       await libs();
       var m = module_();
       if (!m) return bad('血月模块尚未初始化');
       var me = myRole();
       if (!me) return bad('当前没有自己的战场角色');
+      var warId = m.enteredMapId;
       var x = num(me.position && me.position.x), y = num(me.position && me.position.y);
       var snap = null;
-      try { snap = m.getBuildingOpSnapshot(x, y); } catch (e) { snap = null; }
+      try { snap = m.getBuildingOpSnapshot(x, y); } catch (e) { traceException('queue.snapshot.exception', e, {x:x,y:y}); snap = null; }
       if (!snap) return bad('当前节点没有可用的队列快照', 'rejected');
       var data = mapData(), building = null;
-      try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { building = null; }
+      try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { traceException('building.read.exception', e, {x:x,y:y}); building = null; }
       var hasMe = false, hasTarget = false;
-      try { hasMe = !!(building && building.members && building.members.has(me.id)); } catch (e) { }
-      try { hasTarget = !!(building && building.members && building.members.has(roleId)); } catch (e) { }
+      try { hasMe = !!(building && building.members && building.members.has(me.id)); } catch (e) { traceException('membership.self.exception', e, {roleId:me.id}); }
+      try { hasTarget = !!(building && building.members && building.members.has(roleId)); } catch (e) { traceException('membership.target.exception', e, {roleId:roleId}); }
       if (!hasMe) return bad('自己不在此节点驻留，不发起挑战', 'rejected');
       if (!hasTarget) return bad('目标不在此节点驻留，不发起挑战', 'rejected');
       if (num(me.state) !== 1) return bad('自己不是待命状态（' + stateName(me.state) + '）', 'rejected');
@@ -457,10 +585,11 @@
       if (!target) return bad('目标不在当前可见队列里，不发起挑战', 'rejected');
       var side = num(me.lId, 0);
       if (side > 0 && num(target.lId, 0) === side) return bad('目标与己方同阵营，不发起挑战', 'rejected');
+      trace('attack.preflight', { roleId: roleId, args: args, warId: m.enteredMapId, me: me, target: target, hasMe: hasMe, hasTarget: hasTarget, side: side, tab: tab });
       var ui = g.UIManager.ins;
       var existing = ui.findOpen('SeasonQueueDetailUI');
       if (existing) {
-        try { await clickButton(existing.view.btn_close); } catch (e) { }
+        try { await clickButton(existing.view.btn_close); } catch (e) { traceException('queue.close.exception', e); }
         await waitFor(function () { return !ui.findOpen('SeasonQueueDetailUI'); }, '队列界面未关闭', 3000);
       }
       ui.open('SeasonQueueDetailUI', { tab: tab, buildingX: x, buildingY: y });
@@ -477,24 +606,43 @@
       var cell = lib.cellType ? node.getComponent(lib.cellType) : null;
       if (!cell || !cell.btn_attack) return bad('挑战按钮未核实，未点击');
       if (cell.btn_attack.node && cell.btn_attack.node.activeInHierarchy === false) return bad('挑战按钮当前不可见（不满足挑战条件）', 'rejected');
-      var receipt = await serviceCall(async function () { await clickButton(cell.btn_attack); });
-      if (!receipt.called) return bad('未观察到挑战请求，结果未知', 'uncertain');
-      if (receipt.error) return bad('挑战请求出错：' + receipt.error, 'rejected');
-      if (receipt.value && receipt.value.err) return bad('挑战被拒绝：' + receipt.value.err, 'rejected');
+      var receipt = await serviceCall(async function () {
+        await clickButton(cell.btn_attack, async function () {
+          var bound = asButton(cell.btn_attack).cbTarget;
+          var fresh = await candidates(), rows = (fresh.attack || []).concat(fresh.defense || []);
+          var current = rows.filter(function (r) { return r.roleId === roleId; })[0];
+          var mine = num(fresh.self_plan_power) || num(fresh.self_power);
+          var power = current && (num(current.planPower) || num(current.power));
+          var ceiling = mine * num(args.power_ratio, 100) / 100;
+          if (num(args.power_limit) > 0) ceiling = Math.min(ceiling, num(args.power_limit));
+          var officialAllowed = !!(bound && bound.role && typeof screen.canAttack === 'function' && screen.canAttack(bound.role));
+          trace('attack.clickGuard', { roleId: roleId, boundRoleId: bound && bound.role && bound.role.id,
+            boundShowAttack: bound && bound.showAttack, officialAllowed: officialAllowed,
+            expectedNode: {x:x,y:y}, actualWarId: m.enteredMapId, expectedWarId: warId,
+            snapshot: fresh, target: current, mine: mine, power: power, ceiling: ceiling, args: args });
+          if (!bound || !bound.role || num(bound.role.id) !== roleId || bound.showAttack !== true ||
+              !officialAllowed ||
+              !fresh.ok || !current || !current.attackable || mine <= 0 || power <= 0 || power >= ceiling ||
+              !fresh.node || fresh.node.x !== x || fresh.node.y !== y || String(m.enteredMapId) !== String(warId))
+            throw new Error('点击前目标绑定、资格、战力或节点已变化，未点击');
+        });
+      }, 'startPVPBattle', { warId: warId, targetId: roleId });
+      var failure = checkReceipt(receipt, '挑战');
+      if (failure) return failure;
       state.battles += 1;
       return done({ confirmed: true, roleId: roleId, name: target.name || '', tab: tab, battles: state.battles });
     } catch (e) {
-      if (e && e.status === 'uncertain') state.uncertain = true;
-      return bad((e && e.message) || e, (e && e.status) || 'unavailable');
+      trace('action.exception', {message: String(e), stack: e && e.stack, outstanding: state.outstanding});
+      return bad((e && e.message) || e, (e && e.status) || (state.dispatched ? 'uncertain' : 'unavailable'));
     } finally {
       state.pending = false;
     }
   }
 
-  // ── 水旗标注：只标原本就可见的单位 ──
+  // ── 隐匿状态标注：只标原本就可见的单位 ──
 
   function clearMarks() {
-    state.marks.forEach(function (node) { try { if (node && node.isValid) node.destroy(); } catch (e) { } });
+    state.marks.forEach(function (node) { try { if (node && node.isValid) node.destroy(); } catch (e) { traceException('marks.destroy.exception', e); } });
     state.marks = [];
   }
 
@@ -520,11 +668,11 @@
     // 先摘掉不再需要的（列表复用行会让目标换人），再补上新的。
     state.marks = state.marks.filter(function (node) {
       var keep = node && node.isValid && needed.indexOf(node.parent) >= 0;
-      if (!keep) { try { if (node && node.isValid) node.destroy(); } catch (e) { } }
+      if (!keep) { try { if (node && node.isValid) node.destroy(); } catch (e) { traceException('marks.destroy.exception', e); } }
       return keep;
     });
     var marked = 0;
-    needed.forEach(function (node) { if (attachMark(node, '隐身水旗')) marked++; });
+    needed.forEach(function (node) { if (attachMark(node, '隐匿中')) marked++; });
     return marked;
   }
 
@@ -562,7 +710,14 @@
     if (state.markTimer) { clearInterval(state.markTimer); state.markTimer = null; }
     clearMarks();
     if (!on) return done({ marked: 0 });
-    state.markTimer = setInterval(function () { try { markVisibleLists(); } catch (e) { } }, 1000);
+    state.markError = null;
+    state.markTimer = setInterval(function () {
+      try { markVisibleLists(); }
+      catch (e) {
+        state.markError = { at: Date.now(), message: String(e), stack: e && e.stack };
+        trace('marks.tick.exception', state.markError);
+      }
+    }, 1000);
     return done({ marked: markVisibleLists() });
   }
 
@@ -586,25 +741,26 @@
       constants: { MarchSpeed: num(conf.MarchSpeed, 0), MarchSpeedUpCD: num(conf.MarchSpeedUpCD, 0),
                    MarchSpeedUpMinTime: num(conf.MarchSpeedUpMinTime, 0),
                    MarchSpeedUpItem: conf.MarchSpeedUpItem || null, PreEnterMinutes: num(conf.PreEnterMinutes, 0) },
-      pending: state.pending, uncertain: state.uncertain
+      pending: state.pending, uncertain: state.uncertain, outstanding: state.outstanding,
+      mark_error: state.markError, script_version: '2026-10-17-audit'
     });
   }
 
   function stop() {
     if (state.markTimer) { clearInterval(state.markTimer); state.markTimer = null; }
     clearMarks();
-    state.speedTimes = 0; state.marchKey = ''; state.battles = 0;
     return done({ stopped: true });
   }
 
   function reset() {
+    if (state.pending || state.outstanding) return bad('仍有操作或请求在途，不能复位', 'uncertain');
     state.uncertain = false; state.speedTimes = 0; state.marchKey = ''; state.battles = 0;
     return done({ reset: true });
   }
 
-  g.e0e1Season = {
-    ready: true, flags: flags, march: march, speedUp: speedUp, candidates: candidates,
-    attack: attack, marks: marks, diagnose: diagnose, stop: stop, reset: reset
-  };
-  log('血月战场脚本已就绪：战旗探测/加速/挑战/水旗标注');
+  g.e0e1Season = { ready: true, version: '2026-10-17-audit' };
+  var methods = { flags: flags, march: march, speedUp: speedUp, candidates: candidates,
+    attack: attack, marks: marks, diagnose: diagnose, stop: stop, reset: reset };
+  Object.keys(methods).forEach(function (name) { g.e0e1Season[name] = exportCall(name, methods[name]); });
+  log('血月战场脚本已就绪：战旗探测/加速/挑战/隐匿状态标注');
 })();

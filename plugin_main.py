@@ -14,4 +14,8 @@ if __name__ == "__main__":
     import multiprocessing
 
     multiprocessing.freeze_support()
-    raise SystemExit(main())
+    import argparse
+    parser = argparse.ArgumentParser(description='遗弃之地插件管理器')
+    parser.add_argument('--platform', choices=('wechat', 'douyin'), help='可选；省略时显示平台选择器')
+    args = parser.parse_args()
+    raise SystemExit(main(platform=args.platform))

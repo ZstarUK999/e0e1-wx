@@ -85,17 +85,27 @@ def publish(base: str, token: str, version: str) -> None:
         raise SystemExit(f"发布失败（{response.status_code}）：{response.text}")
 
 
+def _env(name: str, default: str = "") -> str:
+    """读配置；bat 里设的环境变量优先。"""
+    return os.environ.get(f"PUBLISH_{name}", default)
+
+
+def _env_flag(name: str) -> bool:
+    return _env(name, "0").strip().lower() in ("1", "true", "yes")
+
+
 def main() -> int:
+    # 默认值都从环境变量取，这样 publish.bat 把配置写在文件里即可，命令行只给版本号
     parser = argparse.ArgumentParser(description="构建并发布插件新版本")
     parser.add_argument("version", help="版本号，如 1.2.0")
-    parser.add_argument("changelog", nargs="?", default="", help="更新日志")
-    parser.add_argument("--base", default="http://127.0.0.1:8000", help="后台 HTTP 地址")
-    parser.add_argument("--target", default="127.0.0.1:8001", help="后台 gRPC 地址（写进产物）")
-    parser.add_argument("--username", default="admin")
-    parser.add_argument("--password", default="", help="不传就从环境变量或交互输入")
-    parser.add_argument("--skip-build", action="store_true", help="复用现有产物，只上传发布")
-    parser.add_argument("--mandatory", action="store_true", help="设为强制更新")
-    parser.add_argument("--no-publish", action="store_true", help="只上传，不发布（先看看）")
+    parser.add_argument("changelog", nargs="?", default=_env("CHANGELOG"), help="更新日志")
+    parser.add_argument("--base", default=_env("BASE", "http://127.0.0.1:8000"), help="后台 HTTP 地址")
+    parser.add_argument("--target", default=_env("TARGET", "127.0.0.1:8001"), help="后台 gRPC 地址")
+    parser.add_argument("--username", default=_env("USERNAME", "admin"))
+    parser.add_argument("--password", default=_env("PASSWORD"), help="不设就交互输入")
+    parser.add_argument("--skip-build", action="store_true", default=_env_flag("SKIP_BUILD"))
+    parser.add_argument("--mandatory", action="store_true", default=_env_flag("MANDATORY"))
+    parser.add_argument("--no-publish", action="store_true", default=_env_flag("NO_PUBLISH"))
     args = parser.parse_args()
 
     archive = DIST_DIR / f"{APP_NAME}-{args.version}-upload.zip"

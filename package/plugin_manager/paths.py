@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
@@ -28,5 +29,19 @@ def lock_path(config_path: Path) -> Path:
     return Path(config_path).with_name(LOCK_FILE_NAME)
 
 
+def program_dir() -> Path | None:
+    """打包后 exe 所在目录；源码运行返回 None。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return None
+
+
 def log_path(config_path: Path) -> Path:
+    """日志位置：打包后放程序所在目录，玩家报错时直接把日志发过来。
+
+    源码运行仍放配置目录，避免往仓库里丢文件。
+    """
+    program = program_dir()
+    if program is not None:
+        return program / LOG_FILE_NAME
     return Path(config_path).parent / "logs" / LOG_FILE_NAME

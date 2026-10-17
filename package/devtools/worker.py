@@ -108,6 +108,41 @@ def is_address_in_use_error(exc: BaseException) -> bool:
     )
 
 
+def debug_port_unavailable_message(port: int) -> str:
+    """Distinguish a listener from Windows access-denied/reserved ports."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('0.0.0.0', int(port)))
+    except OSError as exc:
+        number = getattr(exc, 'winerror', None) or getattr(exc, 'errno', None)
+        if number in {13, 10013}:
+            return (f'调试端口 {port} 绑定被系统拒绝（错误码 {number}）：'
+                    '可能位于 Windows 排除端口区间或受权限策略限制；不一定有进程占用。'
+                    '可用 netsh interface ipv4 show excludedportrange protocol=tcp 核对')
+        if is_address_in_use_error(exc):
+            return f'调试端口 {port} 已被占用（错误码 {number}）：请停止另一个调试实例后重试'
+        return f'调试端口 {port} 无法绑定（错误码 {number}）：{exc}'
+    return f'调试端口 {port} 先前不可用，但复查可绑定；请重试并检查并发调试实例'
+
+
+def choose_debug_port(preferred: int) -> int:
+    """Keep the normal port; fall back only for OS access-denied errors."""
+    if port_available(preferred):
+        return preferred
+    denied = False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('0.0.0.0', int(preferred)))
+    except OSError as exc:
+        denied = (getattr(exc, 'winerror', None) or getattr(exc, 'errno', None)) in {13, 10013}
+    if denied:
+        for candidate in range(19421, 19521):
+            if candidate != preferred and port_available(candidate):
+                return candidate
+        raise RuntimeError(f'调试端口 {preferred} 被系统拒绝，备用端口 19421–19520 也均不可用')
+    raise RuntimeError(debug_port_unavailable_message(preferred))
+
+
 class AsyncDevtoolsWorker:
     """支持调试与路由切换的单会话异步 worker。"""
 
@@ -995,10 +1030,12 @@ class AsyncDevtoolsWorker:
         try:
             # 9421 这类固定调试端口被别的实例占着时，换 CDP 端口重试多少次都没用，
             # 只会把 62000~65535 一路试穿并刷屏，所以先直接判掉。
-            if not port_available(debug_port):
-                raise RuntimeError(
-                    f"调试端口 {debug_port} 已被占用：多半是另一个调试实例或残留进程在跑，请先停止它"
-                )
+            preferred_debug_port = debug_port
+            debug_port = await asyncio.to_thread(choose_debug_port, debug_port)
+            if debug_port != preferred_debug_port:
+                self.state.update({'debug_port': debug_port,
+                    'message': f'调试端口 {preferred_debug_port} 被系统拒绝，切换到 {debug_port}；Hook 回连地址同步更新'})
+                self.emit_state()
             # 端口探测可能遍历多个端口，放入线程避免拖慢 DevTools worker 事件循环。
             cdp_port = await asyncio.to_thread(self.cdp_port_finder, self.cdp_port_start_from_command(command))
             while True:
@@ -1012,9 +1049,7 @@ class AsyncDevtoolsWorker:
                     if not is_address_in_use_error(exc):
                         raise
                     if not port_available(debug_port):
-                        raise RuntimeError(
-                            f"调试端口 {debug_port} 已被占用：请停止另一个调试实例后重试"
-                        ) from exc
+                        raise RuntimeError(debug_port_unavailable_message(debug_port)) from exc
                     # 换端口重试要有上限：否则占用的端口段会被一路试穿，状态刷屏。
                     port_retries += 1
                     if port_retries >= CDP_PORT_RETRY_LIMIT:

@@ -1,0 +1,16 @@
+[Unit]
+Description=e0e1 plugin server (FastAPI + gRPC)
+After=network.target
+
+[Service]
+Type=simple
+User={user}
+WorkingDirectory={current_path}
+Environment="PYTHONUNBUFFERED=1"
+# 一个进程同时跑 HTTP 管理端和 gRPC 插件通道，所以走 app.main 而不是 uvicorn CLI
+ExecStart={current_path}/.venv/bin/python -m app.main
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -57,6 +57,7 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/daily_tasks/daily_runtime.js", "package/daily_tasks"),
     ("package/daily_tasks/sweep_runtime.js", "package/daily_tasks"),
     ("package/plugin_manager/desire_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/douyin_bridge.js", "package/plugin_manager"),
     ("tools/config/daily_tasks.json", "tools/config"),
     ("tools/js", "tools/js"),
     ("tools/hook.js", "tools"),  # frida 注入脚本，缺失会导致调试启动失败
@@ -390,8 +391,12 @@ def package(target: Path, version: str, onefile: bool, *, with_license: bool) ->
         return archive_path
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in target.rglob("*"):
-            if path.is_file():
-                archive.write(path, path.relative_to(target.parent).as_posix())
+            if not path.is_file():
+                continue
+            # 上传包里绝不能带某个玩家的 license
+            if not with_license and path.name == "license.bin":
+                continue
+            archive.write(path, path.relative_to(target.parent).as_posix())
     return archive_path
 
 
@@ -419,6 +424,11 @@ def report(target: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="打包插件管理器为 Windows 可执行文件")
     parser.add_argument("--windowed", action="store_true", help="不显示控制台窗口")
+    parser.add_argument(
+        "--console",
+        action="store_true",
+        help="显示控制台窗口（release 默认不带，加这个可以带，便于看报错）",
+    )
     parser.add_argument("--onefile", action="store_true", help="产出单文件 exe（体积对比用）")
     parser.add_argument(
         "--exclude-frida",
@@ -484,7 +494,8 @@ def main() -> int:
     features_file = write_bundle_features(load_features_profile(Path(args.features)))
     build_file = write_build_info(mode=args.mode, version=args.version, target=args.target)
     command = build_command(
-        windowed=args.windowed,
+        # release 默认不带控制台（玩家看到黑框会以为出错了），调试版默认带
+        windowed=args.windowed or (release and not args.console),
         onefile=args.onefile,
         exclude_frida=args.exclude_frida,
         keep_cryptography=args.keep_cryptography,
