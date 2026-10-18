@@ -807,9 +807,11 @@ function createEnergyRuntime(g, timing) {
     const role=r.id!=null?String(r.id):'';
     const hero=r.heroId!=null?String(r.heroId):'';
     const legion=(r.legion && (r.legion.legionName||r.legion.name)) || r.legionName || '';
-    // name 是玩家的角色名（昵称），后台用它显示"是谁在用来"
+    // 游戏 role-helper 使用 USER.userName；ROLE 不保存当前显示昵称。
+    // 保留 ROLE.name 兜底，兼容旧运行环境。
+    const name=(g.USER && g.USER.userName) || r.name || '';
     return {player_id:role||hero, role_id:role, hero_id:hero,
-            name:String(r.name||''), legion_name:String(legion||'')};
+            name:String(name), legion_name:String(legion||'')};
   }
 
   function playerInformation() {

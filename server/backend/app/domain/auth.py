@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -69,12 +70,14 @@ def record(
     remote: str,
     player_name: str = "",
     login_player_id: str = "",
+    bound_player_ids: list[str] | None = None,
 ) -> None:
     """落审计日志；公会名和角色名只记录不校验。"""
     session.add(
         HandshakeLog(
             player_id=login_player_id or verdict.player_id or bound_player_id,
             bound_player_id=bound_player_id,
+            bound_player_ids=json.dumps(bound_player_ids or [], ensure_ascii=False),
             player_name=player_name or "",
             guild=guild or "",
             client_version=client_version or "",

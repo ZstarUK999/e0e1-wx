@@ -64,9 +64,9 @@
 
     <section id="logs-view" class="view hidden">
       <h1>握手日志</h1>
-      <p class="hint">只记录最近 200 条；公会名（阴司）只记录，不参与鉴权。</p>
+      <p class="hint">只记录最近 200 条；绑定备注取自玩家管理，便于追查包来源。旧记录仅显示已保存的绑定ID；公会名（阴司）只记录，不参与鉴权。</p>
       <table class="grid">
-        <thead><tr><th>时间</th><th>玩家ID</th><th>角色名</th><th>绑定ID</th><th>公会</th><th>版本</th><th>来源</th><th>结果</th></tr></thead>
+        <thead><tr><th>时间</th><th>玩家ID</th><th>角色名</th><th>包主绑定ID</th><th>绑定玩家备注</th><th>包内全部绑定玩家（ID / 备注）</th><th>公会</th><th>版本</th><th>来源</th><th>结果</th></tr></thead>
         <tbody id="logs-body"></tbody>
       </table>
     </section>

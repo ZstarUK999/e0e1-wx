@@ -36,6 +36,7 @@ class HandshakeLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     player_id: Mapped[str] = mapped_column(String(64), index=True, default="")
     bound_player_id: Mapped[str] = mapped_column(String(64), default="")
+    bound_player_ids: Mapped[str] = mapped_column(Text, default="")  # 已验签包的全部绑定 ID（JSON）
     player_name: Mapped[str] = mapped_column(String(64), default="")  # 上报时的角色名
     guild: Mapped[str] = mapped_column(String(64), default="")
     client_version: Mapped[str] = mapped_column(String(32), default="")

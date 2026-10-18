@@ -277,7 +277,9 @@ async function refreshLogs() {
     const tr = document.createElement('tr');
     tr.append(
       cell(row.created_at), cell(row.player_id), cell(row.player_name || '—'),
-      cell(row.bound_player_id), cell(row.guild), cell(row.client_version), cell(row.remote),
+      cell(row.bound_player_id), cell(row.bound_player_nickname || '—'),
+      cell((row.bound_players || []).map(player => `${player.player_id}（${player.nickname || '未备注'}）`).join('；') || '—'),
+      cell(row.guild), cell(row.client_version), cell(row.remote),
     );
     const result = document.createElement('td');
     result.textContent = row.allowed ? '放行' : `拒绝（${row.reason}）`;

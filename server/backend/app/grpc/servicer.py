@@ -38,10 +38,14 @@ class PluginServicer(plugin_pb2_grpc.PluginServiceServicer):
         self._peer_resolver = peer_resolver
 
     async def Handshake(self, request, context):
+        payload = _license_from(request)
         verdict, bound = auth_domain.evaluate(
-            license_payload=_license_from(request),
+            license_payload=payload,
             login_player_id=request.login_player_id,
         )
+        # 只记录验签通过的包绑定，不能信任无效授权文件声称的归属。
+        package_ids = (auth_domain.license_module.player_ids(payload)
+                       if payload and (verdict is None or verdict.reason != auth_domain.REASON_BAD_LICENSE) else [])
         remote = _peer(context)
 
         def decide():
@@ -53,7 +57,8 @@ class PluginServicer(plugin_pb2_grpc.PluginServiceServicer):
                 auth_domain.record(
                     session,
                     verdict=final,
-                    bound_player_id=bound,
+                    bound_player_id=package_ids[0] if package_ids else bound,
+                    bound_player_ids=package_ids,
                     guild=request.guild_name,
                     client_version=request.client_version,
                     remote=remote,

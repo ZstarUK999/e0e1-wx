@@ -38,7 +38,7 @@ def _add_missing_columns() -> None:
 # 只列后加的列；建表时已有的不用管
 _EXTRA_COLUMNS = {
     "players": {"role_name": "VARCHAR(64) DEFAULT ''"},
-    "handshake_logs": {"player_name": "VARCHAR(64) DEFAULT ''"},
+    "handshake_logs": {"player_name": "VARCHAR(64) DEFAULT ''", "bound_player_ids": "TEXT DEFAULT ''"},
 }
 
 
