@@ -16,3 +16,4 @@ output
 publish.bat
 license.bin
 build.json
+apk/base.apk

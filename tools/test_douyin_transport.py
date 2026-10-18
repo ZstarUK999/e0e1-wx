@@ -153,7 +153,7 @@ def test_real_node_python_bridge_reuses_resident_and_damage_script(tmp_path):
         config = tmp_path / 'node-fixture.json'
         bridge = tmp_path / 'compiled-static-bridge.js'
         bridge.write_text(cache.compiled_source(),encoding='utf-8')
-        atomic_json(config, {'token':cache.token, 'build':cache.build, 'user':str(cache.user), 'bridge':str(bridge)})
+        atomic_json(config, {'token':cache.token, 'build':cache.build, 'user':str(cache.user), 'bridge':str(bridge), 'largeReply':True})
         child = subprocess.Popen([node, str(Path(__file__).with_name('douyin_bridge_fixture.cjs')), str(config)],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -166,6 +166,14 @@ def test_real_node_python_bridge_reuses_resident_and_damage_script(tmp_path):
             transport = DouyinTransport(cache)
             await transport.connect()
             assert await transport._rpc('ping') == 2
+            result = await transport._rpc('damage-debug', timeout_ms=30000)
+            assert result == {'text':'中文😀'*100000}
+            for _ in range(30):
+                if not cache.mailbox('response').exists():
+                    break
+                await asyncio.sleep(.05)
+            assert not cache.mailbox('response').exists()
+
             assert (await transport.probe())['ready']
             sid = await transport.install()
             assert sid == transport.session_id
@@ -261,4 +269,28 @@ def test_overlay_control_bypasses_busy_file_command_lock_and_checks_identity(tmp
         assert command['resident']=='resident' and command['runtime']==transport.runtime
         live(cache,resident='other')
         assert await transport.automation_overlay({'active':False}) is None
+    asyncio.run(run())
+
+
+def test_chunked_reply_resumes_after_timeout_without_replaying(tmp_path):
+    async def run():
+        cache,_,_=cache_fixture(tmp_path);cache.prepare();live(cache)
+        transport=DouyinTransport(cache);await transport.connect()
+        pending={'id':'large','runtime':transport.runtime}
+        transport._pending_file=pending
+        payload={'token':cache.token,'runtime':transport.runtime,'id':'large','ok':True,'value':'中文😀'*20000}
+        text=json.dumps(payload,ensure_ascii=False)
+        def part(index,data,final):
+            atomic_json(cache.mailbox('response'),{'token':cache.token,'runtime':transport.runtime,
+                'id':'large','chunked':True,'index':index,'data':data,'final':final})
+        part(0,text[:10000],False)
+        with pytest.raises(asyncio.TimeoutError):
+            await transport._reply(pending,30)
+        assert len(pending['_reply_parts'])==1
+        assert transport._pending_file is pending
+        part(1,text[10000:],True)
+        assert await transport._reply(pending,100)==payload['value']
+        assert transport._pending_file is None
+        assert '_reply_parts' not in pending
+        assert json.loads(cache.mailbox('response-ack').read_text())['index']==1
     asyncio.run(run())

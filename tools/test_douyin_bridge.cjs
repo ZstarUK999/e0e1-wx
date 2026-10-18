@@ -13,7 +13,7 @@ const source=fs.readFileSync(path.join(__dirname,'../package/plugin_manager/douy
   .replace('__BRIDGE_STATIC_SCRIPTS__',scripts);
 const files=new Map(),timers=new Map();
 const base='ttfile://user/e0e1-plugin-';
-let next=0,sequence=0;
+let next=0,sequence=0,responseLimit=Infinity;
 const hides=new Set(),shows=new Set(),screen=[];
 let pausedGame=true,pausedDirector=true,resumeCount=0;
 const cocos={game:{isPaused:()=>pausedGame,resume(){pausedGame=false;resumeCount++;},pause(){pausedGame=true;}},
@@ -22,7 +22,7 @@ const context=vm.createContext({eval:undefined,Function:undefined,
   tt:{env:{USER_DATA_PATH:'ttfile://user'},
  onHide(fn){hides.add(fn);},onShow(fn){shows.add(fn);},offHide(fn){hides.delete(fn);},offShow(fn){shows.delete(fn);},
  setKeepScreenOn(args){screen.push(args.keepScreenOn);if(args.success)args.success();},getFileSystemManager(){return{
-    readFileSync(p){if(!files.has(p))throw Error('missing');return files.get(p);},writeFileSync(p,v){files.set(p,v);}
+    readFileSync(p){if(!files.has(p))throw Error('missing');return files.get(p);},unlinkSync(p){files.delete(p);},writeFileSync(p,v){if(p===base+'response.json' && Buffer.byteLength(v)>responseLimit)throw Error('user dir saved file size limit exceeded');files.set(p,v);}
   };}},UIManager:{ins:{findOpen(){return true;}}},ROLE:{},System:{async import(){return cocos;}},CommonUICfgId:{MainUI:1},
   setInterval(fn,ms){const id=++next;timers.set(id,{fn,ms});return id;},clearInterval(id){timers.delete(id);}
 });
@@ -52,6 +52,24 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   command('dynamic','ping',{}, {expression:'1+1'});await tick();assert.equal(response().ok,false);
   command('unknown','unknown');await tick();assert.equal(response().ok,false);
   command('still-works','ping');await tick();assert.equal(response().value,2);
+  // Simulate a nearly full platform directory and an old oversized receipt.
+  responseLimit=8000;
+  const large='中文😀'.repeat(30000);
+  context.damageCurveJson=()=>large;
+  command('large','damage-snapshot');await tick();
+  let joined='',count=0;
+  while(true){
+    const part=response();assert.equal(part.chunked,true);assert.equal(part.index,count++);
+    joined+=part.data;
+    files.set(base+'response-ack.json',JSON.stringify({token:'wrong',runtime:state().runtime,id:'large',index:part.index}));
+    await tick();assert.equal(response().index,part.index,'wrong token cannot advance');
+    files.set(base+'response-ack.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,id:'large',index:part.index}));
+    await tick();if(part.final)break;
+  }
+  assert.equal(JSON.parse(joined).value,large);assert.ok(count>1);
+  assert.equal(files.has(base+'response.json'),false,'ack releases platform file');
+  assert.equal(context.executed,1,'transfer never replays game operations');
+  responseLimit=Infinity;
   context.tt.setKeepScreenOn({keepScreenOn:false});
   files.set(base+'lease.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now()}));
   pulse();for(let i=0;i<12;i++)await Promise.resolve();
@@ -93,5 +111,21 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   console.log('PASS: instance-bound exit signal stops background features even while command queue is blocked, without replaying actions.');
   context.__e0e1DouyinBridge.stop();assert.equal(timers.size,0);assert.equal(hides.size,0);assert.equal(shows.size,0);
   console.log('PASS: Douyin background keepalive requires fresh matching lease, preserves foreground pause, restores on expiry and never replays actions.');
+  // Test both actual API outcomes; mocks do not establish real device support.
+  for (const writable of [true,false]) {
+    files.clear();
+    files.set(base+'storage-probe-request.json',JSON.stringify({token:'fixture-token',id:'probe',at:Date.now()}));
+    context.tt.getFileSystemManager=()=>({
+      readFileSync(p){if(!files.has(p))throw Error('missing');return files.get(p);},
+      writeFileSync(p,v){if(p.startsWith('ttfile://temp/')&&!writable)throw Error('permission denied');files.set(p,v);},
+      unlinkSync(p){files.delete(p);}
+    });
+    context.__e0e1DouyinBridge=null;
+    vm.runInContext(source,context);
+    const result=JSON.parse(files.get(base+'storage-probe-result.json'));
+    assert.equal(result.write,writable);assert.equal(result.read,writable);assert.equal(result.removed,writable);
+    assert.equal([...files.keys()].some(p=>p.startsWith('ttfile://temp/')),false);
+    context.__e0e1DouyinBridge.stop();
+  }
   console.log('PASS: eval/Function disabled; static resident dispatch, async script enable, identity/replay/expiry checks, dynamic-source rejection.');
 })().catch(error=>{console.error(error);process.exitCode=1;});

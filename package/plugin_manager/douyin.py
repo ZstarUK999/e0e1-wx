@@ -38,7 +38,15 @@ def atomic_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + '.tmp')
     temporary.write_text(json.dumps(data, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-    os.replace(temporary, path)
+    # A simultaneous platform read can briefly hold the destination on Windows.
+    for attempt in range(6):
+        try:
+            os.replace(temporary, path)
+            break
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(.01)
 
 
 def douyin_ready():
@@ -291,6 +299,36 @@ class DouyinTransport(PluginTransport):
                 response = {}
             if (response.get('token') == self.cache.token and response.get('runtime') == pending['runtime']
                     and response.get('id') == pending['id']):
+                if response.get('chunked') is True:
+                    parts = pending.setdefault('_reply_parts', [])
+                    index = response.get('index')
+                    data = response.get('data')
+                    if type(index) is not int or not isinstance(data, str) or index < 0 or index > len(parts):
+                        raise RuntimeError('抖音回执分块序号无效，操作不会重发')
+                    if index == len(parts):
+                        parts.append(data)
+                        # Timeout measures lack of progress, not total report size.
+                        if timeout_ms is not None:
+                            until = time.monotonic() + timeout_ms / 1000
+                    elif parts[index] != data:
+                        raise RuntimeError('抖音回执分块内容变化，操作不会重发')
+                    atomic_json(self.cache.mailbox('response-ack'), {
+                        'token': self.cache.token, 'runtime': pending['runtime'],
+                        'id': pending['id'], 'index': index})
+                    if not response.get('final'):
+                        if until is not None and time.monotonic() >= until:
+                            raise asyncio.TimeoutError('抖音回执分块等待超时，操作不会重发')
+                        await asyncio.sleep(.01)
+                        continue
+                    response = json.loads(''.join(parts))
+                    if (response.get('token') != self.cache.token or response.get('runtime') != pending['runtime']
+                            or response.get('id') != pending['id']):
+                        raise RuntimeError('抖音分块回执身份不匹配，操作不会重发')
+                    pending.pop('_reply_parts', None)
+                else:
+                    atomic_json(self.cache.mailbox('response-ack'), {
+                        'token': self.cache.token, 'runtime': pending['runtime'], 'id': pending['id']})
+                    pending.pop('_reply_parts', None)
                 self._pending_file = None
                 if not response.get('ok'):
                     raise RuntimeError(response.get('error') or '抖音脚本执行失败')

@@ -7,6 +7,7 @@ const game={
   console:{log(){},error(){}},setTimeout,clearTimeout,setInterval,clearInterval,
   tt:{env:{USER_DATA_PATH:'ttfile://user'},getFileSystemManager(){return{
     readFileSync(p){return fs.readFileSync(path.join(config.user,p.replace('ttfile://user/','')),'utf8');},
+    unlinkSync(p){fs.unlinkSync(path.join(config.user,p.replace('ttfile://user/','')));},
     writeFileSync(p,value){fs.writeFileSync(path.join(config.user,p.replace('ttfile://user/','')),value,'utf8');}
   };}},
   UIManager:{ins:{findOpen(){return true;}}},ROLE:{id:123},CommonUICfgId:{MainUI:1},
@@ -15,3 +16,5 @@ const game={
 const source=fs.readFileSync(config.bridge,'utf8').replace('__BRIDGE_TOKEN__',JSON.stringify(config.token))
   .replace('__BRIDGE_BUILD__',JSON.stringify(config.build));
 vm.runInContext(source,vm.createContext(game));
+
+if(config.largeReply)game.damageCurveDebug=()=>({text:'中文😀'.repeat(100000)});

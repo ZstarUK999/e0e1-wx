@@ -19,9 +19,143 @@
     const data = JSON.stringify(value);
     // Readers retry partial JSON. Use only the filesystem write API already
     // verified in the live game, without assuming overwrite semantics of rename.
-    fs.writeFileSync(prefix + name + '.json', data, 'utf8');
+    try { fs.writeFileSync(prefix + name + '.json', data, 'utf8'); }
+    catch(e) {
+      if (!String(e).includes('size limit exceeded') || stressFilling || !reclaimStorage()) throw e;
+      fs.writeFileSync(prefix + name + '.json', data, 'utf8');
+    }
+  }
+  let storageCC = null, reclaiming = false, stressFilling = false;
+  const storageCleanup = {files:0, bytes:0, last:[], error:''};
+  function fileSize(path) {
+    const result = fs.statSync(path);
+    const stat = result.stats || result;
+    return stat.isFile() ? stat.size : 0;
+  }
+  function reclaimStorage() {
+    const manager = storageCC && storageCC.assetManager && storageCC.assetManager.cacheManager;
+    if (reclaiming || !manager || !manager.cachedFiles || typeof manager.removeCache !== 'function') return false;
+    reclaiming = true;
+    let freed = 0;
+    try {
+      const root = g.tt.env.USER_DATA_PATH + '/gamecaches/';
+      const indexed = new Set(), videos = [];
+      manager.cachedFiles.forEach((entry,key)=>{
+        if (!entry || typeof entry.url !== 'string') return;
+        indexed.add(entry.url);
+        if (/^https?:\/\//.test(key) && entry.url.startsWith(root) && !entry.url.includes('/../') &&
+            /\.(mp4|webm|mov|avi|m4v)(?:[?#]|$)/i.test(entry.url))
+          videos.push({key,path:entry.url,last:Number(entry.lastTime)||0});
+      });
+      videos.sort((a,b)=>a.last-b.last);
+      // Delete bytes before the index rewrite: a completely full directory may
+      // reject the index write itself. removeCache then updates the live index.
+      for (const item of videos) {
+        try {
+          const size = fileSize(item.path); if (!size) continue;
+          fs.unlinkSync(item.path); freed += size;
+          storageCleanup.files++; storageCleanup.bytes += size;
+          storageCleanup.last = [item.path];
+          manager.removeCache(item.key);
+          if (freed >= 32768) break;
+        } catch(e) {storageCleanup.error=errorText(e);}
+      }
+      // Only unindexed regular files are eligible after videos, never the index,
+      // configuration, or files still being written by the download queue.
+      if (freed < 32768 && !Object.keys(manager.cacheQueue || {}).length) {
+        const walk=(dir,depth)=>{
+          if(depth>8 || freed>=32768)return;
+          for(const name of fs.readdirSync(dir)) {
+            if(typeof name!=='string'||name.includes('/')||name.includes('\\')||name==='.'||name==='..')continue;
+            const path=dir+'/'+name;
+            try {
+              const result=fs.statSync(path), stat=result.stats||result;
+              if(stat.isDirectory())walk(path,depth+1);
+              else if(stat.isFile() && name!=='cacheList.json' && !indexed.has(path) &&
+                      Date.now() - stat.lastModifiedTime > 60000) {
+                fs.unlinkSync(path);freed+=stat.size;
+                storageCleanup.files++;storageCleanup.bytes+=stat.size;storageCleanup.last=[path];
+              }
+            }catch(e){storageCleanup.error=errorText(e);}
+            if(freed>=32768)break;
+          }
+        };
+        walk(root.slice(0,-1),0);
+      }
+    } catch(e) {storageCleanup.error=errorText(e);}
+    finally {reclaiming=false;}
+    return freed>0;
+  }
+  // Only one bounded response file exists; acknowledgement releases it via the
+  // platform API so its quota accounting stays consistent.
+  let transfer = null;
+  function clearResponse() {
+    try { fs.unlinkSync(prefix + 'response.json'); } catch (_) {}
+  }
+  function sendPart() {
+    const t = transfer;
+    if (!t) return;
+    let end = Math.min(t.offset + t.size, t.text.length);
+    if (end < t.text.length && /[\uD800-\uDBFF]/.test(t.text[end - 1])) end--;
+    const part = {token, runtime, id:t.id, chunked:true, index:t.index,
+      final:end === t.text.length, data:t.text.slice(t.offset,end)};
+    clearResponse();
+    try { write('response', part); }
+    catch (e) {
+      if (String(e).includes('size limit exceeded') && t.size > 1024) {
+        t.size = Math.max(1024, Math.floor(t.size / 2));
+        return sendPart();
+      }
+      throw e;
+    }
+    t.end = end; t.at = Date.now();
+  }
+  function acknowledgeResponse() {
+    const ack = read('response-ack');
+    if (!ack || ack.token !== token || ack.runtime !== runtime) return;
+    if (transfer && ack.id === transfer.id && ack.index === transfer.index) {
+      if (transfer.end === transfer.text.length) { transfer = null; clearResponse(); }
+      else { transfer.offset = transfer.end; transfer.index++; sendPart(); }
+    } else if (!transfer) {
+      const reply = read('response');
+      if (reply && reply.id === ack.id && reply.runtime === runtime && reply.token === token) clearResponse();
+    }
+  }
+  function publishResponse(response) {
+    const text = JSON.stringify(response);
+    clearResponse();
+    if (text.length <= 16384) {
+      try { write('response',response); return; }
+      catch(e) { if (!String(e).includes('size limit exceeded')) throw e; }
+    }
+    transfer = {id:response.id, text, offset:0, index:0, size:4096, at:Date.now()};
+    sendPart();
   }
   function errorText(e) { return String(e && (e.stack || e.message) || e).slice(0, 4000); }
+  // Explicit, one-shot filesystem capability probe. Never changes transport.
+  let storageProbe = null;
+  const probeRequest = read('storage-probe-request');
+  if (probeRequest && probeRequest.token === token && probeRequest.id &&
+      Number.isFinite(probeRequest.at) && Date.now() - probeRequest.at >= 0 && Date.now() - probeRequest.at < 3600000) {
+    const previous = read('storage-probe-result');
+    if (!previous || previous.id !== probeRequest.id) {
+      const path = 'ttfile://temp/e0e1-probe-' + runtime + '.txt';
+      const content = 'e0e1 temporary storage probe';
+      storageProbe = {id:probeRequest.id, runtime, path, write:false, read:false, removed:false};
+      let created = false;
+      try {
+        fs.writeFileSync(path, content, 'utf8'); created = true; storageProbe.write = true;
+        storageProbe.read = fs.readFileSync(path, 'utf8') === content;
+      } catch(e) { storageProbe.error = errorText(e); }
+      finally {
+        if (created) {
+          try { fs.unlinkSync(path); storageProbe.removed = true; }
+          catch(e) { storageProbe.cleanup_error = errorText(e); }
+        }
+      }
+      try { write('storage-probe-result', storageProbe); } catch(e) { storageProbe.result_error = errorText(e); }
+    }
+  }
   // Douyin-only background protection. A fresh manager lease is required;
   // no synthetic input, network flags, automatic login or business-command replay.
   const keepAlive = {active:false, background:false, resumes:0, error:''};
@@ -59,7 +193,7 @@
     }
     if (!cocos && !loadingCocos && g.System && typeof g.System.import === 'function' && Date.now() >= nextCocosTry) {
       loadingCocos = true;nextCocosTry = Date.now() + 30000;
-      Promise.resolve().then(()=>g.System.import('cc')).then(value=>{cocos=value;},e=>{keepAlive.error=errorText(e);}).finally(()=>{loadingCocos=false;});
+      Promise.resolve().then(()=>g.System.import('cc')).then(value=>{cocos=value;storageCC=value;},e=>{keepAlive.error=errorText(e);}).finally(()=>{loadingCocos=false;});
     }
     if (keepAlive.background && cocos) {
       try {
@@ -109,7 +243,7 @@
     try {
       write('state', {token, build, runtime, appid: 'tt310e47b3ae06acc002', at: Date.now(),
         game, hall, busy, lastSequence, resident: g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.id || null,
-        protocol: 'static-v1', automation: g.__e0e1AutomationOverlay ? g.__e0e1AutomationOverlay.snapshot() : null, player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
+        protocol: 'static-v1', storage_cleanup: storageCleanup, storage_probe: storageProbe, automation: g.__e0e1AutomationOverlay ? g.__e0e1AutomationOverlay.snapshot() : null, player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
     } catch (e) { lastError = errorText(e); }
   }
   function receipt(value) { return typeof value === 'string' ? JSON.parse(value) : value; }
@@ -168,7 +302,18 @@
     }
   }
   async function poll() {
-    if (stopped || busy) return;
+    try {
+      acknowledgeResponse();
+      if (transfer && Date.now() - transfer.at > 120000) {
+        const id = transfer.id; transfer = null; clearResponse();
+        write('response',{token,runtime,id,ok:false,error:'回执分块传输等待超时，操作不会重发'});
+      }
+    } catch(e) {
+      const id = transfer && transfer.id; transfer = null; clearResponse();
+      lastError = errorText(e);
+      try { write('response',{token,runtime,id,ok:false,error:'回执传输失败（用户目录空间不足或文件写入异常），操作不会重发: '+lastError}); } catch(_) {}
+    }
+    if (stopped || busy || transfer) return;
     const command = read('command');
     if (!command || command.token !== token || command.runtime !== runtime
         || typeof command.id !== 'string' || !Number.isSafeInteger(command.sequence)
@@ -187,13 +332,14 @@
     } catch (e) {
       response = {token, runtime, id: command.id, ok: false, error: errorText(e)};
     }
-    try { write('response', response); }
+    try { publishResponse(response); }
     catch (e) {
+      transfer = null; clearResponse();
       lastError = errorText(e);
       try { write('response', {token, runtime, id: command.id, ok: false, error: '回执序列化或写入失败: ' + lastError}); } catch (_) {}
     } finally { busy = false; heartbeat(); }
   }
-  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;releaseKeepAlive();if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
+  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;transfer=null;clearResponse();releaseKeepAlive();if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
     try {if(typeof g.tt.offHide==='function')g.tt.offHide(onHide);if(typeof g.tt.offShow==='function')g.tt.offShow(onShow);
       if(screenWrapper && g.tt.setKeepScreenOn===screenWrapper)g.tt.setKeepScreenOn=screenOriginal;} catch (_) {}
     clearInterval(tick);clearInterval(pulse);clearInterval(replay); }};
@@ -201,10 +347,74 @@
   const tick = setInterval(function () {
     if (!busy) poll().catch(e => {lastError = errorText(e); heartbeat();});
   }, 100);
+  let stressStarted = false;
+  async function storageStress() {
+    const request=read('storage-stress-request');
+    if(stressStarted || !request || request.token!==token || !Number.isFinite(request.at) ||
+       Date.now()-request.at<0 || Date.now()-request.at>3600000){busy=false;return;}
+    stressStarted=true;
+    const paths=[], report={id:request.id,runtime,target_bytes:200*1024*1024,filled_bytes:0,
+      quota_reached:false,recovered:false,cleaned_files:0,remaining_files:[]};
+    let size=256*1024;
+    try {
+      storageCC=await g.System.import('cc');
+      if(!storageCC.assetManager || !storageCC.assetManager.cacheManager)throw Error('缓存管理器未就绪');
+      // First remove only our own abandoned stress files from an earlier crash.
+      for(const name of fs.readdirSync(g.tt.env.USER_DATA_PATH)) {
+        if(/^e0e1-storage-stress-[a-z0-9-]+-\d+\.tmp$/.test(name)) {
+          try{fs.unlinkSync(g.tt.env.USER_DATA_PATH+'/'+name);}catch(_){}
+        }
+      }
+      const usage=(dir,depth)=>{
+        if(depth>12)throw Error('测试目录层级过深');
+        let total=0;
+        for(const name of fs.readdirSync(dir)) {
+          if(typeof name!=='string'||name.includes('/')||name.includes('\\')||name==='.'||name==='..')continue;
+          const result=fs.statSync(dir+'/'+name), stat=result.stats||result;
+          total+=stat.isDirectory()?usage(dir+'/'+name,depth+1):stat.size;
+        }
+        return total;
+      };
+      report.initial_bytes=usage(g.tt.env.USER_DATA_PATH,0);
+      stressFilling=true;
+      while(report.initial_bytes+report.filled_bytes<report.target_bytes) {
+        size=Math.min(size,report.target_bytes-report.initial_bytes-report.filled_bytes);
+        const path=g.tt.env.USER_DATA_PATH+'/e0e1-storage-stress-'+runtime+'-'+paths.length+'.tmp';
+        paths.push(path);
+        try {
+          fs.writeFileSync(path,'x'.repeat(size),'utf8');report.filled_bytes+=size;
+          await new Promise(resolve=>setTimeout(resolve,0));
+        } catch(e) {
+          if(!String(e).includes('size limit exceeded'))throw e;
+          report.quota_reached=true;report.boundary_error=errorText(e);
+          if(size>1024){size=Math.max(1024,Math.floor(size/2));continue;}
+          break;
+        }
+      }
+      stressFilling=false;
+      const before=storageCleanup.bytes;
+      // At most 1023 bytes remain: this write must exercise quota recovery.
+      write('storage-stress-check',{id:request.id,payload:'x'.repeat(8192)});
+      report.recovered=storageCleanup.bytes>before;
+      report.reclaimed_bytes=storageCleanup.bytes-before;
+      report.check_written=true;
+    }catch(e){report.error=errorText(e);}
+    finally {
+      stressFilling=false;
+      for(const path of paths){try{fs.unlinkSync(path);report.cleaned_files++;}catch(_){try{if(fileSize(path)>0)report.remaining_files.push(path);}catch(_) {}}}
+      try{fs.unlinkSync(prefix+'storage-stress-check.json');}catch(_){}
+      try{write('storage-stress-result',report);}catch(e){lastError=errorText(e);}
+      busy=false;heartbeat();
+    }
+  }
   const replay = setInterval(function () {
     if (g.UIManager && g.System && !busy) {
       clearInterval(replay);
       busy = true;
+      const stress=read('storage-stress-request');
+      if(stress && stress.token===token && stress.id && (!read('storage-stress-result') || read('storage-stress-result').id!==stress.id)) {
+        storageStress().catch(e=>{lastError=errorText(e);busy=false;});return;
+      }
       const config = read('persistent');
       const replayDamage = config && config.token === token && config.damage === true;
       Promise.resolve(replayDamage ? enableDamage() : null).catch(e => {lastError = errorText(e);}).finally(() => {busy = false; heartbeat();});
