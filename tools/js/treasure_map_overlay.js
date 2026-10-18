@@ -215,7 +215,8 @@ function e0e1Update() {
 function e0e1Tick() {
   // 单次异常不能把定时器打死
   try {
-    e0e1Update();
+    var perf=globalThis.e0e1Perf;
+    if(perf)perf.measure('treasure.tick.sync',e0e1Update,null,[]);else e0e1Update();
   } catch (error) {
     console.log("[e0e1][摸金标注] update error: " + error);
   }
@@ -259,6 +260,8 @@ function e0e1Expose(name, value) {
 }
 
 async function e0e1Install() {
+  var previousStop=globalThis.treasureMapOverlayOff;
+  if(typeof previousStop==='function' && previousStop!==e0e1Stop)previousStop();
   e0e1Expose("treasureMapOverlayOn", e0e1Start);
   e0e1Expose("treasureMapOverlayOff", e0e1Stop);
   e0e1Expose("treasureMapOverlayStatus", e0e1Status);

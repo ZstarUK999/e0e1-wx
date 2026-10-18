@@ -317,6 +317,17 @@ return {{resident_id:id, capabilities:['energy']}};
                 pass
             await asyncio.sleep(0.2)
 
+    async def perf_start(self):
+        path = Path(__file__).resolve().parents[2] / 'tools/js/runtime_perf_probe.js'
+        source = path.read_text(encoding='utf-8-sig')
+        return await self._evaluate('(async()=>{'+source+';return true;})()', self.context_id, timeout_ms=10000)
+
+    async def perf_snapshot(self):
+        return await self._evaluate('globalThis.e0e1Perf ? globalThis.e0e1Perf.snapshot() : null', self.context_id)
+
+    async def perf_stop(self):
+        return await self._evaluate('globalThis.e0e1Perf ? globalThis.e0e1Perf.stop() : null', self.context_id)
+
     # ── 摸金地图：注入 tools/js 里已核对的脚本，并调用它们暴露的函数 ──
     TREASURE_SCRIPTS = ("treasure_map_dump.js", "treasure_map_overlay.js")
 

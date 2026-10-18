@@ -21,7 +21,63 @@
     fs.writeFileSync(prefix + name + '.json', data, 'utf8');
   }
   function errorText(e) { return String(e && (e.stack || e.message) || e).slice(0, 4000); }
+  // Douyin-only background protection. A fresh manager lease is required;
+  // no synthetic input, network flags, automatic login or business-command replay.
+  const keepAlive = {active:false, background:false, resumes:0, error:''};
+  let cocos = null, loadingCocos = false, nextCocosTry = 0, resumedInBackground = false;
+  let keepScreenRequested = false, nativeKeepScreen = null;
+  const screenOriginal = g.tt.setKeepScreenOn;
+  let screenWrapper = null;
+  if (typeof screenOriginal === 'function') {
+    screenWrapper = function(options) {
+      if (options && typeof options.keepScreenOn === 'boolean') nativeKeepScreen = options.keepScreenOn;
+      return screenOriginal.apply(this, arguments);
+    };
+    try { g.tt.setKeepScreenOn = screenWrapper; } catch (_) { screenWrapper = null; }
+  }
+  function releaseKeepAlive() {
+    if (resumedInBackground && keepAlive.background && cocos) {
+      try { cocos.director.pause(); cocos.game.pause(); } catch (e) {keepAlive.error = errorText(e);}
+    }
+    resumedInBackground = false;
+    if (keepScreenRequested && typeof nativeKeepScreen === 'boolean') {
+      try {screenOriginal.call(g.tt,{keepScreenOn:nativeKeepScreen,fail:e=>{keepAlive.error=errorText(e);}});} catch(e){keepAlive.error=errorText(e);}
+    }
+    keepScreenRequested = false;keepAlive.active = false;
+  }
+  function maintainKeepAlive() {
+    const lease = read('lease'), resident = g.__e0e1PluginRuntime;
+    const age = lease ? Date.now() - lease.at : Infinity;
+    const active = !stopped && lease && lease.token === token && lease.runtime === runtime && resident &&
+      lease.resident === resident.id && age >= 0 && age < 15000;
+    if (!active) {if (keepAlive.active) releaseKeepAlive();return;}
+    keepAlive.active = true;
+    if (!keepScreenRequested && typeof screenOriginal === 'function') {
+      keepScreenRequested = true;
+      try {screenOriginal.call(g.tt,{keepScreenOn:true,fail:e=>{keepAlive.error=errorText(e);}});} catch(e){keepAlive.error=errorText(e);}
+    }
+    if (!cocos && !loadingCocos && g.System && typeof g.System.import === 'function' && Date.now() >= nextCocosTry) {
+      loadingCocos = true;nextCocosTry = Date.now() + 30000;
+      Promise.resolve().then(()=>g.System.import('cc')).then(value=>{cocos=value;},e=>{keepAlive.error=errorText(e);}).finally(()=>{loadingCocos=false;});
+    }
+    if (keepAlive.background && cocos) {
+      try {
+        let resumed = false;
+        if (cocos.game && typeof cocos.game.isPaused === 'function' && cocos.game.isPaused()) {cocos.game.resume();resumed=true;}
+        if (cocos.director && typeof cocos.director.isPaused === 'function' && cocos.director.isPaused()) {cocos.director.resume();resumed=true;}
+        if(resumed){resumedInBackground=true;keepAlive.resumes++;}
+      } catch(e) {keepAlive.error=errorText(e);}
+    }
+  }
+  const onHide = function(){keepAlive.background=true;keepScreenRequested=false;};
+  const onShow = function(){keepAlive.background=false;resumedInBackground=false;keepScreenRequested=false;};
+  try {if(typeof g.tt.onHide==='function')g.tt.onHide(onHide);if(typeof g.tt.onShow==='function')g.tt.onShow(onShow);} catch(e){keepAlive.error=errorText(e);}
   function heartbeat() {
+    const perf=g.e0e1Perf;
+    return perf ? perf.measure('douyin.heartbeat.sync',heartbeatBody,null,[]) : heartbeatBody();
+  }
+  function heartbeatBody() {
+    maintainKeepAlive();
     let hall = false;
     let playerId = '';
     const game = !!(g.UIManager && g.ROLE && g.System);
@@ -33,7 +89,7 @@
     try {
       write('state', {token, build, runtime, appid: 'tt310e47b3ae06acc002', at: Date.now(),
         game, hall, busy, lastSequence, resident: g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.id || null,
-        protocol: 'static-v1', player_id: playerId, error: lastError});
+        protocol: 'static-v1', player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
     } catch (e) { lastError = errorText(e); }
   }
   function receipt(value) { return typeof value === 'string' ? JSON.parse(value) : value; }
@@ -64,6 +120,9 @@
         const guard = g.__e0e1EnergyGuard;
         return !resident ? {gone:true} : {id:resident.id,pending:!!(resident.pending || guard && (guard.pending || guard.action_pending || guard.callback_count))};
       }
+      case 'perf-start': return staticScripts.perf();
+      case 'perf-status': return g.e0e1Perf ? g.e0e1Perf.snapshot() : null;
+      case 'perf-stop': return g.e0e1Perf ? g.e0e1Perf.stop() : null;
       case 'damage-inject': return enableDamage();
       case 'damage-stop': return stopDamage();
       case 'damage-status': return typeof g.damageCurveStatus === 'function' ? g.damageCurveStatus() : null;
@@ -114,7 +173,10 @@
       try { write('response', {token, runtime, id: command.id, ok: false, error: '回执序列化或写入失败: ' + lastError}); } catch (_) {}
     } finally { busy = false; heartbeat(); }
   }
-  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true; clearInterval(tick); clearInterval(pulse); clearInterval(replay); }};
+  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;releaseKeepAlive();
+    try {if(typeof g.tt.offHide==='function')g.tt.offHide(onHide);if(typeof g.tt.offShow==='function')g.tt.offShow(onShow);
+      if(screenWrapper && g.tt.setKeepScreenOn===screenWrapper)g.tt.setKeepScreenOn=screenOriginal;} catch (_) {}
+    clearInterval(tick);clearInterval(pulse);clearInterval(replay); }};
   const pulse = setInterval(heartbeat, 500);
   const tick = setInterval(function () {
     if (!busy) poll().catch(e => {lastError = errorText(e); heartbeat();});

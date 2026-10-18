@@ -206,3 +206,19 @@ def test_douyin_identity_signal_clears_on_disconnect_and_does_not_change_gate(tm
     assert ids == ['456','789','']
     service.shutdown()
     app.processEvents()
+
+
+def test_douyin_probe_renews_runtime_and_resident_bound_keepalive_lease(tmp_path):
+    async def run():
+        cache, _, _ = cache_fixture(tmp_path)
+        cache.prepare()
+        live(cache, runtime='lease-runtime', resident='lease-resident')
+        transport = DouyinTransport(cache)
+        await transport.connect()
+        await transport.probe()
+        lease = json.loads(cache.mailbox('lease').read_text(encoding='utf-8'))
+        assert lease['token'] == cache.token
+        assert lease['runtime'] == 'lease-runtime'
+        assert lease['resident'] == 'lease-resident'
+        assert 0 <= time.time()*1000-lease['at'] < 2000
+    asyncio.run(run())

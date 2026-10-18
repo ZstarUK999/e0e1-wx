@@ -102,7 +102,7 @@ return {resident_id:id,capabilities:['energy']};
             return 'async function(){' + '\n'.join('await (async function(){\n' +
                 (scripts/name).read_text(encoding='utf-8-sig') + '\n})();' for name in names) + '\nreturn true;}'
         bundle = '{resident:function(id){\n'+resident+'\n},damageEnable:function(){return '+damage+'\n;},'+ \
-                 'damageStop:function(){return '+stop+'\n;},treasure:'+once(('treasure_map_dump.js','treasure_map_overlay.js'))+ \
+                 'damageStop:function(){return '+stop+'\n;},perf:'+once(('runtime_perf_probe.js',))+',treasure:'+once(('treasure_map_dump.js','treasure_map_overlay.js'))+ \
                  ',season:'+once(('season_bloodmoon.js',))+'}'
         template = manager.joinpath('douyin_bridge.js').read_text(encoding='utf-8')
         material = template.replace('__BRIDGE_STATIC_SCRIPTS__',bundle)
@@ -242,6 +242,8 @@ class DouyinTransport(PluginTransport):
             self.connected = False
             self.invalidate()
             return {'appid': '', 'ready': False, 'context_id': None, 'resident_id': None}
+        atomic_json(self.cache.mailbox('lease'), {'token': self.cache.token,
+                    'runtime': status['runtime'], 'resident': status.get('resident'), 'at': time.time() * 1000})
         if self.runtime != status['runtime']:
             self.invalidate()
             self.runtime = status['runtime']
@@ -377,6 +379,9 @@ class DouyinTransport(PluginTransport):
         self._damage_persistent=''
         return result
 
+    async def perf_start(self): return await self._rpc('perf-start')
+    async def perf_snapshot(self): return await self._rpc('perf-status')
+    async def perf_stop(self): return await self._rpc('perf-stop')
     async def damage_status(self): return await self._rpc('damage-status')
     async def damage_snapshot(self): return await self._rpc('damage-snapshot',timeout_ms=30000)
     async def damage_debug(self): return await self._rpc('damage-debug')

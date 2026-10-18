@@ -1,7 +1,7 @@
 """血月战场：战旗探测（只读）、自动加速、自动攻击、隐匿状态标注。
 
 四条共同边界（与 血月调查与插件设计.md 一致）：
-  1. 加速与挑战只点正常按钮，保留冷却、最小剩余时间、道具与状态限制；
+  1. 加速点击原按钮，挑战调用原模块并保留原生资格、频率与状态限制；
   2. 请求没有明确回执就是 uncertain，停止本轮自动动作，不重试不重放；
   3. 被游戏拒绝（rejected）就停下并写明原因，不换目标绕开限制；
   4. 不读取被隐藏的敌方隐匿行军，隐匿目标不作为自动攻击的选敌来源。
@@ -20,15 +20,23 @@ _DECISION_LOG = {}
 
 
 def _decision(name: str, payload: dict) -> None:
-    """分支依据变化即记 INFO；相同依据每 30 秒留一次心跳。"""
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    """常规采样仅 DEBUG 且每类最多30秒一条；重要决策只在依据变化时记 INFO。"""
+    routine = name in {'poll', 'marks', 'speed', 'attack', 'flags_snapshot',
+                       'march_snapshot', 'candidate_snapshot'} or (
+        name.startswith('target_') and name not in {'target_selected', 'target_threshold'})
+    level = logging.DEBUG if routine else logging.INFO
+    if not LOG.isEnabledFor(level):
+        return
     now = time.monotonic()
     previous = _DECISION_LOG.get(name)
-    if previous is None or previous[0] != encoded or now - previous[1] >= 30:
-        LOG.info('血月决策 %s %s', name, encoded)
+    if routine and previous is not None and now - previous[1] < 30:
+        return
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    if routine or previous is None or previous[0] != encoded:
+        LOG.log(level, '血月决策 %s %s', name, encoded)
         _DECISION_LOG[name] = (encoded, now)
 
-ATTACK_PROBE_SECONDS = 2     # 挑战后核对状态同步的间隔
+ATTACK_PROBE_SECONDS = 0     # 挑战后核对状态同步的间隔
 ATTACK_SYNC_TIMEOUT = 60     # 多久还没进入战斗就当服务端没确认，停止本轮
 
 SOURCE_TEXT = {
@@ -49,6 +57,8 @@ class SeasonFeature:
         self._next_probe = 0.0
         self._next_speed = 0.0
         self._next_attack = 0.0
+        self.scan_interval_ms = 100
+        self._deferred_targets = {}
         self._marks = None
         self._next_mark_check = 0.0
         self._lock = asyncio.Lock()
@@ -60,6 +70,11 @@ class SeasonFeature:
         self._attack_since = 0.0
         self._battles = 0
         self._snapshot = None
+        self._config_epoch = 0
+        self.store.changed.connect(self._configuration_changed)
+
+    def _configuration_changed(self, _state) -> None:
+        self._config_epoch += 1
 
     # ── 面板入口 ──
 
@@ -107,6 +122,7 @@ class SeasonFeature:
             self.panel.set_message(f'血月操作失败：{exc}')
 
     def _reset_local(self) -> None:
+        self._deferred_targets.clear()
         self._speed_stopped = self._attack_stopped = ''
         self._attack_pending = False
         self._attack_seen_battle = False
@@ -150,6 +166,7 @@ class SeasonFeature:
     # ── 每秒轮询 ──
 
     async def poll(self, config: dict) -> None:
+        config_epoch = self._config_epoch
         bloodmoon = config.get('bloodmoon') or {}
         ready = self.state.installed and not self.state.closing
         _decision('poll', {'config': bloodmoon, 'installed': bool(self.state.installed), 'closing': self.state.closing, 'injected': self._injected, 'probing': self._probing, 'probe_due': time.monotonic() >= self._next_probe})
@@ -167,18 +184,29 @@ class SeasonFeature:
                 self._injected = False
                 self._marks = None
             return
+        # 兼容旧配置中的子开关字段，统一由总开关决定是否运行。
+        bloodmoon = dict(bloodmoon)
+        for key in ('speed_up', 'attack', 'stealth_mark'):
+            bloodmoon[key] = dict(bloodmoon.get(key) or {}, enabled=True)
         try:
             await self._ensure_injected()
+            if self._lock.locked():
+                return
+            async with self._lock:
+                if config_epoch != self._config_epoch or self.state.closing:
+                    return
+                # 抵达后优先发现并挑战，不让加速、诊断、探测阻塞首次选敌。
+                await self._poll_attack(bloodmoon)
+                if config_epoch != self._config_epoch or self.state.closing:
+                    return
+                await self._poll_speed(bloodmoon)
+            if config_epoch != self._config_epoch or self.state.closing:
+                return
             await self._sync_marks(bloodmoon)
             if self._probing and time.monotonic() >= self._next_probe:
                 interval = max(1, int((bloodmoon.get('flag_probe') or {}).get('refresh_seconds') or 5))
                 self._next_probe = time.monotonic() + interval
                 await self.probe_once()
-            if self._lock.locked():
-                return
-            async with self._lock:
-                await self._poll_speed(bloodmoon)
-                await self._poll_attack(bloodmoon)
         except Exception as exc:
             LOG.exception('血月轮询失败：%s', exc)
 
@@ -195,7 +223,10 @@ class SeasonFeature:
         if on and time.monotonic() >= self._next_mark_check:
             self._next_mark_check = time.monotonic() + 30
             info = await self.transport.season_call('diagnose')
-            LOG.info('血月标注定时诊断：%r', info)
+            LOG.debug('血月标注定时诊断：%r', info)
+            if isinstance(info, dict) and info.get('marks_enabled') is False:
+                await self.transport.season_call('marks', {'on': True})
+                LOG.info('已恢复脚本更新后停止的隐匿标注定时器')
             if isinstance(info, dict) and info.get('mark_error'):
                 LOG.error('血月标注定时器异常：%r', info['mark_error'])
 
@@ -239,8 +270,12 @@ class SeasonFeature:
         notes = [n for n in (member.get('stateName') or '', member.get('note') or '') if n]
         if member.get('stealth'):
             notes.append('隐身中')
+        for key, label in (('season_power', '赛季战力'), ('total_power', '综合战力')):
+            if member.get(key) is not None:
+                notes.append(label + '：' + SeasonFeature._short(member[key]))
         return {'name': member.get('name') or ('#' + str(member.get('roleId'))),
-                'power': SeasonFeature._short(member.get('power')),
+                '_power': int(member.get('power') or 0),
+                'power': SeasonFeature._short(member['power']) if member.get('power') is not None else '未下发',
                 'flag': flag, 'note': ' · '.join(notes)}
 
     @staticmethod
@@ -275,6 +310,7 @@ class SeasonFeature:
     # ── 自动加速 ──
 
     async def _poll_speed(self, bloodmoon: dict) -> None:
+        config_epoch = self._config_epoch
         speed = bloodmoon.get('speed_up') or {}
         _decision('speed', {'config': speed, 'stopped': self._speed_stopped, 'due': time.monotonic() >= self._next_speed})
         if not speed.get('enabled'):
@@ -284,8 +320,10 @@ class SeasonFeature:
             return
         if time.monotonic() < self._next_speed:
             return
-        self._next_speed = time.monotonic() + max(1, int(speed.get('poll_seconds') or 2))
+        self._next_speed = time.monotonic() + 0.1  # 每轮检查，真实加速间隔由原UI冷却决定
         state = await self.transport.season_call('march')
+        if config_epoch != self._config_epoch or self.state.closing:
+            return
         _decision('march_snapshot', {'snapshot': state})
         if not isinstance(state, dict) or not state.get('ok'):
             LOG.warning('行军状态读取失败：%r', state)
@@ -309,6 +347,11 @@ class SeasonFeature:
             LOG.debug('自动加速等待：%s remain=%s', reason, remain)
             self.panel.set_speed_status(f"等待合法时机：{reason}（剩余 {remain} 秒）")
             return
+        minimum_ms = int((state.get('speed_up') or {}).get('min_remain_seconds') or 0) * 1000
+        margin_ms = int(speed.get('safety_margin_seconds') or 0) * 1000
+        if int(move.get('remain_ms') or 0) < minimum_ms + margin_ms:
+            self.panel.set_speed_status('剩余时间不足（含额外预留时间），不点击加速')
+            return
         LOG.info('准备行军加速：times=%s limit=%s remain=%s margin=%s', times, limit, remain, speed.get('safety_margin_seconds') or 0)
         try:
             receipt = await self.transport.season_call('speedUp', {'safety_margin_seconds': speed.get('safety_margin_seconds') or 0, 'max_times': limit})
@@ -320,6 +363,9 @@ class SeasonFeature:
             result = receipt if isinstance(receipt, dict) else {}
             status = result.get('status') or 'uncertain'
             message = result.get('message') or '未取得明确成功回执'
+            if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
+                self.panel.set_speed_status(f'等待UI可操作：{message}')
+                return
             if status == 'uncertain':
                 self._speed_stopped = message
                 LOG.error('加速结果未知，停止本次行军的自动加速：%s', message)
@@ -335,6 +381,7 @@ class SeasonFeature:
     # ── 自动攻击 ──
 
     async def _poll_attack(self, bloodmoon: dict) -> None:
+        config_epoch = self._config_epoch
         attack = bloodmoon.get('attack') or {}
         _decision('attack', {'config': attack, 'stopped': self._attack_stopped, 'pending': self._attack_pending, 'seen_battle': self._attack_seen_battle, 'since': self._attack_since, 'battles': self._battles, 'due': time.monotonic() >= self._attack_wait_until, 'sync_expired': bool(self._attack_since and time.monotonic() - self._attack_since > ATTACK_SYNC_TIMEOUT), 'sync_timeout': ATTACK_SYNC_TIMEOUT, 'probe_seconds': ATTACK_PROBE_SECONDS})
         if not attack.get('enabled'):
@@ -344,9 +391,11 @@ class SeasonFeature:
             return
         if time.monotonic() < self._attack_wait_until:
             return
-        wait = max(0, int(attack.get('wait_seconds') or 0))
-        self._attack_wait_until = time.monotonic() + max(1, wait)
+        wait = 0  # 不设两场间隔；每次轮询仍核对真实战斗状态与按钮资格。
+        self._attack_wait_until = time.monotonic()
         snapshot = await self.transport.season_call('candidates')
+        if config_epoch != self._config_epoch or self.state.closing:
+            return
         _decision('candidate_snapshot', {'snapshot': snapshot})
         if not isinstance(snapshot, dict) or not snapshot.get('ok'):
             LOG.warning('节点队列读取失败：%r', snapshot)
@@ -354,6 +403,12 @@ class SeasonFeature:
             self.panel.set_attack_status(f"读取节点队列失败：{result.get('message') or '未知原因'}")
             return
         state = snapshot.get('self_state')
+        self.scan_interval_ms = 100
+        end_time = int(snapshot.get('battle_end_time') or 0)
+        server_now = int(snapshot.get('server_now') or 0)
+        if state == 3 and end_time > 0 and server_now > 0:
+            # 预计结束前200ms进入高频扫描；只在服务端回到idle后发送。
+            self.scan_interval_ms = max(50, min(100, end_time - server_now - 200))
         if self._attack_pending:
             LOG.debug('挑战同步决策：self_state=%r state_name=%r elapsed=%s timeout=%s wait=%s', state, snapshot.get('self_state_name'), time.monotonic() - self._attack_since, ATTACK_SYNC_TIMEOUT, wait)
             # 只有明确战斗状态确认进入；缺失/行军都不能代替确认。
@@ -374,7 +429,7 @@ class SeasonFeature:
         if state == 3:
             self._attack_seen_battle = True
             self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-            self.panel.set_attack_status('战斗中，等待结束后计时')
+            self.panel.set_attack_status('战斗中，等待结束后继续挑战')
             return
         if self._attack_seen_battle:
             if state != 1:
@@ -384,7 +439,7 @@ class SeasonFeature:
             self._attack_seen_battle = False
             self._attack_wait_until = time.monotonic() + wait
             LOG.info('战斗结束已确认：wait_seconds=%s wait_until=%s', wait, self._attack_wait_until)
-            self.panel.set_attack_status(f'战斗结束，等待 {wait} 秒后选敌')
+            self.panel.set_attack_status('战斗结束，待命后继续扫描选敌')
             if wait > 0:
                 return
         if state != 1:
@@ -396,14 +451,19 @@ class SeasonFeature:
             LOG.info('自动攻击停止：%s', self._attack_stopped)
             self.panel.set_attack_status(self._attack_stopped)
             return
-        target = self._pick(snapshot, attack)
+        now = time.monotonic()
+        self._deferred_targets = {role_id:until for role_id,until in self._deferred_targets.items() if until > now}
+        selectable = dict(snapshot)
+        for key in ('attack', 'defense'):
+            selectable[key] = [row for row in snapshot.get(key, []) if row.get('roleId') not in self._deferred_targets]
+        target = self._pick(selectable, attack)
         if target is None:
             LOG.debug('自动攻击未选到目标：mine=%s ratio=%s absolute=%s reason=%s', snapshot.get('self_plan_power') or snapshot.get('self_power'), attack.get('power_ratio'), attack.get('power_limit'), self._no_target_reason(snapshot, attack))
             self.panel.set_attack_status(self._no_target_reason(snapshot, attack))
             return
         LOG.info('准备挑战：roleId=%s power=%s mine=%s ratio=%s absolute=%s battles=%s limit=%s', target['roleId'], target.get('planPower') or target.get('power'), snapshot.get('self_plan_power') or snapshot.get('self_power'), attack.get('power_ratio'), attack.get('power_limit'), self._battles, limit)
         try:
-            receipt = await self.transport.season_call('attack', {'roleId': target['roleId'], 'power_ratio': int(attack.get('power_ratio') or 100), 'power_limit': int(attack.get('power_limit') or 0)})
+            receipt = await self.transport.season_call('attack', {'roleId': target['roleId'], 'power_ratio': 100, 'power_limit': int(attack.get('power_limit') or 0)})
         except Exception as exc:
             LOG.exception('挑战传输失败，停止自动攻击：roleId=%s', target['roleId'])
             receipt = {'ok': False, 'status': 'uncertain', 'message': f'挑战回执未取得：{exc}'}
@@ -412,6 +472,15 @@ class SeasonFeature:
             result = receipt if isinstance(receipt, dict) else {}
             status = result.get('status') or 'uncertain'
             message = result.get('message') or '未取得明确成功回执'
+            if status == 'target_unavailable' and result.get('roleId') == target['roleId']:
+                delay = max(1.0, float(result.get('retry_after_ms') or 1000) / 1000)
+                self._deferred_targets[target['roleId']] = time.monotonic() + delay
+                self.panel.set_attack_status('目标正在行军，暂缓该目标，继续扫描当前节点')
+                LOG.info('挑战目标暂不可用：roleId=%s，暂缓%s秒，继续节点扫描', target['roleId'], delay)
+                return
+            if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
+                self.panel.set_attack_status(f'等待UI可操作：{message}')
+                return
             self._attack_stopped = message
             LOG.error('挑战未成功，停止自动攻击：%s（%s）', message, status)
             self.panel.set_attack_status(f"已停止：{message}")
@@ -430,7 +499,7 @@ class SeasonFeature:
         if mine <= 0:
             LOG.debug('选敌停止：self_plan_power=%r self_power=%r effective_mine=%s', snapshot.get('self_plan_power'), snapshot.get('self_power'), mine)
             return None
-        ratio = int(attack.get('power_ratio') or 100)
+        ratio = 100
         absolute = int(attack.get('power_limit') or 0)
         ceiling = mine * ratio // 100 if mine > 0 else 0
         if absolute and (ceiling <= 0 or absolute < ceiling):
@@ -459,7 +528,7 @@ class SeasonFeature:
         if not rows:
             return '当前节点没有可见的其他玩家'
         mine = int(snapshot.get('self_plan_power') or snapshot.get('self_power') or 0)
-        ratio = int(attack.get('power_ratio') or 100)
+        ratio = 100
         if mine <= 0:
             return '我方战力尚未可靠读取，暂停选敌'
         ceiling = mine * ratio // 100

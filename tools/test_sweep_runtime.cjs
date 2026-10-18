@@ -222,6 +222,22 @@ test('own player information renders translated snapshot sections',async()=>{
   assert.equal(f.requests.length,0);
 });
 
+test('player information marks equipped Leifa before other sections without using display skin',async()=>{
+  const f=fixture();f.cfg.Setting={id:'Setting'};
+  const configs=await f.g.System.import('chunks:///_virtual/configs.ts');
+  configs.FashionCfg={getById:id=>({name:id===5001?'雷法尊者':'其他傀儡装'})};
+  const snapshot={name:'甲',fashion:new Map([[5,5001]]),allFashion:new Map([[5001,3]])};
+  const node={activeInHierarchy:true,children:[],getComponent:()=>null};
+  const page={isPersonal:false,node,info:snapshot};
+  f.windows.set(f.cfg.Setting,{isValid:true,isSelf:false,view:{page_info:page},info:snapshot});
+  let result=await f.runtime.dispatch('player_information');
+  assert.match(result.value.text,/【雷法尊者】.*已穿戴.*Lv3/);
+  snapshot.fashion=new Map();snapshot.onShow=new Map([[5,5001]]);
+  result=await f.runtime.dispatch('player_information');
+  assert.match(result.value.text,/未穿戴傀儡装/);assert.doesNotMatch(result.value.text,/【雷法尊者】/);
+  assert.equal(f.requests.length,0);
+});
+
 test('optimize picks the gold plan from entry data and measures sanshi inside its page',async()=>{
   const f=fixture();
   const configs=await f.g.System.import('chunks:///_virtual/configs.ts');

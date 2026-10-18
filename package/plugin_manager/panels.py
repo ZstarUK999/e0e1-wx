@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from datetime import datetime
 
 LOG = logging.getLogger('plugin_manager.configuration')
 
@@ -446,7 +447,7 @@ class PlayerPanel(QWidget):
 class BloodmoonPanel(QWidget):
     """血月战场：战旗探测是只读展示，加速与攻击只走正常按钮并保留游戏全部限制。
 
-    战旗探测由「开始/停止探测」按钮控制，运行状态不写配置；加速与攻击的开关即时保存，
+    战旗探测由「开始/停止探测」按钮控制，运行状态不写配置；其余功能统一跟随总开关，
     但只有游戏在血月地图里、插件就绪时才真正执行。
     """
 
@@ -470,7 +471,7 @@ class BloodmoonPanel(QWidget):
         heading = QLabel("血月战场")
         heading.setObjectName("panelTitle")
         layout.addWidget(heading)
-        note = QLabel("战旗探测只读战场内已同步的旗帜数据；自动加速与自动攻击只点正常按钮，"
+        note = QLabel("战旗探测只读战场内已同步的旗帜数据；自动加速点击原按钮；自动攻击直接调用原模块，"
                       "保留冷却、剩余时间、道具与状态限制，被拒绝就停。\n"
                       "不读取、不展示被游戏隐藏的敌方隐匿行军，隐匿目标不作为自动攻击的选敌来源。")
         note.setWordWrap(True)
@@ -479,7 +480,7 @@ class BloodmoonPanel(QWidget):
         self.enabled.setObjectName("bloodmoon.enabled")
         layout.addWidget(self.enabled)
 
-        self.master_note = QLabel("关闭总开关会暂停全部血月功能，并保留下方设置；开启后只运行单独启用的功能。\n"
+        self.master_note = QLabel("关闭总开关会暂停全部血月功能，并保留下方设置；开启后自动加速、自动挑战与隐匿标注统一运行。\n"
                                  "战旗探测需点击“开始探测”；诊断和复位不受总开关控制。")
         self.master_note.setWordWrap(True)
         layout.addWidget(self.master_note)
@@ -523,9 +524,6 @@ class BloodmoonPanel(QWidget):
 
         self.speed_box = QGroupBox("自动加速（正常加速按钮）")
         speed_layout = QVBoxLayout(self.speed_box)
-        self.speed_enabled = QCheckBox("行军中自动点击加速")
-        self.speed_enabled.setObjectName("bloodmoon.speed_up.enabled")
-        speed_layout.addWidget(self.speed_enabled)
         speed_form = QFormLayout()
         self.speed_times = QSpinBox()
         self.speed_times.setRange(0, 99)
@@ -536,7 +534,8 @@ class BloodmoonPanel(QWidget):
         self.speed_margin.setRange(0, 60)
         self.speed_margin.setSuffix(" 秒")
         self.speed_margin.setObjectName("bloodmoon.speed_up.safety_margin_seconds")
-        speed_form.addRow("最小剩余时间安全余量", self.speed_margin)
+        self.speed_margin.setToolTip("在游戏要求的最低剩余时间上额外预留；例如游戏最低要求10秒、预留2秒，则剩余不足12秒不加速；原生UI禁止时绝不操作。")
+        speed_form.addRow("额外预留时间（游戏最低要求之外）", self.speed_margin)
         speed_layout.addLayout(speed_form)
         self.speed_save = QPushButton("保存加速设置")
         speed_layout.addWidget(self.speed_save)
@@ -545,33 +544,23 @@ class BloodmoonPanel(QWidget):
         speed_layout.addWidget(self.speed_status)
         layout.addWidget(self.speed_box)
 
-        self.attack_box = QGroupBox("自动攻击（同节点、可见、战力更低）")
+        self.attack_box = QGroupBox("自动攻击（当前节点扫描、直接请求）")
         attack_layout = QVBoxLayout(self.attack_box)
-        self.attack_enabled = QCheckBox("自动挑战符合条件的玩家")
-        self.attack_enabled.setObjectName("bloodmoon.attack.enabled")
-        attack_layout.addWidget(self.attack_enabled)
         attack_form = QFormLayout()
-        self.attack_ratio = QSpinBox()
-        self.attack_ratio.setRange(10, 200)
-        self.attack_ratio.setSuffix(" %")
-        self.attack_ratio.setObjectName("bloodmoon.attack.power_ratio")
-        attack_form.addRow("目标战力低于我方的比例", self.attack_ratio)
         self.attack_limit = QDoubleSpinBox()
         self.attack_limit.setDecimals(0)
         self.attack_limit.setRange(0, BLOODMOON_POWER_MAX)
         self.attack_limit.setSpecialValueText("不限制")
         self.attack_limit.setObjectName("bloodmoon.attack.power_limit")
-        attack_form.addRow("目标战力绝对上限", self.attack_limit)
+        attack_form.addRow("目标战力上限", self.attack_limit)
+        attack_hint = QLabel("只攻击战力低于我方、且低于此上限的可见玩家；0 表示只按我方战力筛选。每100毫秒扫描当前节点；待命后直接挑战，发送至少间隔1秒，等待回执期间不重复发送。")
+        attack_hint.setWordWrap(True)
+        attack_layout.addWidget(attack_hint)
         self.attack_max = QSpinBox()
         self.attack_max.setRange(0, 999)
         self.attack_max.setSpecialValueText("不限制")
         self.attack_max.setObjectName("bloodmoon.attack.max_battles")
         attack_form.addRow("单轮最多挑战", self.attack_max)
-        self.attack_wait = QSpinBox()
-        self.attack_wait.setRange(0, 60)
-        self.attack_wait.setSuffix(" 秒")
-        self.attack_wait.setObjectName("bloodmoon.attack.wait_seconds")
-        attack_form.addRow("两场之间等待", self.attack_wait)
         attack_layout.addLayout(attack_form)
         self.attack_save = QPushButton("保存攻击设置")
         attack_layout.addWidget(self.attack_save)
@@ -582,9 +571,6 @@ class BloodmoonPanel(QWidget):
 
         self.mark_box = QGroupBox("隐匿状态标注")
         mark_layout = QVBoxLayout(self.mark_box)
-        self.mark_enabled = QCheckBox("给已可见的隐身单位画「隐匿中」标识")
-        self.mark_enabled.setObjectName("bloodmoon.stealth_mark.enabled")
-        mark_layout.addWidget(self.mark_enabled)
         mark_note = QLabel("只标注当前本来就能看到的单位（已到达本节点、已在可见队列里）。"
                            "不揭示被游戏隐藏的敌方行军，也不把它们加进自动攻击的候选。")
         mark_note.setWordWrap(True)
@@ -604,9 +590,6 @@ class BloodmoonPanel(QWidget):
         scroll.setWidget(content)
         self.set_ready(False)
         self.enabled.toggled.connect(lambda value: self._patch({"enabled": value}))
-        self.speed_enabled.toggled.connect(lambda value: self._patch({"speed_up": {"enabled": value}}))
-        self.attack_enabled.toggled.connect(lambda value: self._patch({"attack": {"enabled": value}}))
-        self.mark_enabled.toggled.connect(lambda value: self._patch({"stealth_mark": {"enabled": value}}))
         self.probe_start.clicked.connect(lambda: self.probe_requested.emit(True))
         self.probe_stop.clicked.connect(lambda: self.probe_requested.emit(False))
         self.diagnose_button.clicked.connect(self.diagnose_requested.emit)
@@ -643,27 +626,21 @@ class BloodmoonPanel(QWidget):
                              "safety_margin_seconds": self.speed_margin.value()}}
 
     def _attack_patch(self) -> dict:
-        return {"attack": {"power_ratio": self.attack_ratio.value(), "power_limit": int(self.attack_limit.value()),
-                           "max_battles": self.attack_max.value(), "wait_seconds": self.attack_wait.value()}}
+        return {"attack": {"power_ratio": 100, "power_limit": int(self.attack_limit.value()),
+                           "max_battles": self.attack_max.value(), "wait_seconds": 0}}
 
     def sync(self, state):
         bloodmoon = state.get("bloodmoon") or {}
         probe = bloodmoon.get("flag_probe") or {}
         speed = bloodmoon.get("speed_up") or {}
         attack = bloodmoon.get("attack") or {}
-        mark = bloodmoon.get("stealth_mark") or {}
         set_checked(self.enabled, bool(bloodmoon.get("enabled")))
-        set_checked(self.speed_enabled, bool(speed.get("enabled")))
-        set_checked(self.attack_enabled, bool(attack.get("enabled")))
-        set_checked(self.mark_enabled, bool(mark.get("enabled")))
         for widget, value in ((self.probe_refresh, probe.get("refresh_seconds", 5)),
                               (self.probe_top, probe.get("top_members", 3)),
                               (self.speed_times, speed.get("max_times", 15)),
                               (self.speed_margin, speed.get("safety_margin_seconds", 2)),
-                              (self.attack_ratio, attack.get("power_ratio", 100)),
                               (self.attack_limit, attack.get("power_limit", 0)),
-                              (self.attack_max, attack.get("max_battles", 10)),
-                              (self.attack_wait, attack.get("wait_seconds", 3))):
+                              (self.attack_max, attack.get("max_battles", 10))):
             if widget.value() != value:
                 widget.setValue(int(value))
         self.set_ready(getattr(self, '_ready', False))
@@ -671,18 +648,15 @@ class BloodmoonPanel(QWidget):
     def set_ready(self, ready: bool) -> None:
         """游戏与插件未就绪时，除总开关外一律禁用。"""
         for widget in (self.probe_start, self.probe_save, self.diagnose_button, self.reset_button,
-                       self.speed_enabled, self.speed_save, self.attack_enabled, self.attack_save,
-                       self.mark_enabled):
+                       self.speed_save, self.attack_save):
             widget.setEnabled(bool(ready))
         self._ready = bool(ready)
         master = bool((self.store.snapshot().get('bloodmoon') or {}).get('enabled'))
         active = bool(ready) and master
-        for widget in (self.speed_enabled, self.attack_enabled, self.mark_enabled):
-            widget.setEnabled(active)
         self.probe_start.setEnabled(active and not getattr(self, '_probe_running', False))
         self.probe_stop.setEnabled(bool(ready) and getattr(self, '_probe_running', False))
         self.master_status.setText('总开关已关闭：全部血月功能暂停' if not master else
-                                   ('总开关已开启：按下方开关运行' if ready else '总开关已开启：等待游戏与插件就绪'))
+                                   ('总开关已开启：加速、挑战与隐匿标注运行中' if ready else '总开关已开启：等待游戏与插件就绪'))
         if not ready:
             self.probe_stop.setEnabled(False)
 
@@ -699,9 +673,9 @@ class BloodmoonPanel(QWidget):
         expanded = {item.text(0) for item in self._top_items() if item.isExpanded()}
         self.probe_tree.clear()
         for group in rows or []:
-            members = list(group.get("members", []) or [])
+            members = sorted(group.get("members", []) or [], key=lambda m: int(m.get("_power", m.get("power")) or 0), reverse=True)
             top_count = int((self.store.snapshot().get('bloodmoon') or {}).get('flag_probe', {}).get('top_members', 3))
-            summary = " ".join(f"{m.get('name') or '?'}·{m.get('flag') or '?'}" for m in members[:top_count])
+            summary = "\n".join(f"{m.get('name') or '?'}·{m.get('flag') or '?'}  战力 {m.get('power') or '未知'}" for m in members[:top_count])
             top = QTreeWidgetItem([str(group.get("title") or "未命名阴司"),
                                    str(group.get("power") or ""), summary,
                                    "展开看全部" if members else str(group.get("note") or "")])
@@ -763,6 +737,7 @@ class DamagePanel(QWidget):
     refresh_requested = Signal()
     reset_requested = Signal()
     debug_requested = Signal()
+    perf_requested = Signal()
     open_report_requested = Signal()
 
     def __init__(self, store: PluginConfigStore):
@@ -772,7 +747,7 @@ class DamagePanel(QWidget):
         heading = QLabel("PVP伤害分析")
         heading.setObjectName("panelTitle")
         layout.addWidget(heading)
-        note = QLabel("进入 PVP 对局自动采集我方与敌方两个 World 的伤害，战斗结束后在 logs/ 生成 HTML 报告。"
+        note = QLabel("进入 PVP 对局自动采集我方与敌方两个 World 的伤害，战斗结束后在 logs/damage_reports/ 保存对局数据与 HTML 报告。"
                       "当前完整支持的是好友切磋：它可以随便打，也可以直接点「跳过战斗」。"
                       "斗法／血月也能采，但它们的跳过走服务端结算，会丢数据——下面那行提示会说明当前模式。")
         note.setWordWrap(True)
@@ -801,10 +776,11 @@ class DamagePanel(QWidget):
         self.refresh_button = QPushButton("立即取一次")
         self.reset_button = QPushButton("清空重采")
         self.debug_button = QPushButton("诊断")
+        self.perf_button = QPushButton("性能采样60秒")
         self.open_button = QPushButton("打开图表报告")
-        for button in (self.refresh_button, self.reset_button, self.debug_button, self.open_button):
+        for button in (self.refresh_button, self.reset_button, self.debug_button, self.perf_button, self.open_button):
             buttons.addWidget(button)
-        for button in (self.refresh_button, self.reset_button, self.debug_button):
+        for button in (self.refresh_button, self.reset_button, self.debug_button, self.perf_button):
             button.setEnabled(False)
         layout.addLayout(buttons)
 
@@ -812,12 +788,30 @@ class DamagePanel(QWidget):
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
 
+        history_heading = QHBoxLayout()
+        history_heading.addWidget(QLabel("历史报告（双击打开）"))
+        self.history_refresh_button = QPushButton("刷新历史")
+        history_heading.addWidget(self.history_refresh_button)
+        layout.addLayout(history_heading)
+        self.report_history = QTreeWidget()
+        self.report_history.setHeaderLabels(["对局报告", "保存时间"])
+        self.report_history.setRootIsDecorated(False)
+        self.report_history.setMinimumHeight(130)
+        self.report_history.setMaximumHeight(260)
+        self.report_history.setColumnWidth(0, 360)
+        layout.addWidget(self.report_history)
         self._report_path = None
+        self._report_dir = Path('logs') / 'damage_reports'
+        self.open_button.setEnabled(False)
+        self.history_refresh_button.clicked.connect(lambda: self.refresh_report_history())
+        self.report_history.currentItemChanged.connect(self._history_selected)
+        self.report_history.itemDoubleClicked.connect(lambda *_: self.open_report_requested.emit())
         self.enabled.toggled.connect(lambda value: self._flag("enabled", value))
         self.auto_csv.toggled.connect(lambda value: self._flag("auto_csv", value))
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.reset_button.clicked.connect(self.reset_requested.emit)
         self.debug_button.clicked.connect(self.debug_requested.emit)
+        self.perf_button.clicked.connect(self.perf_requested.emit)
         self.open_button.clicked.connect(self.open_report_requested.emit)
         store.changed.connect(self.sync)
         self.sync(store.snapshot())
@@ -837,7 +831,7 @@ class DamagePanel(QWidget):
         set_checked(self.auto_csv, bool(damage.get("auto_csv")))
 
     def set_ready(self, ready: bool):
-        for button in (self.refresh_button, self.reset_button, self.debug_button):
+        for button in (self.refresh_button, self.reset_button, self.debug_button, self.perf_button):
             button.setEnabled(bool(ready))
 
     def set_status(self, text: str):
@@ -854,6 +848,43 @@ class DamagePanel(QWidget):
         self.open_button.setEnabled(self._report_path is not None and self._report_path.exists())
         if self._report_path is not None:
             self.message.setText(f"报告：{self._report_path}")
+
+
+    def set_report_directory(self, directory):
+        self._report_dir = Path(directory)
+        self.refresh_report_history()
+
+    def refresh_report_history(self, preferred=None):
+        selected = Path(preferred) if preferred else self._report_path
+        try:
+            candidates = list(self._report_dir.glob('*.html'))
+            # 兼容原先 logs 下的报告，新报告使用独立目录。
+            if self._report_dir.name == 'damage_reports':
+                candidates.extend(self._report_dir.parent.glob('damage_curve_*.html'))
+            reports = sorted(((path.stat().st_mtime, path) for path in candidates if path.is_file()),
+                             key=lambda item: (item[0], item[1].name), reverse=True)
+        except OSError as exc:
+            self.message.setText(f"读取历史报告失败：{exc}")
+            return
+        blocker = QSignalBlocker(self.report_history)
+        self.report_history.clear()
+        chosen = None
+        for modified, path in reports:
+            item = QTreeWidgetItem([path.stem, datetime.fromtimestamp(modified).strftime('%Y-%m-%d %H:%M:%S')])
+            item.setData(0, Qt.UserRole, str(path))
+            item.setToolTip(0, str(path.resolve()))
+            self.report_history.addTopLevelItem(item)
+            if selected and path.resolve() == selected.resolve():
+                chosen = item
+        if chosen is None and self.report_history.topLevelItemCount():
+            chosen = self.report_history.topLevelItem(0)
+        if chosen is not None:
+            self.report_history.setCurrentItem(chosen)
+        del blocker
+        self._history_selected(chosen, None)
+
+    def _history_selected(self, current, previous):
+        self.set_report_path(current.data(0, Qt.UserRole) if current is not None else None)
 
 
 class DesirePanel(QWidget):

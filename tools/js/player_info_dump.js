@@ -220,27 +220,6 @@ function e0e1ParseSkillCombine(snapshot) {
   return lines;
 }
 
-// 三尸效果只有描述文本，从文本里抠「N%pvp增伤」/「pvp增伤+N%」这类数值
-function e0e1PickPercent(desc, keyword) {
-  if (!desc) return 0;
-  var text = String(desc).toLowerCase().replace(/\s+/g, "");
-  var kw = String(keyword).toLowerCase();
-  var patterns = [
-    "([0-9]+(?:\\.[0-9]+)?)%" + kw,
-    kw + "[+＋]?([0-9]+(?:\\.[0-9]+)?)%"
-  ];
-  for (var i = 0; i < patterns.length; i++) {
-    var re = new RegExp(patterns[i], "g");
-    var match, total = 0, found = false;
-    while ((match = re.exec(text)) !== null) {
-      total += parseFloat(match[1]);
-      found = true;
-    }
-    if (found) return Math.round(total * 100) / 100;
-  }
-  return 0;
-}
-
 // 三尸：key = 槽位<<16 | 序号，value = 三尸ID（DesireCfg 行的 itemId 里带名字和效果描述）
 function e0e1ParseDesirePlan(planMap, label) {
   var lines = [];
@@ -264,19 +243,16 @@ function e0e1ParseDesirePlan(planMap, label) {
     });
   });
 
-  // 每套方案汇总 PVP 增伤 / 减伤
-  var pvpUp = 0, pvpDown = 0;
-  e0e1ForEachMap(planMap, 80, function (desireId) {
-    var desc = e0e1ResolveDesc("DesireCfg", desireId);
-    pvpUp += e0e1PickPercent(desc, "pvp增伤");
-    // 文本里两种写法都有：PVP减伤 / PVP减免
-    pvpDown += e0e1PickPercent(desc, "pvp减伤") + e0e1PickPercent(desc, "pvp减免");
+  // 只汇总无条件面板属性；描述里的层数、概率、条件增伤不能当成常驻值相加。
+  var pvpUp=0,pvpDown=0,conditional=0;
+  e0e1ForEachMap(planMap,80,function(desireId){
+    var row=e0e1Row('DesireCfg',desireId),attrs=row && row.attr;
+    function value(key){return Number(attrs && (attrs.get ? attrs.get(key) : attrs[key])) || 0;}
+    pvpUp+=value(117)/100;pvpDown+=value(118)/100;
+    if(row && row.skill && row.skill.length)conditional++;
   });
-  if (pvpUp || pvpDown) {
-    var summary = "· " + label + " 汇总：PVP增伤 " + pvpUp + "%";
-    if (pvpDown) summary += "、PVP减伤 " + pvpDown + "%";
-    lines.push(summary);
-  }
+  if(pvpUp || pvpDown)lines.push('· '+label+' 常驻面板汇总：PVP增伤 '+pvpUp+'%、PVP减伤 '+pvpDown+'%');
+  if(conditional)lines.push('· 另有 '+conditional+' 项技能效果，按触发条件与实际层数生效，不计入常驻面板汇总');
   return lines;
 }
 
@@ -445,6 +421,23 @@ function e0e1ParseModules(snapshot) {
   }).join("、")];
 }
 
+// 使用实际穿戴fashion，onShow只是展示外观，不据此判断战斗装备。
+function e0e1ParseFashion(snapshot) {
+  var equipped = e0e1IsMap(snapshot.fashion) ? snapshot.fashion : snapshot.fashion && snapshot.fashion.onUse;
+  if (!e0e1IsMap(equipped)) return ['· 傀儡装穿戴资料未下发'];
+  var lines = [];
+  e0e1ForEachMap(equipped, 30, function (id, slot) {
+    var cfg = e0e1Row('FashionCfg', id);
+    var levels = snapshot.allFashion || (snapshot.fashion && snapshot.fashion.level);
+    var level = e0e1IsMap(levels) ? levels.get(Number(id)) : null;
+    var name = e0e1NameOf(cfg) || ('傀儡装ID' + id);
+    lines.push('· ' + (name === '雷法尊者' ? '【雷法尊者】 ' : '') + name +
+      '（已穿戴，部位' + slot + (level !== null && level !== undefined ? '，Lv' + level : '') + '）');
+  });
+  lines.sort(function(a,b){return Number(b.indexOf('【雷法尊者】') >= 0)-Number(a.indexOf('【雷法尊者】') >= 0);});
+  return lines.length ? lines : ['· 未穿戴傀儡装'];
+}
+
 // ── 组装与输出 ──
 
 function e0e1DecodeHide(mask) {
@@ -478,6 +471,7 @@ async function e0e1BuildDump(snapshot, isSelf) {
     if (filled.length) dump.sections.push({ name: name, blocks: filled });
   }
 
+  add("傀儡装", [{ label: "当前穿戴", lines: e0e1ParseFashion(snapshot) }]);
   add("天书", [
     { label: "装备中", lines: e0e1ParseEquippedSkills(snapshot) },
     { label: "天书等级", lines: e0e1ParseSkillLevels(snapshot) },

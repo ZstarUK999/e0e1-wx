@@ -504,7 +504,9 @@ def test_task_buttons_replace_context_menus_and_advanced_fields_start_collapsed(
     assert energy.test_button.isEnabled()
 
 
-def test_main_ui_stays_hidden_until_gate_releases(window):
+def test_main_ui_stays_hidden_until_gate_releases(window, monkeypatch):
+    from package.plugin_manager.build_info import BuildInfo
+    monkeypatch.setattr("package.plugin_manager.window.build_info", lambda: BuildInfo("release", "1", ""))
     """启动只显示门禁占位面板；主 UI 必须显式放行后才切过去。"""
     assert window.main_ui_shown is False
     root = window.centralWidget()
@@ -567,3 +569,35 @@ def test_launch_entry_does_not_import_old_main_window(app):
     assembly = inspect.getsource(application.PluginApplication._create_window)
     assert "window_module.PluginWindow" in assembly
     assert "MainWindow" not in assembly
+
+
+@pytest.mark.parametrize("platform", ["wechat", "douyin"])
+def test_debug_platform_selection_keeps_main_ui_visible(window, monkeypatch, platform):
+    from package.plugin_manager.build_info import BuildInfo
+    from package.plugin_manager.app import PluginApplication
+    import package.plugin_manager.app as app_module
+    monkeypatch.setattr(app_module.window_module, "PluginWindow", lambda store: window)
+    monkeypatch.setattr(app_module, "PluginConfigStore", lambda path: window.store)
+    debug_info = lambda: BuildInfo("debug", "dev", "")
+    monkeypatch.setattr(app_module, "build_info", debug_info)
+    monkeypatch.setattr("package.plugin_manager.window.build_info", debug_info)
+    # 在构造实际运行服务之前检查 UI，避免测试连接宿主进程。
+    class StopRuntime(Exception):
+        pass
+    def selected_title(title):
+        assert window.main_ui_shown
+        raise StopRuntime()
+    monkeypatch.setattr(window, "setWindowTitle", selected_title)
+    application = PluginApplication(window.store.path, platform=None)
+    callbacks = []
+    monkeypatch.setattr(window, "select_platform", callbacks.append)
+    application._create_window()
+    assert not window.main_ui_shown
+    with pytest.raises(StopRuntime):
+        callbacks[0](platform)
+    for phase in ("init", "wait_game", "mounting"):
+        window.set_gate(phase, "等待连接")
+        assert window.main_ui_shown
+        assert window.centralWidget().currentWidget() is window._splitter
+    assert not window.game_connected
+    assert not window.runtime_ready

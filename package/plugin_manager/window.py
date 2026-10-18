@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from package.ui.offset_dialog import OffsetDialogController
+from .build_info import current as build_info
 from .debug_link import open_chrome, valid_debug_link
 from .gate import PHASE_INIT, StartupGate
 from .feature_flags import panel_enabled, task_enabled
@@ -129,6 +130,7 @@ class PluginWindow(QMainWindow):
         damage.refresh_requested.connect(lambda: self.damage_requested.emit("refresh", {}))
         damage.reset_requested.connect(lambda: self.damage_requested.emit("reset", {}))
         damage.debug_requested.connect(lambda: self.damage_requested.emit("debug", {}))
+        damage.perf_requested.connect(lambda: self.damage_requested.emit("perf", {}))
         damage.open_report_requested.connect(self._open_damage_report)
         desire = self.pages["desire"]
         desire.start_requested.connect(lambda: self.desire_requested.emit("start", {}))
@@ -225,6 +227,9 @@ class PluginWindow(QMainWindow):
         wait_game，游戏已接入挂载脚本 → mounting，账号授权对不上 → denied
         （带读到的ID，不做任何伪装）。
         """
+        # 调试版进入功能面板后，断连和重新挂载只更新状态，不收回面板。
+        if not build_info().is_release and self._main_shown:
+            return
         self.gate.set_phase(phase, detail)
         if self._main_shown:
             self._main_shown = False

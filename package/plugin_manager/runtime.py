@@ -60,7 +60,7 @@ class PluginRuntime(QObject):
         self._player_name = ''
         self._update_checked = False # 每次启动只检查一次更新
         self.timer = QTimer(self)
-        self.timer.setInterval(1000)
+        self.timer.setInterval(100 if window.store.snapshot().get('bloodmoon', {}).get('enabled') else 1000)
         self.timer.timeout.connect(self._schedule_poll)
         service.state_changed.connect(self._on_state)
         # 自动检测偏移时弹独占窗口（FakeService 等没有该信号时跳过）。
@@ -117,6 +117,7 @@ class PluginRuntime(QObject):
                 self.window.set_gate(PHASE_WAIT_GAME, '游戏会话已变化，等待重新接入')
 
     def _on_config(self, state):
+        self.timer.setInterval(100 if state.get('bloodmoon', {}).get('enabled') else 1000)
         LOG.info('插件配置更新：总开关=%s，启用任务=%s，玩家信息=%s',state['daily']['enabled'],[k for k,v in state['daily']['tasks'].items() if v['enabled']],state['player']['enabled'])
         self.state.configured = None
         if not state['daily']['enabled']:
@@ -213,6 +214,8 @@ class PluginRuntime(QObject):
                 self.window.set_debug_link(f'devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{state["cdp_port"]}' if state.get('cdp_port') else '')
                 self.window.set_connection(connected=True, target_appid=self.target_appid, runtime_ready=not bool(self.state.blocked))
                 self.window.task_panels['energy'].runtime_message.setText(self.state.blocked or self.window.task_panels['energy'].runtime_message.text().replace('等待游戏连接', '已接入，等待任务开启'))
+                await self.season.poll(config)
+                self.timer.setInterval(self.season.scan_interval_ms if config.get('bloodmoon', {}).get('enabled') else 1000)
                 if config['player']['enabled']:
                     snapshot = await self.transport.call('player_information')
                     if self.state.closing or self.session.stale(epoch):
@@ -224,7 +227,6 @@ class PluginRuntime(QObject):
                 await self.treasure.poll(config)
                 await self.damage.poll(config)
                 await self.desire.poll(config)
-                await self.season.poll(config)
                 if self.state.closing or self.session.stale(epoch):
                     return
                 if time.monotonic() >= self._next_summary:

@@ -1,0 +1,24 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),path=require('node:path');
+const root=path.resolve(__dirname,'..');
+(async()=>{
+ let now=0,id=0;const timers=new Map(),logs=[];
+ const promise=Promise.resolve('ok'),season={candidates(){now+=4;return promise;},attack(){throw new Error('original');}};
+ const g={performance:{now:()=>now,memory:{usedJSHeapSize:123}},console:{info:(...a)=>logs.push(a)},e0e1Season:season};
+ const context={globalThis:g,Date,Promise,setInterval:fn=>{timers.set(++id,fn);return id;},clearInterval:key=>timers.delete(key)};
+ const source=fs.readFileSync(path.join(root,'tools/js/runtime_perf_probe.js'),'utf8');
+ const original=season.candidates;vm.runInNewContext(source,context);
+ assert.equal(season.candidates(),promise,'Promise identity preserved');await Promise.resolve();
+ assert.throws(()=>season.attack(),/original/);
+ const snapshot=g.e0e1Perf.snapshot();assert.equal(snapshot.metrics['season.candidates.sync'].maxMs,4);assert.equal(snapshot.metrics['season.candidates.wall'].calls,1);
+ g.e0e1Perf.start(5);assert.equal(timers.size,1);now+=6000;[...timers.values()][0]();assert.equal(timers.size,0);assert.equal(season.candidates,original);assert.equal(g.e0e1Perf.snapshot().enabled,false);assert.equal(logs.length,1);
+ vm.runInNewContext(source,context);vm.runInNewContext(source,context);assert.equal(timers.size,1);g.e0e1Perf.stop();assert.equal(timers.size,0);
+ console.log('PASS optional profiler preserves promises/errors, distinguishes sync/wall, auto-stops, releases wrappers and survives reinjection');
+ const overlay=fs.readFileSync(path.join(root,'tools/js/treasure_map_overlay.js'),'utf8');
+ const install=overlay.slice(overlay.indexOf('async function e0e1Install()'),overlay.indexOf('function e0e1Uninstall()'));
+ const timerFns=overlay.slice(overlay.indexOf('function e0e1Start()'),overlay.indexOf('function e0e1Status()'));
+ let labelsCleared=0;const game={setInterval:context.setInterval,clearInterval:context.clearInterval};
+ const env={globalThis:g,console:g.console,e0e1ResolveGameWindow:()=>game,e0e1FindClasses:()=>true,e0e1Tick(){},e0e1ClearLabels(){labelsCleared++;},e0e1FindMapUi:()=>null,e0e1Status:()=>({}),e0e1Expose:(k,v)=>{g[k]=v;},setTimeout};
+ const run=()=>vm.runInNewContext('(async()=>{var E0E1_TIMER=null;'+timerFns+install+';return await e0e1Install();})()',env);
+ await run();assert.equal(timers.size,1);await run();assert.equal(timers.size,1);assert.equal(labelsCleared,1);g.treasureMapOverlayOff();assert.equal(timers.size,0);
+ console.log('PASS repeated overlay installation removes old timer and labels before replacing global controls');
+})().catch(e=>{console.error(e);process.exitCode=1;});

@@ -102,7 +102,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="导出战斗／PVP 伤害曲线 HTML 报告")
     parser.add_argument("--port", type=int, default=0,
                         help=f"CDP 端口，默认扫描 {CDP_PORT_START}-{CDP_PORT_END}")
-    parser.add_argument("--out", default="logs", help="输出目录，默认 logs/")
+    parser.add_argument("--out", default="logs/damage_reports", help="输出目录，默认 logs/damage_reports/")
     parser.add_argument("--from-json", dest="from_json", default="",
                         help="直接读取 logs 里已保存的 damage_curve_*.json 渲染，不连 CDP"
                              "（改了模板后拿旧数据重算用；latest 取最新一份）")
@@ -118,9 +118,12 @@ async def main() -> int:
     if args.from_json:
         source = Path(args.from_json)
         if args.from_json == "latest":
-            candidates = sorted(out_dir.glob("damage_curve_*.json"))
+            candidates = list(out_dir.glob('*.json'))
+            if out_dir.name == 'damage_reports':
+                candidates.extend(out_dir.parent.glob('damage_curve_*.json'))
+            candidates.sort(key=lambda path: path.stat().st_mtime)
             if not candidates:
-                print(f"{out_dir} 里没有 damage_curve_*.json")
+                print(f"{out_dir} 里没有已保存的对局 JSON")
                 return 1
             source = candidates[-1]
         elif not source.is_absolute() and not source.exists():
@@ -135,7 +138,7 @@ async def main() -> int:
         for line in describe(data):
             print(line)
         written = write_outputs(data, out_dir, stamp, save_json=False,
-                                write_csv=args.csv, keep_events=not args.no_events)
+                                write_csv=args.csv, keep_events=not args.no_events, basename=source.stem)
     else:
         ports = [args.port] if args.port else await cdp_probe.scan_ports(CDP_PORT_START, CDP_PORT_END)
         if not ports:

@@ -79,7 +79,7 @@ def default_config() -> dict:
                           "speed_up": {"enabled": False, "max_times": 15,
                                        "safety_margin_seconds": 2, "poll_seconds": 2},
                           "attack": {"enabled": False, "power_ratio": 100, "power_limit": 0,
-                                     "max_battles": 10, "wait_seconds": 3},
+                                     "max_battles": 10, "wait_seconds": 0},
                           "stealth_mark": {"enabled": False}}}
 
 

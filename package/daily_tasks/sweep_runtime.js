@@ -646,6 +646,19 @@ function createEnergyRuntime(g, timing) {
       if (value !== undefined && value !== null && value !== '' && value !== 0) head.push(title + '=' + value);
     });
     if (head.length) out.push(head.join('  '));
+    const wornFashion = isMap(snapshot.fashion) ? snapshot.fashion :
+      (snapshot.fashion && isMap(snapshot.fashion.onUse) ? snapshot.fashion.onUse : null);
+    const fashionLevels = isMap(snapshot.allFashion) ? snapshot.allFashion :
+      (snapshot.fashion && snapshot.fashion.level);
+    const fashionLines = [];
+    if (wornFashion) eachMap(wornFashion, 30, (id, slot) => {
+      const name = nameOf('FashionCfg',id) || ('傀儡装ID'+id);
+      const level = isMap(fashionLevels) ? fashionLevels.get(Number(id)) : null;
+      fashionLines.push((name==='雷法尊者'?'【雷法尊者】 ':'') + name + '（已穿戴，部位'+slot+
+        (level!==null && level!==undefined?'，Lv'+level:'')+'）');
+    });
+    fashionLines.sort((a,b)=>Number(b.includes('【雷法尊者】'))-Number(a.includes('【雷法尊者】')));
+    out.push('── 傀儡装 ──\n  '+(fashionLines.length?fashionLines.join('\n  '):wornFashion?'未穿戴傀儡装':'穿戴资料未下发'));
 
     const books = [];
     eachMap(snapshot.equipSkill, 12, (id, slot) => books.push('槽位' + slot + ' ' + label(id, 'SkillBookCfg')));

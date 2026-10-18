@@ -138,7 +138,7 @@ def test_damage_take_writes_report_when_battle_ends(app, tmp_path, monkeypatch):
         await feature.take()
     asyncio.run(run())
 
-    reports = list(tmp_path.glob("damage_curve_*.html"))
+    reports = list(tmp_path.glob("*vs*_*.html"))
     assert len(reports) == 1
     assert panel._report_path == reports[0]
 
@@ -150,3 +150,102 @@ def test_damage_hint_warns_about_skipping_on_unsupported_modes(app, tmp_path):
     assert "只能拿到跳过之前" not in feature.hint(other)   # skipped 分支
     assert "服务端结算" in feature.hint(other)
     assert "好友切磋" in feature.hint({})                 # 还没进对局时的引导
+
+
+
+def test_damage_report_preserves_replay_and_fashion_metadata():
+    from package.plugin_manager.damage_report.serialize import slim
+    player = {'name': '甲', 'fashions': [{'id': 5001, 'name': '雷法尊者'}]}
+    side = {'battleType': 20, 'replay': {'isReplay': True, 'sessionId': 1},
+            'players': {'self': player}, 'categories': [{'key': 'leifa', 'dmg': 123}]}
+    result = slim({'mode': 'pvp', 'self': side, 'other': side}, False)
+    assert result['replay']['isReplay'] is True
+    assert result['players']['self']['fashions'][0]['name'] == '雷法尊者'
+    assert result['other']['categories'][0]['key'] == 'leifa'
+
+
+def test_damage_report_keeps_both_sides_factor_history_without_raw_events():
+    from package.plugin_manager.damage_report import build_html, slim
+    row = {'sec': 3, 'group': 'book', 'factors': {'damage': 1.5}, 'sourceRef': 0}
+    sources = [{'self': {'104': [{'label': '实际 Buff', 'value': 0.5}]}}]
+    side = {'factorRows': [row], 'factorSources': sources, 'factorsTruncated': False,
+            'events': [{'dmg': 10}]}
+    pvp = {'attrSeconds': [{'sec': 3, 'self': {'104': 0.5}, 'selfSources': sources[0]['self']}]}
+    result = slim({'mode': 'pvp', 'self': side, 'other': side, 'pvp': pvp}, False)
+    for payload in (result, result['other']):
+        assert payload['factorRows'] == [row]
+        assert payload['factorSources'] == sources
+        assert payload['factorsTruncated'] is False
+        assert 'events' not in payload
+    assert result['pvp']['attrSeconds'][0]['selfSources'] == sources[0]['self']
+    html = build_html(result)
+    assert 'factor-all-seconds' in html
+    assert '实际 Buff' in html
+
+
+def test_damage_archives_have_match_names_and_do_not_overwrite(tmp_path):
+    import json
+    from package.plugin_manager.damage_report import write_outputs
+    data = {'mode': 'pvp', 'self': {'players': {'self': {'name': '玩家甲:/..'}, 'other': {'sName': '玩家乙?'}}, 'events': []}}
+    first = write_outputs(data, tmp_path, '20261017_120000', write_csv=True)
+    second = write_outputs(data, tmp_path, '20261017_120000', write_csv=True)
+    assert len({p.stem for p in first}) == 1
+    assert len({p.stem for p in second}) == 1
+    assert first[0].stem != second[0].stem
+    assert first[0].name.startswith('玩家甲__vs玩家乙__20261017_120000')
+    assert all(p.exists() and p.parent == tmp_path for p in first + second)
+    assert json.loads(first[0].read_text(encoding='utf-8')) == data
+    assert first[-1].suffix == second[-1].suffix == '.html'
+
+
+def test_damage_history_defaults_to_latest_and_opens_selected_report(app, tmp_path):
+    from PySide6.QtCore import Qt
+    directory = tmp_path / 'logs' / 'damage_reports'
+    directory.mkdir(parents=True)
+    old = directory / '甲vs乙_20261016.html'
+    new = directory / '丙vs丁_20261017.html'
+    legacy = directory.parent / 'damage_curve_20261015.html'
+    unrelated = directory.parent / 'desire_report.html'
+    for index, path in enumerate((legacy, old, new, unrelated)):
+        path.write_text('<html></html>', encoding='utf-8')
+        os.utime(path, (100 + index, 100 + index))
+    panel = DamagePanel(PluginConfigStore(tmp_path / 'plugins.json'))
+    panel.set_report_directory(directory)
+    assert panel._report_path == new
+    assert panel.open_button.isEnabled()
+    assert panel.report_history.topLevelItemCount() == 3
+    chosen = panel.report_history.topLevelItem(1)
+    panel.report_history.setCurrentItem(chosen)
+    assert panel._report_path == old
+    opened = []
+    panel.open_report_requested.connect(lambda: opened.append(panel._report_path))
+    panel.report_history.itemDoubleClicked.emit(chosen, 0)
+    assert opened == [old]
+    panel.refresh_report_history()
+    assert panel._report_path == old
+    panel.refresh_report_history(preferred=new)
+    assert panel._report_path == new
+    for path in (legacy, old, new):
+        path.unlink()
+    panel.refresh_report_history()
+    assert panel._report_path is None
+    assert not panel.open_button.isEnabled()
+
+
+def test_damage_report_rerender_keeps_named_archive_pair(tmp_path):
+    from package.plugin_manager.damage_report import write_outputs
+    data = {'self': {'players': {'self': {'name': '甲'}, 'other': {'name': '乙'}}}}
+    original = write_outputs(data, tmp_path, '20261017_120000')
+    rerendered = write_outputs(data, tmp_path, '', save_json=False, basename=original[0].stem)
+    assert rerendered == [original[-1]]
+    assert len(list(tmp_path.glob('*.json'))) == len(list(tmp_path.glob('*.html'))) == 1
+
+
+def test_damage_report_preserves_per_second_formula_snapshots():
+    from package.plugin_manager.damage_report.serialize import slim
+
+    sample = {"sec": 0, "sampleKind": "second", "factors": {"attack": 100, "coefficient": None}}
+    data = {"mode": "pvp", "self": {"factorSnapshots": [sample]}, "other": {"factorSnapshots": [sample]}}
+    payload = slim(data, False)
+    assert payload["factorSnapshots"] == [sample]
+    assert payload["other"]["factorSnapshots"] == [sample]

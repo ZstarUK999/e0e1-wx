@@ -15,6 +15,7 @@ from package.runtime.launch import run_gui
 
 from . import runtime as runtime_module
 from . import window as window_module
+from .build_info import current as build_info
 from .logging_setup import configure_logging
 from .paths import default_config_path, lock_path, log_path
 from .store import PluginConfigStore
@@ -61,6 +62,8 @@ class PluginApplication:
         # 通过模块属性解析，保证测试替换 PluginRuntime / PluginWindow 与导入顺序无关。
         def connect(platform):
             self.platform = platform
+            if not build_info().is_release:
+                window.show_main_ui()
             window.setWindowTitle('遗弃之地 · 插件管理器 · ' + ('抖音 PC' if platform == 'douyin' else '微信'))
             if platform == 'douyin':
                 from .douyin import DouyinCache, DouyinService, DouyinTransport, douyin_ready

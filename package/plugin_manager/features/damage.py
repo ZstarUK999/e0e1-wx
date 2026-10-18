@@ -13,7 +13,7 @@ from ..damage_report import write_outputs
 
 LOG = logging.getLogger('plugin_manager')
 
-REPORT_DIR = Path('logs')
+REPORT_DIR = Path('logs') / 'damage_reports'
 
 # 面板里展示的属性项：攻击/增伤/天书/法术爆伤/暴伤/PVP增减伤/最终PVP增伤/最终增减伤
 # 'finalPvp' 是派生项：最终PVP增伤 = 本方PVP增伤(117) − 对方PVP减伤(118)
@@ -33,6 +33,8 @@ class DamageFeature:
         self._written = False     # 这一场的报告是否已经落盘
         self._report_path = None
         self._next_poll = 0.0
+        self._perf_running = False
+        self.panel.set_report_directory(REPORT_DIR)
 
     # ── 面板操作 ──
 
@@ -44,6 +46,9 @@ class DamageFeature:
 
     async def handle(self, op: str, args: dict) -> None:
         try:
+            if op == 'perf':
+                await self._profile_runtime()
+                return
             await self._ensure_injected()
             if op == 'refresh':
                 await self.take(force=True)
@@ -71,6 +76,34 @@ class DamageFeature:
         except Exception as exc:
             LOG.error('伤害采集操作失败：%s', exc)
             self.panel.message.setText(f'操作失败：{exc}')
+
+    async def _profile_runtime(self):
+        if self._perf_running:
+            self.panel.message.setText('性能采样正在进行，请等待完成')
+            return
+        self._perf_running = True
+        runtime = self.transport.context_id
+        try:
+            await self.transport.perf_start()
+            self.panel.message.setText('正在采样60秒，请保持原来的挂机操作；无需打开伤害采集')
+            for _ in range(61):
+                await asyncio.sleep(1)
+                if self.state.closing:
+                    return
+                if self.transport.context_id != runtime:
+                    self.panel.message.setText('游戏上下文已变化，本次性能采样中断，请重新采样')
+                    return
+            result = await self.transport.perf_stop()
+            if not result:
+                raise RuntimeError('游戏上下文已重建，性能记录不可用')
+            folder = Path('logs/runtime_profiles')
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / (datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.json')
+            path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+            self.panel.message.setText(f'性能采样已保存：{path}')
+            LOG.info('运行时性能采样已保存：%s', path)
+        finally:
+            self._perf_running = False
 
     async def _ensure_injected(self) -> None:
         if self._injected:
@@ -155,12 +188,13 @@ class DamageFeature:
     def write_report(self, data: dict, label: str) -> None:
         try:
             config = self.store.snapshot().get('damage') or {}
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             written = write_outputs(data, REPORT_DIR, stamp, save_json=True,
                                     write_csv=bool(config.get('auto_csv')), keep_events=True)
             html = next((p for p in written if p.suffix == '.html'), None)
             self._report_path = html
-            self.panel.set_report_path(html)
+            self.panel.set_report_directory(REPORT_DIR)
+            self.panel.refresh_report_history(preferred=html)
             LOG.info('%s伤害报告已生成：%s', label, html)
         except OSError as exc:
             LOG.error('伤害报告写入失败：%s', exc)

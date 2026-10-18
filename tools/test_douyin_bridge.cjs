@@ -14,10 +14,16 @@ const source=fs.readFileSync(path.join(__dirname,'../package/plugin_manager/douy
 const files=new Map(),timers=new Map();
 const base='ttfile://user/e0e1-plugin-';
 let next=0,sequence=0;
+const hides=new Set(),shows=new Set(),screen=[];
+let pausedGame=true,pausedDirector=true,resumeCount=0;
+const cocos={game:{isPaused:()=>pausedGame,resume(){pausedGame=false;resumeCount++;},pause(){pausedGame=true;}},
+ director:{isPaused:()=>pausedDirector,resume(){pausedDirector=false;resumeCount++;},pause(){pausedDirector=true;}}};
 const context=vm.createContext({eval:undefined,Function:undefined,
-  tt:{env:{USER_DATA_PATH:'ttfile://user'},getFileSystemManager(){return{
+  tt:{env:{USER_DATA_PATH:'ttfile://user'},
+ onHide(fn){hides.add(fn);},onShow(fn){shows.add(fn);},offHide(fn){hides.delete(fn);},offShow(fn){shows.delete(fn);},
+ setKeepScreenOn(args){screen.push(args.keepScreenOn);if(args.success)args.success();},getFileSystemManager(){return{
     readFileSync(p){if(!files.has(p))throw Error('missing');return files.get(p);},writeFileSync(p,v){files.set(p,v);}
-  };}},UIManager:{ins:{findOpen(){return true;}}},ROLE:{},System:{},CommonUICfgId:{MainUI:1},
+  };}},UIManager:{ins:{findOpen(){return true;}}},ROLE:{},System:{async import(){return cocos;}},CommonUICfgId:{MainUI:1},
   setInterval(fn,ms){const id=++next;timers.set(id,{fn,ms});return id;},clearInterval(id){timers.delete(id);}
 });
 async function tick(){for(const timer of [...timers.values()])if(timer.ms===100)timer.fn();for(let i=0;i<40;i++)await Promise.resolve();}
@@ -46,6 +52,18 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   command('dynamic','ping',{}, {expression:'1+1'});await tick();assert.equal(response().ok,false);
   command('unknown','unknown');await tick();assert.equal(response().ok,false);
   command('still-works','ping');await tick();assert.equal(response().value,2);
-  context.__e0e1DouyinBridge.stop();assert.equal(timers.size,0);
+  context.tt.setKeepScreenOn({keepScreenOn:false});
+  files.set(base+'lease.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now()}));
+  pulse();for(let i=0;i<12;i++)await Promise.resolve();
+  assert.equal(state().keep_alive.active,true);assert.equal(resumeCount,0,'foreground pause is preserved');
+  for(const fn of hides)fn();pulse();assert.equal(resumeCount,2);assert.equal(pausedGame,false);assert.equal(pausedDirector,false);
+  assert.equal(context.executed,1,'background protection never replays game actions');
+  files.set(base+'lease.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now()-20000}));
+  pulse();assert.equal(state().keep_alive.active,false);assert.equal(pausedGame,true);assert.equal(pausedDirector,true);
+  assert.equal(screen.at(-1),false,'restore the observed native screen setting');
+  files.set(base+'lease.json',JSON.stringify({token:'wrong',runtime:state().runtime,resident:'resident',at:Date.now()}));pulse();assert.equal(resumeCount,2);
+  assert.equal(hides.size,1);assert.equal(shows.size,1);
+  context.__e0e1DouyinBridge.stop();assert.equal(timers.size,0);assert.equal(hides.size,0);assert.equal(shows.size,0);
+  console.log('PASS: Douyin background keepalive requires fresh matching lease, preserves foreground pause, restores on expiry and never replays actions.');
   console.log('PASS: eval/Function disabled; static resident dispatch, async script enable, identity/replay/expiry checks, dynamic-source rejection.');
 })().catch(error=>{console.error(error);process.exitCode=1;});

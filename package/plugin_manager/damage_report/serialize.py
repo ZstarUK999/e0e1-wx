@@ -6,9 +6,9 @@ from __future__ import annotations
 
 # 单侧数据里 HTML 需要的字段；原始事件只在需要时内嵌
 _KEEP_FIELDS = (
-    "side instanceId battleType seed bucketSeconds duration buckets eventCount truncated "
+    "side replay instanceId battleType seed bucketSeconds duration buckets eventCount truncated "
     "totalDamage bossDamage categories curves skills books branches activeBranches players"
-    " perSecondTop perSecondBossTop"
+    " perSecondTop perSecondBossTop factorRows factorSnapshots factorSources factorsTruncated"
 ).split()
 
 
