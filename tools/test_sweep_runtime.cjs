@@ -104,9 +104,10 @@ function fixture() {
   return {runtime:sandbox.createEnergyRuntime(g,{timeoutMs:50,pauseMs:1}),sandbox,g,role,requests,manager,roleService,petService,windows,cfg,inputs,petUI,uiNode,inputButton,setMode:v=>mode=v};
 }
 
-test('identity reads the displayed USER nickname without opening any UI or sending requests',async()=>{
+test('identity reads the game role name instead of the platform nickname without opening any UI or sending requests',async()=>{
   const f=fixture();
-  f.g.USER={userName:'柱子大'};
+  f.g.USER={userName:'微信昵称'};
+  f.role.userInfo={name:'柱子大'};
   f.role.name='旧昵称';
   f.role.legion={legionName:'阴司'};
   const result=await f.runtime.dispatch('identity');
@@ -116,17 +117,20 @@ test('identity reads the displayed USER nickname without opening any UI or sendi
   assert.equal(result.value.legion_name,'阴司');
   assert.equal(f.requests.length,0);
   assert.equal(f.inputs.length,0);
-  f.g.USER.userName='新昵称';
+  f.role.userInfo.name='新昵称';
   assert.equal((await f.runtime.dispatch('identity')).value.name,'新昵称');
 });
 
-test('identity tolerates missing USER and preserves legacy name fallback',async()=>{
+test('identity never substitutes platform or unrelated names for a missing game role name',async()=>{
   const f=fixture();
+  f.g.USER={userName:'微信昵称'};
+  f.role.name='非角色名字字段';
   assert.equal((await f.runtime.dispatch('identity')).value.name,'');
-  f.role.name='旧环境昵称';
-  assert.equal((await f.runtime.dispatch('identity')).value.name,'旧环境昵称');
-  f.g.USER={userName:''};
-  assert.equal((await f.runtime.dispatch('identity')).value.name,'旧环境昵称');
+  f.role.userInfo={name:''};
+  assert.equal((await f.runtime.dispatch('identity')).value.name,'');
+  f.role.userInfo.name='游戏名字';
+  delete f.g.USER;
+  assert.equal((await f.runtime.dispatch('identity')).value.name,'游戏名字');
 });
 
 test('all mutations use registered UI node inputs and pet lookup is first',async()=>{

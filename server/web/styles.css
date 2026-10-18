@@ -41,3 +41,11 @@ td.bad { color: #d0342c; }
 #login-view { max-width: 320px; margin: 60px auto; }
 #login-view form { flex-direction: column; align-items: stretch; }
 #login-view label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+
+.logs-filter { margin-bottom: 12px; }
+.logs-table-wrap { overflow-x: auto; }
+#logs-view table.grid { min-width: 1250px; }
+#logs-view th:nth-child(7), #logs-view td:nth-child(7) { min-width: 200px; white-space: nowrap; }
+#logs-view th:nth-child(3), #logs-view td:nth-child(3),
+#logs-view th:nth-child(8), #logs-view td:nth-child(8),
+#logs-view th:nth-child(10), #logs-view td:nth-child(10) { white-space: nowrap; }

@@ -270,7 +270,7 @@ document.getElementById('release-form').addEventListener('submit', async (event)
 // ── 握手日志 ──
 
 async function refreshLogs() {
-  const rows = await api.logs.list(200);
+  const rows = await api.logs.list(200, document.getElementById('logs-mismatch-only').checked);
   const body = document.getElementById('logs-body');
   body.replaceChildren();
   rows.forEach((row) => {
@@ -288,6 +288,10 @@ async function refreshLogs() {
     body.append(tr);
   });
 }
+
+document.getElementById('logs-mismatch-only').addEventListener('change', () => {
+  refreshLogs().catch(error => toast(error.message, true));
+});
 
 // ── 启动 ──
 

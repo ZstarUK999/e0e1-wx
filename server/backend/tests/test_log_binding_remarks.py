@@ -32,3 +32,17 @@ def test_binding_remarks_follow_package_instead_of_login_and_support_legacy():
         session.query(Player).filter_by(player_id="owner").one().nickname="更新备注"
         session.commit()
         assert list_logs(session=session, _admin="admin")[2].bound_player_nickname == "更新备注"
+
+
+def test_mismatch_filter_applies_before_limit_and_accepts_multi_player_members():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(HandshakeLog(player_id="outsider", bound_player_id="owner", reason="player_id_mismatch"))
+        session.flush()
+        session.add(HandshakeLog(player_id="member", bound_player_id="owner", bound_player_ids='["owner", "member"]', reason="ok", allowed=True))
+        session.add(HandshakeLog(player_id="unknown", reason="invalid_license"))
+        session.commit()
+        rows=list_logs(limit=1, session=session, _admin="admin", mismatch_only=True)
+        assert len(rows)==1 and rows[0].player_id=="outsider"
+        assert list_logs(limit=1, session=session, _admin="admin")[0].reason=="invalid_license"

@@ -94,7 +94,7 @@ export const releases = {
 };
 
 export const logs = {
-  list: (limit = 200) => request(`/api/logs?limit=${limit}`),
+  list: (limit = 200, mismatchOnly = false) => request(`/api/logs?limit=${limit}&mismatch_only=${mismatchOnly}`),
 };
 
 

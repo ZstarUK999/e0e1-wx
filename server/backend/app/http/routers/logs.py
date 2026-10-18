@@ -39,9 +39,14 @@ def list_logs(
     limit: int = 100,
     session: Session = Depends(db_session),
     _admin: str = Depends(current_admin),
+    mismatch_only: bool = False,
 ) -> list[LogOut]:
+    query = session.query(HandshakeLog)
+    if mismatch_only:
+        # 服务端验签后按完整绑定名单裁决，不用主绑定 ID 误判多玩家包。
+        query = query.filter(HandshakeLog.reason == "player_id_mismatch")
     rows = (
-        session.query(HandshakeLog)
+        query
         .order_by(HandshakeLog.id.desc())
         .limit(max(1, min(limit, 1000)))
         .all()
