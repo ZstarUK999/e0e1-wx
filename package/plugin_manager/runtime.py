@@ -283,7 +283,7 @@ class PluginRuntime(QObject):
 
         # 本地先过一遍：公钥验签 + 绑定ID比对。验签不能省——省了别人把 license.bin
         # 里的 player_id 改成自己的号就能白用。
-        bound, reason = license_module.bound_player_id()
+        bound, reason = license_module.bound_player_id(login_player_id=self._bound_id)
         if bound is None:
             self._reject_gate(reason)
             return False

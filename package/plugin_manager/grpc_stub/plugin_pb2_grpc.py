@@ -5,7 +5,7 @@ import warnings
 
 from . import plugin_pb2 as plugin__pb2
 
-GRPC_GENERATED_VERSION = '1.84.0'
+GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class PluginServiceStub:
+class PluginServiceStub(object):
     """插件与服务器之间的通道：登录鉴权一次，更新检查一次。
     """
 
@@ -47,7 +47,7 @@ class PluginServiceStub:
                 _registered_method=True)
 
 
-class PluginServiceServicer:
+class PluginServiceServicer(object):
     """插件与服务器之间的通道：登录鉴权一次，更新检查一次。
     """
 
@@ -84,7 +84,7 @@ def add_PluginServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class PluginService:
+class PluginService(object):
     """插件与服务器之间的通道：登录鉴权一次，更新检查一次。
     """
 

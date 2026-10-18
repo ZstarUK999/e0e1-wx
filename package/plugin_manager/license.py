@@ -46,31 +46,43 @@ def load() -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _player_ids(payload: dict) -> list[str]:
+    if "player_ids" not in payload:
+        value = payload.get("player_id")
+        return [value] if isinstance(value, str) and value else []
+    values = payload["player_ids"]
+    if not isinstance(values, list) or not 1 <= len(values) <= 500:
+        return []
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 128 for value in values):
+        return []
+    if len(set(values)) != len(values) or payload.get("player_id") != values[0]:
+        return []
+    return values
+
+
 def verify(payload: dict | None) -> bool:
-    """本地验签：确认这份 license 确实是持有私钥的一方签的。"""
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not _player_ids(payload):
         return False
     try:
         signature = base64.b64decode(payload["signature"], validate=True)
-        message = "|".join(str(payload[field]) for field in SIGN_FIELDS).encode("utf-8")
+        if "player_ids" in payload:
+            message = ("v2|" + json.dumps([payload[field] for field in SIGN_FIELDS] + [payload["player_ids"]], ensure_ascii=False, separators=(",", ":"))).encode("utf-8")
+        else:
+            message = "|".join(str(payload[field]) for field in SIGN_FIELDS).encode("utf-8")
     except (KeyError, TypeError, ValueError):
         return False
     return ed25519.verify(LICENSE_PUBLIC_KEY, signature, message)
 
 
-def bound_player_id(payload: dict | None = None) -> tuple[str | None, str]:
-    """验签后取出绑定的 player_id，返回 (绑定ID, 失败原因)。
-
-    必须先验签再比对：少了这一步，别人把 license.bin 里的 player_id 改成自己的号
-    就能白用。ID 与原因二选一——返回了 ID 就说明这份授权可信，原因必然为空。
-    """
+def bound_player_id(payload: dict | None = None, *, login_player_id: str | None = None) -> tuple[str | None, str]:
     if payload is None:
         payload = load()
     if payload is None:
         return None, "缺少授权文件 license.bin"
     if not verify(payload):
         return None, "授权文件无效或已被篡改"
-    bound = str(payload.get("player_id") or "")
-    if not bound:
-        return None, "license.bin 里没有 player_id"
-    return bound, ""
+    values = _player_ids(payload)
+    if not values:
+        return None, "license.bin 里没有有效的玩家ID"
+    current = str(login_player_id or "")
+    return (current if current in values else values[0]), ""

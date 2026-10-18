@@ -20,7 +20,7 @@ TMP = Path(tempfile.mkdtemp(prefix="e0e1-client-"))
 os.environ["E0E1_DATA_DIR"] = str(TMP)
 # 客户端 license.py 里烧的是部署公钥，所以这里必须用同一把私钥，签名才对得上
 os.environ["E0E1_LICENSE_KEY_PATH"] = str(
-    BACKEND_ROOT / "data" / "license_ed25519.key"
+    TMP / "license_ed25519.key"
 )
 os.environ["E0E1_DATABASE_URL"] = f"sqlite:///{TMP / 'client.db'}"
 os.environ["E0E1_CERTS_DIR"] = str(BACKEND_ROOT / "certs")
@@ -43,6 +43,37 @@ sys.path.remove(str(BACKEND_ROOT))
 sys.modules.pop("tools", None)
 
 PORT = 50152
+
+
+@pytest.fixture(scope="module", autouse=True)
+def isolated_credentials():
+    """测试自建密钥和证书，不依赖也不改动部署用凭据。"""
+    import importlib.util
+    from cryptography.hazmat.primitives import serialization
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    import app.db.session as database
+    previous_settings = (settings.data_dir, settings.license_key_path, settings.certs_dir, settings.database_url)
+    previous_database = (database._engine, database.SessionLocal)
+    settings.database_url = f"sqlite:///{TMP / 'isolated-client.db'}"
+    database._engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+    database.SessionLocal = sessionmaker(bind=database._engine, expire_on_commit=False)
+    settings.data_dir = TMP
+    settings.license_key_path = TMP / "license_ed25519.key"
+    settings.certs_dir = TMP / "certs"
+    spec = importlib.util.spec_from_file_location("test_gen_certs", BACKEND_ROOT / "tools/gen_certs.py")
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    generator.CERTS_DIR = settings.certs_dir
+    generator.CLIENT_DIR = settings.certs_dir / "client"
+    generator.main()
+    original = client_license.LICENSE_PUBLIC_KEY
+    client_license.LICENSE_PUBLIC_KEY = server_license._private_key().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    yield
+    client_license.LICENSE_PUBLIC_KEY = original
+    database._engine.dispose()
+    database._engine, database.SessionLocal = previous_database
+    settings.data_dir, settings.license_key_path, settings.certs_dir, settings.database_url = previous_settings
 
 
 @pytest.fixture(scope="module")
@@ -70,13 +101,18 @@ def server():
         await grpc_server.start()
         holder["loop"] = asyncio.get_running_loop()
         holder["server"] = grpc_server
+        holder["finished"] = asyncio.Event()
         ready.set()
         await grpc_server.wait_for_termination()
+        await holder["finished"].wait()
 
     threading.Thread(target=lambda: asyncio.run(runner()), daemon=True).start()
     assert ready.wait(15), "gRPC 服务未能启动"
     yield holder["server"]
-    asyncio.run_coroutine_threadsafe(holder["server"].stop(0), holder["loop"]).result(5)
+    try:
+        asyncio.run_coroutine_threadsafe(holder["server"].stop(0), holder["loop"]).result(5)
+    finally:
+        holder["loop"].call_soon_threadsafe(holder["finished"].set)
 
 
 @pytest.fixture
@@ -206,3 +242,15 @@ def test_debug_build_skips_update_check(monkeypatch):
         server_client, "build_info", lambda: build_info.BuildInfo(mode="debug", version="0.0.0-dev", target="")
     )
     assert server_client.check_update({}, player_id="") is None
+
+
+def test_release_handshake_accepts_second_member(server, release_client):
+    with session_scope() as session:
+        from app.db.models import Player
+        if session.query(Player).filter(Player.player_id == "1002").one_or_none() is None:
+            session.add(Player(player_id="1002"))
+    release_client(server_license.issue(["1001", "1002"]))
+    result = server_client.handshake(player_id="1002", legion_name="测试阴司")
+    assert result.allowed and not result.offline
+    result = server_client.handshake(player_id="9999", legion_name="")
+    assert not result.allowed and result.reason == "player_id_mismatch"

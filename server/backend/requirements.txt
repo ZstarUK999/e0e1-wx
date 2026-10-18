@@ -1,10 +1,13 @@
 fastapi>=0.110
 uvicorn>=0.29
-grpcio>=1.60
-grpcio-tools>=1.60
+grpcio>=1.76,<2
+grpcio-tools==1.76.0
 sqlalchemy>=2.0
 pydantic-settings>=2.0
 cryptography>=42.0
 pyjwt>=2.8
 bcrypt>=4.0
 python-multipart>=0.0.18
+
+# Match the Python 3.9-compatible protoc generator above.
+protobuf>=6.31.1,<7

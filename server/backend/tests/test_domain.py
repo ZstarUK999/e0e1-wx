@@ -225,3 +225,61 @@ def test_rollback_by_republishing_old(db):
     release = updates.current_release(db)
     changed, _ = updates.diff(db, release, {"a": updates.sha256_of(b"2")})
     assert changed[0]["sha256"] == updates.sha256_of(b"1")
+
+
+# Multi-player packages: signatures, local/offline gate, protobuf and admin selection.
+def test_multi_player_license_cross_verifies_and_binds_current_player(db, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from package.plugin_manager import license as client, server_client
+    key = license_module._private_key().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    monkeypatch.setattr(client, "LICENSE_PUBLIC_KEY", key)
+    payload = license_module.issue(["1001", "1002", "1001"])
+    assert payload["player_ids"] == ["1001", "1002"]
+    assert license_module.verify(payload) and client.verify(payload)
+    for player_id in ("1001", "1002"):
+        assert client.bound_player_id(payload, login_player_id=player_id) == (player_id, "")
+        assert server_client._offline_verdict(payload, player_id).allowed
+        verdict, bound = auth.evaluate(license_payload=payload, login_player_id=player_id)
+        assert verdict is None and bound == player_id
+    assert not server_client._offline_verdict(payload, "9999").allowed
+    assert auth.evaluate(license_payload=payload, login_player_id="9999")[0].reason == auth.REASON_ID_MISMATCH
+    legacy = license_module.issue("1001")
+    assert client.verify(legacy) and license_module.verify(legacy)
+    for bad in (dict(payload, player_ids=["1001", "9999"]), dict(payload, player_ids=["1001"]), dict(payload, player_ids=[]), dict(payload, player_id="1002"), dict(legacy, player_ids=["1001", "9999"])):
+        assert not client.verify(bad) and not license_module.verify(bad)
+    removed = dict(payload);removed.pop("player_ids")
+    assert not client.verify(removed) and not license_module.verify(removed)
+
+
+def test_multi_player_proto_roundtrip(db):
+    from app.grpc import plugin_pb2
+    from app.grpc.servicer import _license_from
+    for ids in ("1001", ["1001", "1002"]):
+        payload = license_module.issue(ids)
+        request = plugin_pb2.HandshakeRequest(license=plugin_pb2.License(**payload), login_player_id="1001")
+        restored = _license_from(plugin_pb2.HandshakeRequest.FromString(request.SerializeToString()))
+        assert restored == payload
+        assert license_module.verify(restored)
+
+
+def test_multi_package_selection_and_unique_archive(db):
+    import asyncio
+    from fastapi import HTTPException
+    from app.http.routers.players import PackageIn, download_selected_package
+    from app.domain import packages
+    db.add_all([Player(player_id="1001"), Player(player_id="1002"), Player(player_id="1003", enabled=False)])
+    updates.import_release(db, archive=_zip({"app/main.py": b"app"}), version="multi-1", changelog="", mandatory=False)
+    db.flush();updates.publish(db, "multi-1");db.flush()
+    response = download_selected_package(PackageIn(player_ids=["1001", "1002", "1001"]), db, "admin")
+    with zipfile.ZipFile(response.path) as archive:
+        payload = license_module.loads(archive.read("e0e1-wx-plugins/license.bin"))
+        assert payload["player_ids"] == ["1001", "1002"] and license_module.verify(payload)
+        assert archive.read("e0e1-wx-plugins/app/main.py") == b"app"
+        assert archive.namelist().count("e0e1-wx-plugins/license.bin") == 1
+    other, _ = packages.build_player_package(db, ["1001", "1002"])
+    assert str(other) != str(response.path)
+    asyncio.run(response.background());assert not Path(response.path).exists()
+    for ids in ([], ["missing"], ["1001", "1003"], [""]):
+        with pytest.raises(HTTPException):
+            download_selected_package(PackageIn(player_ids=ids), db, "admin")
+    assert not auth.check_whitelist(db, "1003").allowed

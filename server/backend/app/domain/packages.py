@@ -7,6 +7,7 @@ app 文件对所有玩家都一样，所以这里不跑 PyInstaller，只是把�
 from __future__ import annotations
 
 import zipfile
+import uuid
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -28,7 +29,7 @@ def package_dir() -> Path:
 
 
 def build_player_package(
-    session: Session, player_id: str, version: str | None = None
+    session: Session, player_id: str | list[str], version: str | None = None
 ) -> tuple[Path, str]:
     """生成分发包，返回 (文件路径, 版本号)。
 
@@ -46,13 +47,14 @@ def build_player_package(
     if not root.is_dir():
         raise ValueError(f"版本文件缺失：{release.version}")
 
-    target = package_dir() / f"{PACKAGE_ROOT}-{release.version}-{player_id}.zip"
     payload = license_module.issue(player_id)
+    count = len(license_module.player_ids(payload))
+    target = package_dir() / f"{PACKAGE_ROOT}-{release.version}-{count}players-{uuid.uuid4().hex[:12]}.zip"
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             f"{PACKAGE_ROOT}/{LICENSE_FILE_NAME}", license_module.dumps(payload)
         )
         for path in sorted(root.rglob("*")):
-            if path.is_file():
+            if path.is_file() and path.relative_to(root).as_posix() != LICENSE_FILE_NAME:
                 archive.write(path, f"{PACKAGE_ROOT}/{path.relative_to(root).as_posix()}")
     return target, release.version

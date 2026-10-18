@@ -46,9 +46,9 @@ def evaluate(*, license_payload: dict | None, login_player_id: str) -> tuple[Ver
     if not license_payload or not license_module.verify(license_payload):
         return Verdict.denied(REASON_BAD_LICENSE), ""
     bound = str(license_payload.get("player_id") or "")
-    if not bound or bound != str(login_player_id or ""):
+    if str(login_player_id or "") not in license_module.player_ids(license_payload):
         return Verdict.denied(REASON_ID_MISMATCH), bound
-    return None, bound
+    return None, str(login_player_id)
 
 
 def check_whitelist(session: Session, player_id: str) -> Verdict:

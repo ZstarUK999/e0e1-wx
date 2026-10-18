@@ -100,6 +100,32 @@ def delete_player(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+class PackageIn(BaseModel):
+    player_ids: list[str]
+    version: str | None = None
+
+
+@router.post("/package")
+def download_selected_package(payload: PackageIn, session: Session = Depends(db_session), _admin: str = Depends(current_admin)):
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+    from ...domain import packages
+
+    ids = list(dict.fromkeys(value.strip() for value in payload.player_ids))
+    if not ids or len(ids) > 500 or any(not value or len(value) > 128 for value in ids):
+        raise HTTPException(status_code=400, detail="请选择1至500名玩家")
+    players = session.query(Player).filter(Player.player_id.in_(ids)).all()
+    if len(players) != len(ids):
+        raise HTTPException(status_code=400, detail="部分玩家不存在，请刷新列表")
+    if any(not player.enabled for player in players):
+        raise HTTPException(status_code=400, detail="选中玩家包含已停用账号，请取消勾选")
+    try:
+        target, version = packages.build_player_package(session, ids, payload.version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FileResponse(target, filename=f"e0e1-wx-plugins-{version}-{len(ids)}players.zip", media_type="application/zip", background=BackgroundTask(target.unlink, missing_ok=True))
+
+
 @router.get("/{player_id}/package")
 def download_package(
     player_id: str,

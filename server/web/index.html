@@ -34,12 +34,12 @@
         <input name="player_id" placeholder="玩家ID（游戏内 heroId）" required>
         <input name="nickname" placeholder="备注名">
         <input name="note" placeholder="说明">
-        <label class="inline"><input type="checkbox" name="with_package" checked> 创建后直接下载分发包</label>
         <button type="submit">加入白名单</button>
       </form>
-      <p class="hint">分发包 = 当前生效版本的文件 + 这个玩家的 license，解压即用。勾了就会在创建完成后自动开始下载。</p>
+      <p class="hint">添加玩家后勾选账号，点击下载分包。多个账号共用同一份包，仅名单内玩家可以使用；已停用账号不能选入新包。</p>
+      <button id="download-selected" disabled>下载分包（已选0人）</button>
       <table class="grid">
-        <thead><tr><th>玩家ID</th><th>角色名</th><th>备注</th><th>最近公会</th><th>说明</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-players" aria-label="全选启用的玩家"></th><th>玩家ID</th><th>角色名</th><th>备注</th><th>最近公会</th><th>说明</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="players-body"></tbody>
       </table>
     </section>

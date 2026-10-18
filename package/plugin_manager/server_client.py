@@ -90,7 +90,7 @@ def _offline_verdict(payload: dict, player_id: str) -> HandshakeResult:
 
     少了验签这一步，别人拿到包把 player_id 改成自己的号就能离线白用。
     """
-    bound, reason = license_module.bound_player_id(payload)
+    bound, reason = license_module.bound_player_id(payload, login_player_id=player_id)
     if bound is None:
         return HandshakeResult(
             False,
@@ -129,6 +129,7 @@ def _rpc_handshake(
                 issued_at=str(payload.get("issued_at") or ""),
                 nonce=str(payload.get("nonce") or ""),
                 signature=str(payload.get("signature") or ""),
+                player_ids=payload.get("player_ids", []),
             ),
             login_player_id=str(player_id or ""),
             guild_name=str(legion_name or ""),

@@ -20,13 +20,17 @@ def _license_from(request) -> dict | None:
     license_message = request.license
     if not license_message.license_id:
         return None
-    return {
+    payload = {
         "license_id": license_message.license_id,
         "player_id": license_message.player_id,
         "issued_at": license_message.issued_at,
         "nonce": license_message.nonce,
         "signature": license_message.signature,
     }
+
+    if license_message.player_ids:
+        payload["player_ids"] = list(license_message.player_ids)
+    return payload
 
 
 class PluginServicer(plugin_pb2_grpc.PluginServiceServicer):

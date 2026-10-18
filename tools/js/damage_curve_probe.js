@@ -165,6 +165,7 @@ async function e0e1LoadBattleManager() {
   E0E1_BM_TRIED = true;
   E0E1_BM = await e0e1Import("chunks:///_virtual/battle-manager.ts");
   E0E1_DUAL = await e0e1Import("chunks:///_virtual/arena-dual-score-pvp-battle-manager.ts");
+  E0E1_LOCAL_DUAL = await e0e1Import("chunks:///_virtual/dual-score-pvp-battle-manager.ts");
   E0E1_DEFINE = await e0e1Import("chunks:///_virtual/define-index.ts");
   E0E1_CHARACTER = await e0e1Import("chunks:///_virtual/character-helper.ts");
   E0E1_BATTLE_CONST = await e0e1Import("chunks:///_virtual/battle-const.ts");
@@ -254,6 +255,7 @@ function e0e1EvoOf(skillId) {
 var E0E1_ORIGIN = null;
 var E0E1_FASHION_SKILLS = {};
 var E0E1_DUAL = null;
+var E0E1_LOCAL_DUAL = null;
 var E0E1_REPLAY_CONTEXTS = [];
 var E0E1_REPLAY_SERIAL = 0;
 var E0E1_ORIGIN_SOURCES = [
@@ -433,7 +435,7 @@ function e0e1BossDamageOf(world) {
 }
 
 // 每整秒记一次双方分数与对敌方英雄累计伤害
-function e0e1SamplePvp() {
+function e0e1SamplePvp(forceFinal) {
   var self = E0E1_SIDES.self;
   if (!self || !self.world) return;
   var world = self.world;
@@ -447,7 +449,20 @@ function e0e1SamplePvp() {
   } catch (error) {}
   var sec = Math.floor(t);
   [E0E1_SIDES.self,E0E1_SIDES.other].forEach(function(state){if(state)e0e1SampleFormulaState(state);});
-  if (sec === E0E1_PVP.lastSecond) return;
+  if (sec === E0E1_PVP.lastSecond) {
+    // 时钟信号早于本帧伤害结算；同步跳过返回后补齐最后一帧，不制造重复秒。
+    if(forceFinal && E0E1_PVP.samples.length){
+      var finalSample=E0E1_PVP.samples[E0E1_PVP.samples.length-1];
+      var finalSelf=e0e1ScoreOf(world),finalOther=E0E1_SIDES.other && E0E1_SIDES.other.world;
+      finalSample.t=t;
+      if(finalSelf!==null)finalSample.selfScore=finalSelf;
+      var otherFinal=finalOther ? e0e1ScoreOf(finalOther) : null;
+      if(otherFinal!==null)finalSample.otherScore=otherFinal;
+      finalSample.selfBoss=e0e1BossDamageOf(world);
+      if(finalOther)finalSample.otherBoss=e0e1BossDamageOf(finalOther);
+    }
+    return;
+  }
 
   var other = E0E1_SIDES.other;
   var selfScore = e0e1ScoreOf(world);
@@ -1426,6 +1441,22 @@ function e0e1PatchBattleManager() {
   var ins = BM && BM.ins;
   if (!ins) return false;
   var patched = false;
+  var LocalController=E0E1_LOCAL_DUAL && E0E1_LOCAL_DUAL.DualScorePvpBattleManager;
+  var localProto=LocalController && LocalController.prototype;
+  if(localProto && typeof localProto.skipBattleLocalFastForward==='function' && !localProto.skipBattleLocalFastForward.__e0e1SkipCaptured){
+    var skipOriginal=localProto.skipBattleLocalFastForward;
+    localProto.skipBattleLocalFastForward=function(){
+      var selfWorld=this.selfBattleWorld,otherWorld=this.otherBattleWorld;
+      var isFriendly=!!(selfWorld && otherWorld && selfWorld.options && selfWorld.options.battleData && selfWorld.options.battleData.type===26);
+      if(isFriendly){
+        try {e0e1WatchWorld(selfWorld);e0e1WatchWorld(otherWorld);e0e1SamplePvp();E0E1_PVP.skipped=true;}catch(error){E0E1_LAST_ERROR='跳过采集准备：'+String(error);}
+      }
+      try {return skipOriginal.apply(this,arguments);}
+      finally {if(isFriendly){try {e0e1SamplePvp(true);}catch(error){E0E1_LAST_ERROR='跳过最终采样：'+String(error);}}}
+    };
+    localProto.skipBattleLocalFastForward.__e0e1SkipCaptured=true;
+    E0E1_PATCHES.push({owner:localProto,key:'skipBattleLocalFastForward',original:skipOriginal,wrapper:localProto.skipBattleLocalFastForward});
+  }
   var Controller = E0E1_DUAL && E0E1_DUAL.ArenaDualScorePvpBattleManager;
   var proto = Controller && Controller.prototype;
   if (proto && typeof proto.start === 'function' && !proto.start.__e0e1ReplayTagged) {

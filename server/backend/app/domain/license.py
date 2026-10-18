@@ -46,39 +46,50 @@ def public_key_pem() -> str:
     ).decode("ascii")
 
 
-def canonical_payload(*, license_id: str, player_id: str, issued_at: str, nonce: str) -> bytes:
-    """参与签名的字段串；改任何一项都会导致验签失败。"""
-    return f"{license_id}|{player_id}|{issued_at}|{nonce}".encode("utf-8")
+def player_ids(payload: dict) -> list[str]:
+    if "player_ids" not in payload:
+        value = payload.get("player_id")
+        return [value] if isinstance(value, str) and value else []
+    values = payload["player_ids"]
+    if not isinstance(values, list) or not 1 <= len(values) <= 500:
+        return []
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 128 for value in values):
+        return []
+    if len(set(values)) != len(values) or payload.get("player_id") != values[0]:
+        return []
+    return values
 
 
-def issue(player_id: str) -> dict:
-    """为玩家签发一份 license。"""
+def canonical_payload(*, license_id: str, player_id: str, issued_at: str, nonce: str, player_ids=None) -> bytes:
+    if player_ids is None:
+        return f"{license_id}|{player_id}|{issued_at}|{nonce}".encode("utf-8")
+    return ("v2|" + json.dumps([license_id, player_id, issued_at, nonce, player_ids], ensure_ascii=False, separators=(",", ":"))).encode("utf-8")
+
+
+def issue(player_id: str | list[str]) -> dict:
+    values = [player_id] if isinstance(player_id, str) else list(player_id)
+    if not values or any(not isinstance(value, str) or not value.strip() or len(value) > 128 for value in values):
+        raise ValueError("玩家ID不能为空且长度不能超过128")
+    values = list(dict.fromkeys(value.strip() for value in values))
+    if len(values) > 500:
+        raise ValueError("一个包最多授权500名玩家")
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    payload = {
-        "license_id": uuid.uuid4().hex[:16],
-        "player_id": str(player_id),
-        "issued_at": now,
-        "nonce": uuid.uuid4().hex[:16],
-    }
-    signature = _private_key().sign(canonical_payload(**payload))
-    payload["signature"] = base64.b64encode(signature).decode("ascii")
+    payload = {"license_id": uuid.uuid4().hex[:16], "player_id": values[0], "issued_at": now, "nonce": uuid.uuid4().hex[:16]}
+    if len(values) > 1:
+        payload["player_ids"] = values
+    payload["signature"] = base64.b64encode(_private_key().sign(canonical_payload(**payload))).decode("ascii")
     return payload
 
 
 def verify(payload: dict) -> bool:
-    """校验一份 license 的签名；字段缺失一律算失败。"""
-    try:
-        signature = base64.b64decode(payload["signature"], validate=True)
-        message = canonical_payload(
-            license_id=payload["license_id"],
-            player_id=payload["player_id"],
-            issued_at=payload["issued_at"],
-            nonce=payload["nonce"],
-        )
-    except (KeyError, TypeError, ValueError):
+    if not isinstance(payload, dict) or not player_ids(payload):
         return False
     try:
-        _private_key().public_key().verify(signature, message)
+        fields = {key: payload[key] for key in ("license_id", "player_id", "issued_at", "nonce")}
+        if "player_ids" in payload:
+            fields["player_ids"] = payload["player_ids"]
+        signature = base64.b64decode(payload["signature"], validate=True)
+        _private_key().public_key().verify(signature, canonical_payload(**fields))
     except Exception:
         return False
     return True

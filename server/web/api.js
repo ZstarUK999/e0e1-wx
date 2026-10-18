@@ -59,8 +59,11 @@ export const players = {
 
   /** 下载完整分发包：体积大，走 blob 再触发保存，避免把 token 拼在 URL 上。 */
   async downloadPackage(playerId) {
-    const response = await fetch(`/api/players/${encodeURIComponent(playerId)}/package`, {
-      headers: { Authorization: `Bearer ${token()}` },
+    const multiple = Array.isArray(playerId);
+    const response = await fetch(multiple ? '/api/players/package' : `/api/players/${encodeURIComponent(playerId)}/package`, {
+      method: multiple ? 'POST' : 'GET',
+      headers: { Authorization: `Bearer ${token()}`, ...(multiple ? {'Content-Type': 'application/json'} : {}) },
+      ...(multiple ? {body: JSON.stringify({player_ids: playerId})} : {}),
     });
     if (!response.ok) {
       const raw = await response.text();
@@ -73,8 +76,9 @@ export const players = {
     const blob = await response.blob();
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `e0e1-wx-plugins-${playerId}.zip`;
+    link.download = Array.isArray(playerId) ? `e0e1-wx-plugins-${playerId.length}players.zip` : `e0e1-wx-plugins-${playerId}.zip`;
     link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   },
 };
 

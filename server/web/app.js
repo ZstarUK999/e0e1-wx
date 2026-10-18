@@ -65,12 +65,44 @@ document.querySelectorAll('nav a').forEach((link) => {
 
 // ── 玩家白名单 ──
 
+const selectedPlayers = new Set();
+let availablePlayers = [];
+let packageBusy = false;
+function updatePlayerSelection() {
+  const button = document.getElementById('download-selected');
+  button.disabled = packageBusy || !selectedPlayers.size;
+  button.textContent = packageBusy ? '打包中…' : `下载分包（已选${selectedPlayers.size}人）`;
+  const all = document.getElementById('select-all-players');
+  all.checked = availablePlayers.length > 0 && selectedPlayers.size === availablePlayers.length;
+  all.indeterminate = selectedPlayers.size > 0 && !all.checked;
+}
+document.getElementById('select-all-players').addEventListener('change', (event) => {
+  selectedPlayers.clear();
+  if (event.target.checked) availablePlayers.forEach(id => selectedPlayers.add(id));
+  document.querySelectorAll('#players-body input[type="checkbox"]').forEach(box => {box.checked = selectedPlayers.has(box.value);});
+  updatePlayerSelection();
+});
+document.getElementById('download-selected').addEventListener('click', async () => {
+  if (packageBusy || !selectedPlayers.size) return;
+  const ids = [...selectedPlayers];packageBusy = true;updatePlayerSelection();
+  try {await api.players.downloadPackage(ids);toast(`已下载支持${ids.length}名玩家的分包`);}
+  catch (error) {toast(error.message, true);}
+  finally {packageBusy = false;updatePlayerSelection();}
+});
+
 async function refreshPlayers() {
   const rows = await api.players.list();
+  availablePlayers = rows.filter(player => player.enabled).map(player => player.player_id);
+  [...selectedPlayers].forEach(id => {if (!availablePlayers.includes(id)) selectedPlayers.delete(id);});
   const body = document.getElementById('players-body');
   body.replaceChildren();
   rows.forEach((player) => {
     const tr = document.createElement('tr');
+    const checkCell = document.createElement('td'), check = document.createElement('input');
+    check.type = 'checkbox';check.value = player.player_id;check.disabled = !player.enabled;check.checked = selectedPlayers.has(player.player_id);
+    check.setAttribute('aria-label', `选择玩家 ${player.player_id}`);
+    check.addEventListener('change', () => {if (check.checked) selectedPlayers.add(player.player_id);else selectedPlayers.delete(player.player_id);updatePlayerSelection();});
+    checkCell.append(check);tr.append(checkCell);
     tr.append(
       cell(player.player_id),
       cell(player.role_name || '—'),
@@ -133,6 +165,7 @@ async function refreshPlayers() {
     tr.append(actions);
     body.append(tr);
   });
+  updatePlayerSelection();
 }
 
 document.getElementById('player-form').addEventListener('submit', async (event) => {
@@ -146,14 +179,9 @@ document.getElementById('player-form').addEventListener('submit', async (event) 
       note: form.get('note'),
     });
     event.target.reset();
+    selectedPlayers.add(playerId);
     await refreshPlayers();
-    if (!form.get('with_package')) return;
-    try {
-      await api.players.downloadPackage(playerId);
-      toast(`${playerId} 的白名单已添加，分发包开始下载`);
-    } catch (error) {
-      toast(`已加入白名单，但打包失败：${error.message}`, true);
-    }
+    toast('玩家已添加并勾选，可继续添加，或点击下载分包');
   } catch (error) {
     toast(error.message, true);
   }
