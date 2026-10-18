@@ -222,3 +222,26 @@ def test_douyin_probe_renews_runtime_and_resident_bound_keepalive_lease(tmp_path
         assert lease['resident'] == 'lease-resident'
         assert 0 <= time.time()*1000-lease['at'] < 2000
     asyncio.run(run())
+
+
+
+def test_shutdown_detaches_waiter_without_replaying_command(tmp_path):
+    async def run():
+        cache, _, _ = cache_fixture(tmp_path)
+        cache.prepare();live(cache, resident='owned')
+        transport = DouyinTransport(cache)
+        await transport.connect();transport.session_id='owned'
+        job=asyncio.create_task(transport._rpc('season-call', {'name':'candidates'}, timeout_ms=30000))
+        await asyncio.sleep(.01)
+        command=json.loads(cache.mailbox('command').read_text(encoding='utf-8'))
+        transport.begin_shutdown()
+        signal=json.loads(cache.mailbox('shutdown').read_text(encoding='utf-8'))
+        assert signal['resident']=='owned' and signal['runtime']==transport.runtime
+        transport.detach_for_shutdown()
+        with pytest.raises(ContextDestroyed):
+            await asyncio.wait_for(job,.5)
+        assert transport._pending_file['id']==command['id']
+        assert json.loads(cache.mailbox('command').read_text(encoding='utf-8'))['id']==command['id']
+        with pytest.raises(ContextDestroyed):
+            await transport._rpc('ping')
+    asyncio.run(run())

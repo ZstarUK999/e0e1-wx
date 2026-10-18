@@ -160,7 +160,6 @@
     }
   }
   async function poll() {
-    applyShutdown();
     if (stopped || busy) return;
     const command = read('command');
     if (!command || command.token !== token || command.runtime !== runtime

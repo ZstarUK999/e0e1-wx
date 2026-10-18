@@ -936,3 +936,26 @@ def test_invalid_or_missing_license_still_reports_login(app,tmp_path,monkeypatch
         finally:
             await c.shutdown();w.close()
     asyncio.run(run())
+
+
+
+def test_douyin_shutdown_has_deadline_when_game_never_replies(app,tmp_path):
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        await ready(c,s)
+        stalled=asyncio.Event()
+        notifications=[]
+        t.shutdown_timeout=.02
+        def begin():notifications.append('begin')
+        def detach():
+            notifications.append('detach');t.connected=False;stalled.set()
+        async def blocked_idle():
+            await stalled.wait()
+            raise RuntimeError('reply unknown')
+        t.begin_shutdown=begin;t.detach_for_shutdown=detach;t.wait_idle=blocked_idle
+        w.set_operation_running(True)
+        await asyncio.wait_for(c.shutdown(),.5)
+        assert c._closed.is_set() and s.closed
+        assert 'begin' in notifications and 'detach' in notifications
+        assert w._shutdown_complete and not w._operation_running
+    asyncio.run(run())

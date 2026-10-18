@@ -63,6 +63,21 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   assert.equal(screen.at(-1),false,'restore the observed native screen setting');
   files.set(base+'lease.json',JSON.stringify({token:'wrong',runtime:state().runtime,resident:'resident',at:Date.now()}));pulse();assert.equal(resumeCount,2);
   assert.equal(hides.size,1);assert.equal(shows.size,1);
+  // Independent exit mailbox must still be handled while a command is hung.
+  let marksStopped=0,overlayStopped=0;
+  context.e0e1Season={stop(){marksStopped++;return {ok:true};}};
+  context.treasureMapOverlayOff=()=>{overlayStopped++;};
+  context.__e0e1PluginRuntime.dispatch=()=>new Promise(()=>{});
+  command('hung','call',{id:'resident',op:'count'});await tick();assert.equal(state().busy,true);
+  for(const patch of [{token:'other'},{runtime:'old'},{resident:'someone-else'}]){
+    files.set(base+'shutdown.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',...patch}));pulse();assert.equal(marksStopped,0);
+  }
+  files.set(base+'shutdown.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident'}));pulse();
+  for(let i=0;i<30;i++)await Promise.resolve();
+  assert.equal(context.__e0e1PluginRuntime.stopped,true);assert.equal(marksStopped,1);assert.equal(overlayStopped,1);
+  assert.equal(JSON.parse(files.get(base+'persistent.json')).damage,false);
+  pulse();assert.equal(marksStopped,1,'exit cleanup is idempotent');assert.equal(context.executed,1,'unknown action not replayed');
+  console.log('PASS: instance-bound exit signal stops background features even while command queue is blocked, without replaying actions.');
   context.__e0e1DouyinBridge.stop();assert.equal(timers.size,0);assert.equal(hides.size,0);assert.equal(shows.size,0);
   console.log('PASS: Douyin background keepalive requires fresh matching lease, preserves foreground pause, restores on expiry and never replays actions.');
   console.log('PASS: eval/Function disabled; static resident dispatch, async script enable, identity/replay/expiry checks, dynamic-source rejection.');
