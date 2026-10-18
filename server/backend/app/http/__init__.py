@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from ..settings import settings
-from .routers import auth, logs, players, releases
+from .routers import auth, certificates, logs, players, releases
 
 
 def create_app() -> FastAPI:
@@ -21,6 +21,7 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(auth.router)
+    app.include_router(certificates.router)
     app.include_router(players.router)
     app.include_router(releases.router)
     app.include_router(logs.router)

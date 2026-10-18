@@ -11,7 +11,7 @@ export function setToken(value) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
-async function request(path, options = {}) {
+async function request(path, options = {}, binary = false) {
   const headers = new Headers(options.headers || {});
   if (token()) headers.set('Authorization', `Bearer ${token()}`);
   let response;
@@ -34,6 +34,7 @@ async function request(path, options = {}) {
     throw new Error(message || `请求失败（${response.status}）`);
   }
   if (response.status === 204) return null;
+  if (binary) return response.blob();
   const type = response.headers.get('content-type') || '';
   return type.includes('application/json') ? response.json() : response.text();
 }
@@ -95,3 +96,12 @@ export const releases = {
 export const logs = {
   list: (limit = 200) => request(`/api/logs?limit=${limit}`),
 };
+
+
+export async function downloadClientCertificates() {
+  const blob = await request('/api/certificates/client.zip', {}, true);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;link.download = 'e0e1-client-certs.zip';
+  try {link.click();} finally {setTimeout(() => URL.revokeObjectURL(url), 1000);}
+}

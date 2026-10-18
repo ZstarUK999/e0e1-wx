@@ -23,5 +23,7 @@ vm.runInNewContext(app.slice(app.indexOf('const selectedPlayers ='),app.indexOf(
  vm.runInNewContext(source+';globalThis.playersApi=players;',ctx);
  await ctx.playersApi.downloadPackage(['1001','1002']);assert.equal(calls[0].url,'/api/players/package');assert.equal(calls[0].options.method,'POST');assert.deepEqual(JSON.parse(calls[0].options.body),{player_ids:['1001','1002']});assert.equal(revoked.length,1);
  await ctx.playersApi.downloadPackage('1001');assert.equal(calls[1].options.method,'GET');
+ await ctx.downloadClientCertificates();assert.equal(calls.at(-1).url,'/api/certificates/client.zip');assert.equal(calls.at(-1).options.headers.get('Authorization'),'Bearer jwt');assert.equal(revoked.length,3);
+ console.log('PASS authenticated binary certificate download and object URL cleanup');
  console.log('PASS selected IDs sent as authenticated POST JSON, legacy single-player GET retained and Blob URLs released');
 })().catch(e=>{console.error(e);process.exitCode=1;});

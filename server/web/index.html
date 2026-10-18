@@ -46,6 +46,8 @@
 
     <section id="releases-view" class="view hidden">
       <h1>版本发布</h1>
+      <button id="download-client-certs">下载客户端证书</button>
+      <p class="hint">解压后将 client 目录中的三个文件放到本地 server/backend/certs/client/，或用打包参数 --certs 指向该 client 目录。</p>
       <p class="hint">上传的是 build_exe.py 产出的<strong>不含 license</strong> 的构建 zip；新版本默认不启用，确认无误再点发布。</p>
       <form id="release-form" enctype="multipart/form-data">
         <input type="file" name="archive" accept=".zip" required>

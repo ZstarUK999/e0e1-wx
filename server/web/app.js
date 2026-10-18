@@ -189,6 +189,15 @@ document.getElementById('player-form').addEventListener('submit', async (event) 
 
 // ── 版本发布 ──
 
+document.getElementById('download-client-certs').addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  if (button.disabled) return;
+  button.disabled = true;
+  try {await api.downloadClientCertificates();toast('客户端证书已下载，解压 client 目录后用于发行版打包');}
+  catch (error) {toast(error.message, true);}
+  finally {button.disabled = false;}
+});
+
 function sizeText(bytes) {
   if (!bytes) return '0 MB';
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
