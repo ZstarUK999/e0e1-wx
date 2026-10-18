@@ -69,12 +69,25 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   context.treasureMapOverlayOff=()=>{overlayStopped++;};
   context.__e0e1PluginRuntime.dispatch=()=>new Promise(()=>{});
   command('hung','call',{id:'resident',op:'count'});await tick();assert.equal(state().busy,true);
+  // Overlay control is independent of the hung command queue as well.
+  let overlayUpdates=0,automationDestroyed=0;
+  context.__e0e1AutomationOverlay={
+    update(payload){overlayUpdates++;return Promise.resolve(payload);},
+    snapshot(){return {run_id:'run',active:true,stop_requested:true};},
+    destroy(){automationDestroyed++;}
+  };
+  for(const patch of [{token:'other'},{runtime:'old'},{resident:'someone-else'}]){
+    files.set(base+'automation.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now(),payload:{active:true},...patch}));pulse();
+    assert.equal(overlayUpdates,0);
+  }
+  files.set(base+'automation.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now(),payload:{active:true}}));pulse();
+  assert.equal(overlayUpdates,1);assert.equal(state().automation.stop_requested,true);
   for(const patch of [{token:'other'},{runtime:'old'},{resident:'someone-else'}]){
     files.set(base+'shutdown.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',...patch}));pulse();assert.equal(marksStopped,0);
   }
   files.set(base+'shutdown.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident'}));pulse();
   for(let i=0;i<30;i++)await Promise.resolve();
-  assert.equal(context.__e0e1PluginRuntime.stopped,true);assert.equal(marksStopped,1);assert.equal(overlayStopped,1);
+  assert.equal(context.__e0e1PluginRuntime.stopped,true);assert.equal(automationDestroyed,1);assert.equal(marksStopped,1);assert.equal(overlayStopped,1);
   assert.equal(JSON.parse(files.get(base+'persistent.json')).damage,false);
   pulse();assert.equal(marksStopped,1,'exit cleanup is idempotent');assert.equal(context.executed,1,'unknown action not replayed');
   console.log('PASS: instance-bound exit signal stops background features even while command queue is blocked, without replaying actions.');

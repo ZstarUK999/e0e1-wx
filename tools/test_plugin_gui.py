@@ -601,3 +601,43 @@ def test_debug_platform_selection_keeps_main_ui_visible(window, monkeypatch, pla
         assert window.centralWidget().currentWidget() is window._splitter
     assert not window.game_connected
     assert not window.runtime_ready
+
+
+
+def test_delayed_shutdown_shows_single_dialog_with_live_countdown(window, app):
+    from PySide6.QtTest import QTest
+    window.attach_runtime([])
+    window.set_shutdown_estimate(10)
+    spy=QSignalSpy(window.shutdown_requested)
+    assert not window.close()
+    assert window._shutdown_dialog is None
+    QTest.qWait(250)
+    app.processEvents()
+    dialog=window._shutdown_dialog
+    assert dialog is not None and dialog.isVisible()
+    assert "预计 10 秒后退出" in dialog.countdown.text()
+    window._shutdown_started -= 4
+    window._update_shutdown_progress()
+    assert "预计 6 秒后退出" in dialog.countdown.text()
+    assert not window.close()
+    assert window._shutdown_dialog is dialog and spy.count()==1
+    dialog.reject()
+    assert dialog.isVisible()
+    window._shutdown_started -= 10
+    window._update_shutdown_progress()
+    assert "仍在等待当前操作确认" in dialog.countdown.text()
+    assert not window._shutdown_complete
+    window.complete_shutdown()
+    assert not dialog.isVisible()
+    assert not window._shutdown_progress_timer.isActive()
+
+
+def test_fast_shutdown_never_flashes_wait_dialog(window, app):
+    from PySide6.QtTest import QTest
+    window.attach_runtime([])
+    assert not window.close()
+    window.complete_shutdown()
+    QTest.qWait(250)
+    app.processEvents()
+    assert window._shutdown_dialog is None
+    assert not window._shutdown_delay_timer.isActive()

@@ -53,13 +53,16 @@ class ResidentGame:
     async def arena_state(self): return await self.transport.call('arena_state')
     async def arena_refresh(self): return await self._call('arena_refresh')
     async def arena_challenge(self, id): return await self._call('arena_challenge', {'id': id})
+    async def identity(self): return await self.transport.call('identity')
     async def tomb_state(self, kind): return await self.transport.call('tomb_state', {'kind': kind})
+    async def tomb_counts(self, kind): return await self.transport.call('tomb_state', {'kind': kind, 'counts_only': True})
     async def tomb_collect(self, kind): return await self._call('tomb_collect', {'kind': kind})
     async def tomb_start(self, kind): return await self._call('tomb_start', {'kind': kind})
     async def tomb_recruit(self, kind): return await self._call('tomb_recruit', {'kind': kind})
-    async def tomb_targets(self, kind, mode, refresh=True, minimum=0): return await self._call('tomb_targets', {'kind': kind, 'mode': mode, 'refresh': refresh, 'minimum': minimum})
-    async def tomb_raid(self, kind, id): return await self._call('tomb_raid', {'kind': kind, 'id': id})
-    async def tomb_fill(self, kind, id): return await self._call('tomb_fill', {'kind': kind, 'id': id})
+    async def tomb_targets(self, kind, mode, refresh=True, minimum=0, exclude_ids=None, preferred_id=None): return await self._call('tomb_targets', {'kind': kind, 'mode': mode, 'refresh': refresh, 'minimum': minimum, 'exclude_ids': sorted(exclude_ids or []), 'preferred_id': preferred_id})
+    # 批次自行换目标/收尾；不要把同一个失效目标原地重试三次再强制返回大厅。
+    async def tomb_raid(self, kind, id): return await self.transport.call('tomb_raid', {'kind': kind, 'id': id})
+    async def tomb_fill(self, kind, id): return await self.transport.call('tomb_fill', {'kind': kind, 'id': id})
     # 三尸合成：走 _call（只有"明确未执行/被拒绝"才重试，结果未知绝不重试）。
     # ⚠ desire_compose_once 故意不在这里：_call 失败后会 home()，那会把整批打断；
     #   合成失败该由批次自己决定是换档继续还是收尾，见 features/desire.py。

@@ -14,11 +14,11 @@ function fixture(){
  const logs=[];
  const list={_curSelect:0,_dataList:[{id:10,siteNum:16,name:'甲',sName:'561服',legionName:'无',fightPower:1000},
   {id:11,siteNum:0,name:'乙',sName:'561服',legionName:'阴司A',fightPower:2000}],view:{}};
- list.view.list_record={getItemByListId:i=>({getComponent:()=>({btn_goto:button('goto:'+list._dataList[i].id,()=>{other._targetId=list._dataList[i].id;other._loadedTargetId=other._targetId;windows.set(cfg.MineOtherUI,{view:{mine_other_sanshi:other,mine_other_magic_artifact:other}});})})})};
- list.view.btnTabGroup={children:[0,1].map(index=>({getComponent:()=>button('list-tab:'+index,()=>{list._curSelect=index;other._sameLegion=index===1;})}))};
+ list.view.list_record={getItemByListId:i=>({getComponent:()=>({_data:list._dataList[i],btn_goto:button('goto:'+list._dataList[i].id,()=>{other._targetId=list._dataList[i].id;other._loadedTargetId=other._targetId;windows.delete(cfg.MineListUI);windows.delete(cfg.MineUI);windows.set(cfg.MineOtherUI,{_openMineType:root._mineType,view:{mine_other_sanshi:other,mine_other_magic_artifact:other,btn_list:button('target-list',()=>{list._curSelect=0;list._dataList=list._dataList.slice();windows.set(cfg.MineListUI,list);})}});})})})};
+ list.view.btnTabGroup={children:[0,1].map(index=>({getComponent:()=>button('list-tab:'+index,()=>{list._curSelect=index;other._sameLegion=index===1;list._dataList=list._dataList.slice();})}))};
  let refreshIndex=0,refreshProvider=null;
  list.view.btn_refresh=button('list-refresh',()=>{refreshIndex++;list._dataList=refreshProvider?refreshProvider(refreshIndex):[list._dataList[0]];});
- const other={_sameLegion:false,btn_help:button('help',()=>{if(other._sameLegion)ROLE.mine.helpNumDay++;else{windows.set(cfg.MineBattleUI,battle);}})};
+ const other={_sameLegion:false,btn_help:button('help',()=>{if(other._sameLegion)(root._mineType===0?ROLE.mine:ROLE.artifactMine).helpNumDay++;else{windows.set(cfg.MineBattleUI,battle);}})};
  for(const kind of ['sanshi','artifact']){pages[kind].btn_other=button('open-list:'+kind,()=>{windows.set(cfg.MineListUI,list);});pages[kind].btn_recruit=button('open-recruit',()=>{windows.set(cfg.ChatUI,chat);windows.set(cfg.ChatRecruitUI,recruit);});}
  const root={_mineType:0,view:{mine_sanshi:pages.sanshi,mine_magic_artifact:pages.artifact}};
  root.view.btn_sanshi=button('kind:sanshi',()=>root._mineType=0);root.view.btn_magic_artifact=button('kind:artifact',()=>root._mineType=1);
@@ -32,11 +32,11 @@ function fixture(){
  let blankResult=false,blankTaps=0;
  const result=(which)=>{const screen=blankResult?{view:{},node:{activeInHierarchy:true,emit(type){
    if(type==='touch-end'){blankTaps++;windows.delete(which);}
- }}}:{view:{btn_close:button('close-result',()=>windows.delete(which))}};views.set(which,{ui:screen,params:[{result:1}]});return screen;};
+ }}}:{view:{btn_close:button('close-result',()=>{windows.delete(which);if(which===cfg.MinePveBattleResultUI){windows.delete(cfg.MineOtherUI);windows.set(cfg.MineUI,root);}})}};views.set(which,{ui:screen,params:[{result:1}]});return screen;};
  const battle={view:{btn_skip:{node:{activeInHierarchy:true},interactable:true,run:()=>{events.push('official-skip');windows.delete(cfg.MineBattleUI);windows.set(cfg.ArenaBattleResultUI,result(cfg.ArenaBattleResultUI));windows.set(cfg.MinePveBattleResultUI,result(cfg.MinePveBattleResultUI));}}}};
  const ui={findOpen:c=>windows.get(c),find:c=>views.get(c)||{ui:windows.get(c)}};
  const h={configuration:()=>({cfg,data:constants,defs,cc:{Button:'Button'},Button:'Button'}),ui:()=>ui,
-  open:async c=>{events.push('open:'+c.id);if(c===cfg.MineUI)return root;if(c===cfg.ArenaUI)return arena;throw Error('未知页面');},
+  open:async c=>{events.push('open:'+c.id);if(c===cfg.MineUI){windows.set(cfg.MineUI,root);return root;}if(c===cfg.ArenaUI)return arena;throw Error('未知页面');},
   click:async b=>{assert.ok(b&&b.run,'UI按钮存在');events.push(b.name||'skip');await b.run();},
   uiClass:async(module,name)=>name,listNode:async(list,i)=>list.getItemByListId(i),
   wait:async predicate=>{const value=predicate();assert.ok(value,'正常UI响应未完成');return value;},bounded:async promise=>await promise,
@@ -47,7 +47,7 @@ function fixture(){
  return {api:sandbox.createDailyRuntime(g,h),events,ROLE,cfg,windows,views,h,recruitItem,other,pages,logs,
   setRefreshList:fn=>{refreshProvider=fn;},refreshCount:()=>refreshIndex,
   useBlankResult:()=>{blankResult=true;},blankTaps:()=>blankTaps,
-  setInitialList:fn=>{list._dataList=fn();}};
+  setInitialList:fn=>{list._dataList=fn();},list,root};
 }
 test('independent tomb counts and normal collect/start UI',async()=>{const f=fixture();let a=await f.api.dispatch('tomb_state',{kind:'sanshi'});assert.equal(a.raid_remaining,2);assert.equal(a.fill_remaining,2);let b=await f.api.dispatch('tomb_state',{kind:'artifact'});assert.equal(b.raid_remaining,2);assert.equal(b.fill_remaining,5);assert.equal((await f.api.dispatch('tomb_collect',{kind:'sanshi'})).confirmed,true);assert.equal((await f.api.dispatch('tomb_start',{kind:'sanshi'})).confirmed,true);assert.ok(f.events.includes('cell:sanshi'));});
 test('recruit UI publish then exit channel, cooldown never publishes',async()=>{const f=fixture();assert.equal((await f.api.dispatch('tomb_recruit',{kind:'sanshi'})).confirmed,true);assert.ok(f.events.indexOf('publish')<f.events.indexOf('close-chat'));f.recruitItem.lbl_status.string='招募冷却中';await assert.rejects(f.api.dispatch('tomb_recruit',{kind:'sanshi'}),/冷却/);assert.equal(f.events.filter(e=>e==='publish').length,1);});
@@ -132,3 +132,117 @@ test('battle screen is resolved from BattleUICfgId even when CommonUICfgId lacks
 });
 
 test('no challenge ticket never opens confirmation',async()=>{const f=fixture();f.ROLE.arena.dayBattleNum=0;await assert.rejects(f.api.dispatch('arena_challenge',{id:10}),/次数/);assert.ok(!f.events.includes('target-challenge'));});
+
+
+test('count reads do not navigate away from a target page',async()=>{
+ const f=fixture();f.h.open=async()=>{throw Error('counts must not navigate');};
+ const state=await f.api.dispatch('tomb_state',{kind:'sanshi',counts_only:true});
+ assert.equal(state.fill_remaining,2);assert.equal(state.raid_remaining,2);
+ assert.equal(f.events.length,0);
+});
+
+test('repeated fills reuse the loaded target even after the native UI closes its list',async()=>{
+ const f=fixture();f.setRefreshList(()=>[{id:11,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ assert.equal(f.windows.has(f.cfg.MineListUI),false);
+ await f.api.dispatch('tomb_state',{kind:'sanshi',counts_only:true});
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ assert.equal(f.ROLE.mine.helpNumDay,4);
+ assert.equal(f.events.filter(e=>e==='goto:11').length,1);
+ assert.equal(f.events.filter(e=>e==='open:MineUI').length,1);
+});
+
+test('next scan uses target list button instead of reopening own mine',async()=>{
+ const f=fixture();f.setRefreshList(()=>[{id:11,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});
+ assert.ok(f.events.includes('target-list'));
+ assert.equal(f.events.filter(e=>e==='open:MineUI').length,1);
+});
+
+test('excluded raid targets do not prematurely stop refreshing',async()=>{
+ const f=fixture();f.setRefreshList(()=>[{id:12,siteNum:20}]);
+ const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true,minimum:16,exclude_ids:[10]});
+ assert.equal(scan.refresh_count,1);assert.equal(scan.targets[0].id,12);
+});
+
+test('target identity and loaded state must agree before clicking help',async()=>{
+ const f=fixture();await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:false});
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ f.other._loadedTargetId=999;
+ await assert.rejects(f.api.dispatch('tomb_fill',{kind:'sanshi',id:11}));
+ assert.equal(f.events.filter(e=>e==='help').length,1);
+});
+
+test('raid waits for the official return before the next scan',async()=>{
+ const f=fixture();await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:false});
+ const receipt=await f.api.dispatch('tomb_raid',{kind:'sanshi',id:10});
+ assert.equal(receipt.win,true);assert.ok(f.windows.has(f.cfg.MineUI));
+});
+
+
+async function pollingWait(predicate,message){
+ const until=Date.now()+1000;
+ while(Date.now()<until){const value=predicate();if(value)return value;await new Promise(r=>setTimeout(r,5));}
+ throw Error(message||'test UI did not settle');
+}
+
+test('fill waits for target reload and the busy flag before another click',async()=>{
+ const f=fixture();f.setRefreshList(()=>[{id:11,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:true});
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ f.h.wait=pollingWait;
+ f.other._helpBusy=true;f.other._loadedTargetId=0;f.other.btn_help.interactable=false;
+ let ready=false;
+ setTimeout(()=>{ready=true;f.other._helpBusy=false;f.other._loadedTargetId=11;f.other.btn_help.interactable=true;},30);
+ const click=f.h.click;f.h.click=async button=>{if(button===f.other.btn_help)assert.ok(ready,'must wait for target reload');return click(button);};
+ await f.api.dispatch('tomb_fill',{kind:'sanshi',id:11});
+ assert.equal(f.ROLE.mine.helpNumDay,4);
+});
+
+test('fill-tab transition waits for its asynchronous list response',async()=>{
+ const f=fixture();f.h.wait=pollingWait;
+ const originalObserve=f.h.observe;
+ f.h.observe=async(expected,action,verify,ms)=>{await action();await pollingWait(verify,'list data still pending');return {items:[]};};
+ f.list.view.btnTabGroup.children[1].getComponent=()=>({run(){
+   f.list._curSelect=1;setTimeout(()=>{f.list._dataList=[{id:88,siteNum:0}];},30);
+ }});
+ const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'fill',refresh:false});
+ assert.equal(scan.targets[0].id,88);
+});
+
+
+for(const kind of ['sanshi','artifact'])test(kind+' consecutive fill actions use independent counters',async()=>{
+ const f=fixture();f.setRefreshList(()=>[{id:11,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind,mode:'fill',refresh:true});
+ const own=kind==='sanshi'?f.ROLE.mine:f.ROLE.artifactMine;
+ const before=own.helpNumDay;
+ await f.api.dispatch('tomb_fill',{kind,id:11});
+ await f.api.dispatch('tomb_fill',{kind,id:11});
+ assert.equal(own.helpNumDay,before+2);
+ assert.equal(f.events.filter(e=>e==='goto:11').length,1);
+});
+
+test('raid waits through an asynchronous official return to the mine',async()=>{
+ const f=fixture();f.h.wait=pollingWait;
+ await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:false});
+ const click=f.h.click;let returned=false;
+ f.h.click=async button=>{
+   await click(button);
+   if(button.name==='close-result'){
+     f.windows.delete(f.cfg.MineUI);
+     setTimeout(()=>{returned=true;f.windows.set(f.cfg.MineUI,f.root);},30);
+   }
+ };
+ await f.api.dispatch('tomb_raid',{kind:'sanshi',id:10});
+ assert.ok(returned,'must wait before reporting completion to the batch');
+});
+
+
+test('retry scan keeps looking for the preferred player instead of stopping at another eligible target',async()=>{
+ const f=fixture();f.setRefreshList(index=>index===1?[{id:12,siteNum:20}]:[{id:13,siteNum:20}]);
+ const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true,minimum:16,preferred_id:13});
+ assert.equal(scan.refresh_count,2);assert.equal(scan.targets[0].id,13);
+});

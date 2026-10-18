@@ -544,3 +544,17 @@ test('desire ops are routed to the standalone desire runtime, never to the daily
   assert.equal(out.status,'ok',out.message);
   assert.deepEqual(seen,['desire_bag_stats']);
 });
+
+
+test('home closes pages opened by previous close callbacks before reporting success',async()=>{
+ const f=fixture();f.cfg.MineOtherUI={id:'MineOtherUI'};f.cfg.MineUI={id:'MineUI'};
+ const mine={view:{btn_close:f.inputButton('close-mine',()=>{f.windows.delete(f.cfg.MineUI);})}};
+ const other={view:{btn_close:f.inputButton('close-other',()=>{
+   f.windows.delete(f.cfg.MineOtherUI);
+   setTimeout(()=>f.windows.set(f.cfg.MineUI,mine),10);
+ })}};
+ f.windows.set(f.cfg.MineOtherUI,other);
+ assert.equal((await f.runtime.dispatch('home')).status,'ok');
+ assert.ok(f.inputs.includes('close-other'));assert.ok(f.inputs.includes('close-mine'));
+ assert.equal(f.windows.size,1);
+});

@@ -603,7 +603,7 @@ def test_resident_script_tracks_pending_operation_and_small_config_messages():
         source=next(params['expression'] for method,params in fake.messages if params and 'createEnergyRuntime' in params.get('expression',''))
         # 用Node假运行api，仅验证生成的驻留容器，不操作任何游戏数据。
         split=source.index('const id =')
-        source=source[:source.index('function createEnergyRuntime')]+'function createEnergyRuntime(g){return {dispatch:async()=>await g.release};}\n'+source[split:]
+        source=source[:source.index('function createEnergyRuntime')]+'function createEnergyRuntime(g){return {dispatch:async()=>await g.release};}\n'+__import__('pathlib').Path('package/plugin_manager/automation_overlay.js').read_text(encoding='utf-8')+'\n'+source[split:]
         code='''const assert=require('node:assert/strict'); const vm=require('node:vm');
 const source=require('fs').readFileSync(process.argv[1],'utf8'); const g={};let resolve;g.release=new Promise(r=>resolve=r);vm.createContext(g);vm.runInContext(source,g);
 (async()=>{const r=g.__e0e1PluginRuntime;const job=r.dispatch('sweep',{});assert.equal(r.pending,true);const blocked=await r.dispatch('eye',{});assert.equal(blocked.status,'uncertain');await r.dispatch('configure',{daily:{enabled:false}});assert.equal(r.pending,true);resolve({status:'ok',value:1});await job;assert.equal(r.pending,false);await r.dispatch('stop',{});assert.equal((await r.dispatch('sweep',{})).status,'unavailable');})().catch(e=>{console.error(e);process.exit(1)});'''
@@ -958,4 +958,97 @@ def test_douyin_shutdown_has_deadline_when_game_never_replies(app,tmp_path):
         assert c._closed.is_set() and s.closed
         assert 'begin' in notifications and 'detach' in notifications
         assert w._shutdown_complete and not w._operation_running
+    asyncio.run(run())
+
+
+
+def test_game_stop_button_is_polled_while_a_task_is_waiting_and_finishes_at_home(app,tmp_path):
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        try:
+            await ready(c,s)
+            c.automation.set_automation(True)
+            t.entered=asyncio.Event();t.release=asyncio.Event()
+            w.request_test('energy',confirmed=True)
+            await t.entered.wait()
+            payloads=[]
+            async def overlay(payload):
+                payloads.append(payload)
+                return {'run_id':c.automation.run_id,'stop_requested':True}
+            t.automation_overlay=overlay
+            c._next_overlay_sync=0
+            await c.poll()
+            assert not c.automation.running and c.state.stop_operation
+            assert c.automation.busy,'do not cancel an in-flight game request'
+            t.release.set()
+            await c.wait_operation()
+            assert any(op=='home' for op,_ in t.calls)
+            c._next_overlay_sync=0
+            await c._sync_automation_overlay()
+            assert payloads[-1]['active'] is False
+        finally:
+            if getattr(t,'release',None):t.release.set()
+            await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+def test_overlay_state_channel_does_not_wait_for_the_game_action_lock():
+    async def run():
+        m=importlib.import_module('package.plugin_manager.transport')
+        transport=m.PluginTransport(cdp=FakeCdp())
+        transport.connected=True;transport.session_id='owned';transport.context_id=7
+        marker={'id':'game-action'};transport._inflight=marker
+        async def evaluate(expression,context_id=None,timeout_ms=0):
+            assert 'await o.update' in expression and 'owned' in expression
+            return {'run_id':'run','stop_requested':True}
+        transport._evaluate=evaluate
+        async with transport._lock:
+            result=await asyncio.wait_for(transport.automation_overlay({'run_id':'run','active':True}),.2)
+        assert result['stop_requested'] and transport._inflight is marker
+    asyncio.run(run())
+
+
+
+def test_next_check_countdown_respects_task_delay_disabled_tasks_and_daily_window(app,tmp_path,monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+    m=importlib.import_module('package.plugin_manager.automation')
+    monkeypatch.setattr(m,'time',SimpleNamespace(monotonic=lambda:100.0))
+    c,s,t,w=make_controller(tmp_path)
+    try:
+        for key in w.store.snapshot()['daily']['tasks']:w.store.set_task_enabled(key,False)
+        assert c.automation.next_check(datetime(2026,10,18,9,tzinfo=m.BEIJING)) is None
+        w.store.set_task_enabled('energy',True)
+        c.automation._task_due['energy']=190
+        result=c.automation.next_check(datetime(2026,10,18,9,tzinfo=m.BEIJING))
+        assert result['task_id']=='energy' and result['delay_seconds']==90
+        w.store.set_task_enabled('energy',False)
+        w.store.set_task_enabled('arena',True)
+        result=c.automation.next_check(datetime(2026,10,18,10,27,tzinfo=m.BEIJING))
+        assert result['task_id']=='arena' and result['delay_seconds']==60
+        result=c.automation.next_check(datetime(2026,10,18,10,31,tzinfo=m.BEIJING))
+        assert result['delay_seconds']==23*3600+57*60
+    finally:
+        asyncio.run(c.shutdown());w.close()
+
+
+def test_idle_overlay_reports_waiting_and_next_check_timestamp(app,tmp_path):
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        try:
+            await ready(c,s)
+            for key in w.store.snapshot()['daily']['tasks']:w.store.set_task_enabled(key,False)
+            w.store.set_task_enabled('energy',True)
+            c.automation.set_automation(True)
+            c.automation._task_due['energy']=time.monotonic()+90
+            received=[]
+            async def overlay(payload):received.append(payload);return {}
+            t.automation_overlay=overlay
+            await c._sync_automation_overlay()
+            value=received[-1]
+            assert value['active'] and value['phase']=='waiting'
+            assert '体力' in value['next_task']
+            assert 88 < value['next_check_at']/1000-time.time() <= 90
+        finally:
+            await c.shutdown();w.close()
     asyncio.run(run())

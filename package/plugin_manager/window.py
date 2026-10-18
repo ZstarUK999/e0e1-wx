@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from pathlib import Path
+import time
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal, QTimer
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QGridLayout, QLabel, QMainWindow, QMessageBox,
+    QApplication, QDialog, QFileDialog, QGridLayout, QLabel, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QHBoxLayout, QScrollArea, QSplitter, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -32,6 +34,25 @@ def visible_tasks(page_key: str) -> tuple[str, ...]:
     return tuple(task_id for task_id in PAGE_TASKS.get(page_key, ()) if task_enabled(task_id))
 
 
+class _ShutdownDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent, Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
+        self.setWindowTitle("正在退出")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("正在结束定时任务，请稍候…", self))
+        self.countdown = QLabel(self)
+        layout.addWidget(self.countdown)
+        progress = QProgressBar(self)
+        progress.setRange(0, 0)
+        layout.addWidget(progress)
+
+    def reject(self):
+        # 关闭请求已经生效，Escape 不应把收尾提示藏起来。
+        pass
+
+
 class PluginWindow(QMainWindow):
     TARGET_APPID = "wx6d5e82c174635a48"
     configuration_changed = Signal(dict)
@@ -53,6 +74,16 @@ class PluginWindow(QMainWindow):
         self._shutdown_emitted = False
         self._runtime_attached = False
         self._shutdown_complete = False
+        self._shutdown_dialog = None
+        self._shutdown_started = None
+        self._shutdown_estimate_seconds = 30.0
+        self._shutdown_delay_timer = QTimer(self)
+        self._shutdown_delay_timer.setSingleShot(True)
+        self._shutdown_delay_timer.setInterval(200)
+        self._shutdown_delay_timer.timeout.connect(self._show_shutdown_progress)
+        self._shutdown_progress_timer = QTimer(self)
+        self._shutdown_progress_timer.setInterval(200)
+        self._shutdown_progress_timer.timeout.connect(self._update_shutdown_progress)
         self._operation_running = False
         self._capabilities = None
         self._offset_dialog = None
@@ -261,7 +292,37 @@ class PluginWindow(QMainWindow):
 
     def complete_shutdown(self):
         self._shutdown_complete = True
+        self._hide_shutdown_progress()
         self.close()
+
+    def _hide_shutdown_progress(self):
+        self._shutdown_delay_timer.stop()
+        self._shutdown_progress_timer.stop()
+        if self._shutdown_dialog is not None:
+            self._shutdown_dialog.done(QDialog.DialogCode.Accepted)
+
+    def set_shutdown_estimate(self, seconds):
+        self._shutdown_estimate_seconds = max(1.0, float(seconds))
+
+    def _show_shutdown_progress(self):
+        if not self._closing or self._shutdown_complete:
+            return
+        if self._shutdown_dialog is None:
+            self._shutdown_dialog = _ShutdownDialog(self)
+        self._update_shutdown_progress()
+        self._shutdown_dialog.show()
+        self._shutdown_progress_timer.start()
+
+    def _update_shutdown_progress(self):
+        if self._shutdown_dialog is None or self._shutdown_started is None:
+            return
+        elapsed = max(0.0, time.monotonic() - self._shutdown_started)
+        remaining = max(0, math.ceil(self._shutdown_estimate_seconds - elapsed))
+        if remaining:
+            text = f"预计 {remaining} 秒后退出；任务提前结束将立即退出。"
+        else:
+            text = f"仍在等待当前操作确认（已等待 {int(elapsed)} 秒），完成后自动退出。"
+        self._shutdown_dialog.countdown.setText(text)
 
     def set_automation_running(self, running: bool):
         self.pages["daily"].set_automation_running(running)
@@ -458,7 +519,11 @@ class PluginWindow(QMainWindow):
             self.shutdown_requested.emit()
         if self._busy_task is not None or self._operation_running or (self._runtime_attached and not self._shutdown_complete):
             self.action_label.setText("等待当前操作确认并关闭内部运行服务后退出")
+            if self._shutdown_started is None:
+                self._shutdown_started = time.monotonic()
+                self._shutdown_delay_timer.start()
             event.ignore()
             return
         self.reset_session()
+        self._hide_shutdown_progress()
         event.accept()

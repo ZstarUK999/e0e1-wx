@@ -77,14 +77,15 @@ class FakeGame:
         self.record("recruit", kind)
         return self.respond("recruit", {"confirmed": True})
 
-    async def tomb_targets(self, kind, mode, refresh=True, minimum=0):
+    async def tomb_targets(self, kind, mode, refresh=True, minimum=0, exclude_ids=None, preferred_id=None):
         self.record("targets", kind, mode, refresh)
         return self.respond("targets", self.targets[kind])
 
     async def tomb_raid(self, kind, target_id):
         self.record("raid", kind, target_id)
         # 服务端扣次数：循环继续与否靠重新读到的次数判断。
-        self.states[kind]["raid_remaining"] -= 1
+        if self.win:
+            self.states[kind]["raid_remaining"] -= 1
         return self.respond("raid", {"confirmed": True, "win": self.win})
 
     async def tomb_fill(self, kind, target_id):
@@ -252,9 +253,10 @@ def test_loss_is_not_success_and_failed_ids_are_shared_in_this_session():
         result = await task(context(skip_failed_players=True))
         assert result.status == "waiting"
         assert "负" in result.message
-        # 两次机会都打完：102 失败后跳过，继续打 103。
+        # 战败不扣次数：每个玩家初次加两次重试，全输后再换下一名。
         assert failed == {102, 103}
-        assert game.states["sanshi"]["raid_remaining"] == 0
+        assert [call[2] for call in game.calls if call[0] == "raid"] == [102,102,102,103,103,103]
+        assert game.states["sanshi"]["raid_remaining"] == 2
         game.states["sanshi"]["raid_remaining"] = 1
         game.win = True
         # 只把 102 记在失败名单里：跳过它去打 103，胜利后名单不变。
@@ -270,13 +272,13 @@ def test_loss_is_not_success_and_failed_ids_are_shared_in_this_session():
     asyncio.run(run())
 
 
-def test_failed_players_skip_is_kind_local_and_can_be_disabled():
+def test_failed_players_skip_is_kind_local_and_old_disabled_flag_cannot_override_blacklist():
     async def run():
         game = FakeGame()
         task = make_task(game, "raid", failed_ids={102})
         assert (await task(context(skip_failed_players=False))).status == "success"
-        # 关闭跳过后同一目标可以连打，直到次数用完（初始2次）。
-        assert [call[2] for call in game.calls if call[0] == "raid"] == [102, 102]
+        # 旧配置中的关闭跳过不再覆盖“打不过后不再打”的固定规则。
+        assert [call[2] for call in game.calls if call[0] == "raid"] == [103, 103]
         game.calls.clear()
         task = make_task(game, "raid", "artifact", failed_ids=set())
         await task(context("artifact", "raid", skip_failed_players=True))
@@ -385,7 +387,8 @@ def test_explicit_rejection_returns_home_and_is_not_success(mode):
         assert result.next_delay_seconds == (60 if mode == "fill" else 20)
         assert game.calls[-1] == ("home", None)
         # 填土会对每个可填目标各试一次；其余动作整轮只发一次。
-        assert sum(call[0] == action for call in game.calls) == (2 if mode == "fill" else 1)
+        # 盗掠和填土都会遍历其他可用目标，而非第一个拒绝就结束批次。
+        assert sum(call[0] == action for call in game.calls) == (2 if mode in ("fill", "raid") else 1)
         assert failed == set()
     asyncio.run(run())
 
@@ -632,4 +635,162 @@ def test_invalid_remaining_count_does_not_scan_or_spend(mode, count):
         result = await make_task(game, mode)(context(mode=mode))
         assert result.status == "waiting"
         assert [call[0] for call in game.calls] == ["home", "state", "home"]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["sanshi", "artifact"])
+@pytest.mark.parametrize("mode", ["fill", "raid"])
+def test_batch_reads_counts_without_navigating_between_actions(kind, mode):
+    async def run():
+        class CountsGame(FakeGame):
+            async def tomb_state(self, kind):
+                raise AssertionError("scan should use count snapshots without navigating")
+            async def tomb_counts(self, kind):
+                return await FakeGame.tomb_state(self, kind)
+        game=CountsGame()
+        result=await make_task(game, mode, kind)(context(kind, mode))
+        assert result.status=="success"
+        actions=[call for call in game.calls if call[0]==mode]
+        assert len(actions)==2
+        assert [call[0] for call in game.calls].count("home")==2
+        assert not any(call[0]=="home" for call in game.calls[1:-1])
+    asyncio.run(run())
+
+
+def test_raid_rejected_target_does_not_end_batch_or_return_home_early():
+    async def run():
+        game=FakeGame();original=game.tomb_raid
+        async def raid(kind, target_id):
+            if target_id==102:
+                game.record("rejected", kind, target_id)
+                raise RetryableTaskError("目标已变化")
+            return await original(kind,target_id)
+        game.tomb_raid=raid
+        result=await make_task(game,"raid")(context())
+        assert result.status=="success"
+        assert [call[2] for call in game.calls if call[0]=="raid"]==[103,103]
+        assert len([call for call in game.calls if call[0]=="rejected"])==1
+        assert not any(call[0]=="home" for call in game.calls[1:-1])
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["fill", "raid"])
+def test_confirmed_action_without_counter_progress_stops_instead_of_looping(mode):
+    async def run():
+        game=FakeGame()
+        async def no_progress(kind,target_id):
+            game.record(mode,kind,target_id)
+            return {"confirmed":True,"win":True}
+        setattr(game,"tomb_"+mode,no_progress)
+        with pytest.raises(ExecutionUncertain,match="次数未减少"):
+            await make_task(game,mode)(context(mode=mode))
+        assert len([call for call in game.calls if call[0]==mode])==1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["fill", "raid"])
+def test_resident_leaves_rejected_target_recovery_to_batch(mode):
+    from package.plugin_manager.resident import ResidentGame
+    async def run():
+        class Transport:
+            def __init__(self): self.calls=[]
+            async def call(self,op,payload=None):
+                self.calls.append(op)
+                raise RetryableTaskError("目标已变化")
+        transport=Transport();game=ResidentGame(transport)
+        with pytest.raises(RetryableTaskError):
+            await getattr(game,"tomb_"+mode)("sanshi",101)
+        assert transport.calls==["tomb_"+mode]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["sanshi", "artifact"])
+def test_raid_retries_twice_on_confirmed_loss_without_spending_attempts_then_changes_target(kind):
+    async def run():
+        game=FakeGame();original=game.tomb_raid
+        async def raid(which,target_id):
+            game.win=target_id!=102
+            return await original(which,target_id)
+        game.tomb_raid=raid
+        task=make_task(game,"raid",kind)
+        result=await task(context(kind,"raid"))
+        assert result.status=="success"
+        assert [call[2] for call in game.calls if call[0]=="raid"]==[102,102,102,103,103]
+        assert task.failed_ids=={102}
+        assert not task.uncertain
+    asyncio.run(run())
+
+
+def test_retry_victory_clears_loss_streak_and_does_not_blacklist():
+    async def run():
+        game=FakeGame();original=game.tomb_raid;attempt=0
+        async def raid(kind,target_id):
+            nonlocal attempt
+            attempt+=1;game.win=attempt>=3
+            return await original(kind,target_id)
+        game.tomb_raid=raid
+        task=make_task(game,"raid")
+        await task(context())
+        assert [call[2] for call in game.calls if call[0]=="raid"]==[102]*4
+        assert task.failed_ids==set() and task.loss_streaks=={}
+    asyncio.run(run())
+
+
+def test_persisted_loss_history_survives_restart_and_is_scoped_by_role_and_kind(tmp_path):
+    from package.daily_tasks.tomb_history import TombRaidHistory
+    async def run():
+        history=TombRaidHistory(tmp_path/'history.json')
+        game=FakeGame();game.win=False
+        async def identity():return {'player_id':'my-role'}
+        game.identity=identity
+        task=tomb_module().TombRaidTask(game,'sanshi',history=history)
+        await task(context())
+        assert history.load('my-role','sanshi')=={102:3,103:3}
+        game.calls.clear();game.win=True
+        reloaded=tomb_module().TombRaidTask(game,'sanshi',history=TombRaidHistory(history.path))
+        await reloaded(context())
+        assert not any(call[0]=='raid' for call in game.calls)
+        game.calls.clear()
+        other_kind=tomb_module().TombRaidTask(game,'artifact',history=history)
+        await other_kind(context('artifact','raid'))
+        assert any(call[0]=='raid' for call in game.calls)
+        async def other_identity():return {'player_id':'other-role'}
+        game.identity=other_identity;game.calls.clear()
+        await reloaded(context())
+        assert any(call[0]=='raid' for call in game.calls)
+        assert history.load('my-role','sanshi')=={102:3,103:3}
+    asyncio.run(run())
+
+
+def test_corrupt_history_does_not_silently_clear_blacklist_or_attack(tmp_path):
+    from package.daily_tasks.tomb_history import TombRaidHistory
+    async def run():
+        path=tmp_path/'history.json';path.write_text('not-json')
+        game=FakeGame()
+        async def identity():return {'player_id':'my-role'}
+        game.identity=identity
+        task=tomb_module().TombRaidTask(game,'sanshi',history=TombRaidHistory(path))
+        result=await task(context())
+        assert result.status=='waiting'
+        assert not any(call[0]=='raid' for call in game.calls)
+        assert path.read_text()=='not-json'
+    asyncio.run(run())
+
+
+
+def test_loss_retry_respects_remaining_quota_and_continues_streak_next_round():
+    async def run():
+        game=FakeGame();game.targets['sanshi']=[{'id':102,'site_num':20,'can_fill':False}]
+        async def paid_loss(kind,target_id):
+            game.record('raid',kind,target_id)
+            game.states[kind]['raid_remaining']-=1
+            return {'confirmed':True,'win':False}
+        game.tomb_raid=paid_loss
+        task=make_task(game,'raid')
+        await task(context())
+        assert task.loss_streaks=={102:2} and not task.failed_ids
+        game.states['sanshi']['raid_remaining']=2
+        await task(context())
+        assert task.failed_ids=={102}
+        assert len([call for call in game.calls if call[0]=='raid'])==3
     asyncio.run(run())

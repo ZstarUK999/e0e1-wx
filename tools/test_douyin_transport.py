@@ -245,3 +245,20 @@ def test_shutdown_detaches_waiter_without_replaying_command(tmp_path):
         with pytest.raises(ContextDestroyed):
             await transport._rpc('ping')
     asyncio.run(run())
+
+
+
+def test_overlay_control_bypasses_busy_file_command_lock_and_checks_identity(tmp_path):
+    async def run():
+        cache,_,_=cache_fixture(tmp_path);cache.prepare()
+        live(cache,resident='resident',automation={'run_id':'run','stop_requested':True})
+        transport=DouyinTransport(cache);await transport.connect()
+        transport.session_id='resident'
+        async with transport._file_lock:
+            reply=await asyncio.wait_for(transport.automation_overlay({'run_id':'run','active':True}),.2)
+        assert reply['stop_requested']
+        command=json.loads(cache.mailbox('automation').read_text(encoding='utf-8'))
+        assert command['resident']=='resident' and command['runtime']==transport.runtime
+        live(cache,resident='other')
+        assert await transport.automation_overlay({'active':False}) is None
+    asyncio.run(run())

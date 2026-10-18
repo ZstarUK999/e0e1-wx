@@ -153,7 +153,6 @@ class TaskPanel(QGroupBox):
         elif task_id.endswith("_raid"):
             self._integer("params.minimum_tombs", "单个目标最少可盗墓数", params.get("minimum_tombs", 16))
             self._number("params.rescan_seconds", "未找到目标时重扫（秒）", params.get("rescan_seconds", 60))
-            self._bool("params.skip_failed_players", "当前会话跳过战败目标", params.get("skip_failed_players", True))
         elif task_id.endswith("_fill"):
             note = QLabel("有剩余次数且目标可以填土就执行，不设置墓葬数量门槛。")
             note.setWordWrap(True)

@@ -10,6 +10,7 @@
   const runtime = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
   let lastSequence = 0;
   let busy = false, stopped = false, lastError = '';
+  let lastAutomationAt = 0;
   function read(name) {
     try { return JSON.parse(fs.readFileSync(prefix + name + '.json', 'utf8')); }
     catch (_) { return null; }
@@ -79,6 +80,7 @@
     if(!request || request.token!==token || request.runtime!==runtime || !resident || request.resident!==resident.id)return;
     shutdownHandled=true;stopped=true;resident.stopped=true;
     releaseKeepAlive();
+    if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
     try {if(g.e0e1Season && typeof g.e0e1Season.stop==='function')Promise.resolve(g.e0e1Season.stop()).catch(e=>{lastError=errorText(e);});}catch(e){lastError=errorText(e);}
     try {if(typeof g.treasureMapOverlayOff==='function')g.treasureMapOverlayOff();if(g.e0e1Perf)g.e0e1Perf.stop();}catch(e){lastError=errorText(e);}
     Promise.resolve().then(()=>stopDamage()).catch(e=>{lastError=errorText(e);});
@@ -89,6 +91,12 @@
   }
   function heartbeatBody() {
     applyShutdown();
+    const control=read('automation'),overlay=g.__e0e1AutomationOverlay,resident=g.__e0e1PluginRuntime;
+    if(!stopped && overlay && resident && control && control.token===token && control.runtime===runtime && control.resident===resident.id &&
+       Number.isFinite(control.at) && Date.now()-control.at>=0 && Date.now()-control.at<5000 && control.at!==lastAutomationAt) {
+      lastAutomationAt=control.at;
+      Promise.resolve(overlay.update(control.payload)).catch(e=>{lastError=errorText(e);});
+    }
     maintainKeepAlive();
     let hall = false;
     let playerId = '';
@@ -101,7 +109,7 @@
     try {
       write('state', {token, build, runtime, appid: 'tt310e47b3ae06acc002', at: Date.now(),
         game, hall, busy, lastSequence, resident: g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.id || null,
-        protocol: 'static-v1', player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
+        protocol: 'static-v1', automation: g.__e0e1AutomationOverlay ? g.__e0e1AutomationOverlay.snapshot() : null, player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
     } catch (e) { lastError = errorText(e); }
   }
   function receipt(value) { return typeof value === 'string' ? JSON.parse(value) : value; }
@@ -185,7 +193,7 @@
       try { write('response', {token, runtime, id: command.id, ok: false, error: '回执序列化或写入失败: ' + lastError}); } catch (_) {}
     } finally { busy = false; heartbeat(); }
   }
-  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;releaseKeepAlive();
+  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;releaseKeepAlive();if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
     try {if(typeof g.tt.offHide==='function')g.tt.offHide(onHide);if(typeof g.tt.offShow==='function')g.tt.offShow(onShow);
       if(screenWrapper && g.tt.setKeepScreenOn===screenWrapper)g.tt.setKeepScreenOn=screenOriginal;} catch (_) {}
     clearInterval(tick);clearInterval(pulse);clearInterval(replay); }};

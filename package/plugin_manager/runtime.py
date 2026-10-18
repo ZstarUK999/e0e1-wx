@@ -49,6 +49,8 @@ class PluginRuntime(QObject):
         self._poll_job = None
         self._shutdown_job = None
         self._handshake_job = None   # 后台登录上报；纯上报，失败不影响使用
+        self._next_overlay_sync = 0.0
+        self._overlay_error = False
         self._next_energy = 0.0
         self._next_summary = time.monotonic() + 3600
         self._player_snapshot = None
@@ -134,11 +136,47 @@ class PluginRuntime(QObject):
             return
         self.automation.begin(task_id, manual=True)
 
+    async def _sync_automation_overlay(self):
+        sync = getattr(self.transport, 'automation_overlay', None)
+        if not sync or not self.state.installed or not self.transport.connected or time.monotonic() < self._next_overlay_sync:
+            return
+        self._next_overlay_sync = time.monotonic() + 1.0
+        active = self.automation.active
+        payload = {'run_id': self.automation.run_id,
+                   'active': self.automation.running or self.automation.stopping,
+                   'task': '',
+                   'phase': 'running' if active else 'waiting',
+                   'status': '等待当前操作安全收尾' if self.state.stop_operation else '等待下一项定时任务'}
+        if active:
+            from package.daily_tasks.config import parse_config
+            payload['task'] = parse_config(self.window.store.snapshot()['daily']).tasks[active].name
+        elif self.automation.running and not self.state.blocked:
+            upcoming = self.automation.next_check(datetime.now(BEIJING))
+            payload['next_task'] = upcoming['name'] if upcoming else ''
+            payload['next_check_at'] = (time.time() + upcoming['delay_seconds']) * 1000 if upcoming else None
+            payload['status'] = '当前没有启用的定时任务' if upcoming is None else '本轮已完成，正在等待下次检查'
+        if self.state.blocked:
+            payload.update(phase='paused', status='托管已暂停：' + self.state.blocked)
+        elif self.automation.stopping:
+            payload['phase'] = 'stopping'
+        try:
+            reply = await sync(payload)
+            if (isinstance(reply, dict) and reply.get('run_id') == self.automation.run_id
+                    and reply.get('stop_requested') and self.automation.running):
+                LOG.info('游戏内按钮请求退出日常托管')
+                self.automation.set_automation(False)
+            self._overlay_error = False
+        except Exception as exc:
+            if not self._overlay_error:
+                LOG.warning('游戏托管状态浮层暂不可用：%s', exc)
+            self._overlay_error = True
+
     async def poll(self):
         if self.state.closing or self._poll_lock.locked():
             return
         async with self._poll_lock:
             try:
+                await self._sync_automation_overlay()
                 if not await self.session.process_available():
                     # 微信都没起来，frida 也无从挂起，这里就是在等玩家打开游戏。
                     self.window.set_connection(connected=False, message=f'等待{self.platform_name}小游戏运行（不会主动打开）')
@@ -200,6 +238,8 @@ class PluginRuntime(QObject):
                         self.state.blocked = ''
                         self.state.blocked_session = None
                     self.state.configured = None
+                    self._next_overlay_sync = 0.0
+                    self._overlay_error = False
                     self._next_energy = 0.0
                 if not await self._ensure_authorized():
                     return
@@ -369,6 +409,9 @@ class PluginRuntime(QObject):
 
     def request_shutdown(self):
         if self._shutdown_job is None:
+            # 抖音已有明确退出等待上限；其他平台显示估计值，仍以实际收尾为准。
+            if hasattr(self.transport, 'detach_for_shutdown'):
+                self.window.set_shutdown_estimate(self.transport.shutdown_timeout + 1.0)
             self.state.closing = True
             self.state.stop_operation = True
             self.timer.stop()

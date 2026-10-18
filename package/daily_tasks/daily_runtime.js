@@ -14,9 +14,11 @@ function createDailyRuntime(g,h) {
   const self=kind=>kind==='sanshi'?g.ROLE.mine:g.ROLE.artifactMine;
   async function minePage(kind) {
     const {cfg}=config(), index=kindNumber(kind), root=await h.open(cfg.MineUI);
+    const view=h.ui().find(cfg.MineUI);
+    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏页面打开尚未完成');
     if (root._mineType!==index) await h.click(index===0?root.view.btn_sanshi:root.view.btn_magic_artifact);
     const page=index===0?root.view.mine_sanshi:root.view.mine_magic_artifact;
-    await h.wait(()=>page && page.node.activeInHierarchy!==false,'墓藏页面未就绪');
+    await h.wait(()=>root._mineType===index && page && page.node.activeInHierarchy!==false,'墓藏页面未就绪');
     return page;
   }
   async function items(page) {
@@ -46,8 +48,11 @@ function createDailyRuntime(g,h) {
     });
     return result===null?null:result/1000;
   }
-  async function state(kind) {
-    const page=await minePage(kind), list=await items(page), own=self(kind);
+  async function state(kind,countsOnly) {
+    kindNumber(kind);
+    const list=countsOnly?[]:await items(await minePage(kind)), own=self(kind);
+    if (!own || !Number.isFinite(own.battleNumDay) || !Number.isFinite(own.helpNumDay))
+      throw fail('墓藏次数尚未同步');
     const {data}=config();
     const constant=kind==='sanshi'?data.MineCfg:data.ArtifactMineCfg;
     const constants=constant && constant.config;
@@ -85,7 +90,7 @@ function createDailyRuntime(g,h) {
     if (!button) throw fail('页面关闭按钮未核实');
     await h.click(button);
     if (view.waitAfterClose) await h.bounded(view.waitAfterClose,'页面关闭未完成');
-    else await h.wait(()=>!h.ui().findOpen(which),'页面关闭未完成');
+    await h.wait(()=>!h.ui().findOpen(which),'页面关闭未完成');
   }
   async function recruit(kind) {
     if (!(g.ROLE.legion && g.ROLE.legion.legionId>0)) throw fail('未加入阴司，无法正常招募','rejected');
@@ -125,26 +130,51 @@ function createDailyRuntime(g,h) {
     const end=Date.now()+3000;
     while (Date.now()<end) {
       const current=(screen._dataList||[]).map(item=>item.id).join(',');
-      if (current && current===previous) return current;
+      if (current===previous) return current;
       previous=current;
       await new Promise(resolve=>setTimeout(resolve,150));
     }
     return previous||'';
   }
-  async function targets(kind,mode,refresh,minimum) {
-    const page=await minePage(kind),{cfg,Button}=config();
+  async function targets(kind,mode,refresh,minimum,excludeIds,preferredId) {
+    const {cfg,Button}=config();
     const tab=mode==='fill'?1:0;
     minimum=Number(minimum)||0;
-    await h.click(page.btn_other);
+    // 目标页有官方列表入口，不必为打开列表绕回大厅。
+    const otherRoot=h.ui().findOpen(cfg.MineOtherUI);
+    let existing=h.ui().findOpen(cfg.MineListUI);
+    if (existing && existing.mineType!=null && existing.mineType!==kindNumber(kind)) {
+      await closeScreen(cfg.MineListUI);existing=null;
+    }
+    if (!existing) {
+      await h.observe([mineService(kind).getNeighbors],async()=>{
+        if (otherRoot && otherRoot._openMineType===kindNumber(kind)) await h.click(otherRoot.view.btn_list);
+        else {
+          if (otherRoot) await closeScreen(cfg.MineOtherUI);
+          const page=await minePage(kind);
+          await h.click(page.btn_other);
+        }
+      },()=>{
+        const screen=h.ui().findOpen(cfg.MineListUI);
+        return screen && screen._curSelect>=0 && Array.isArray(screen._dataList);
+      });
+    }
     const screen=await h.wait(()=>h.ui().findOpen(cfg.MineListUI),'墓葬目标列表未打开');
+    const view=h.ui().find(cfg.MineListUI);
+    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏列表打开尚未完成');
+    await settleList(screen);
     if (screen._curSelect!==tab) {
-      await h.observe([mineService(kind).getNeighbors],()=>h.click(screen.view.btnTabGroup.children[tab].getComponent(Button)),()=>screen._curSelect===tab);
+      const before=screen._dataList;
+      await h.observe([mineService(kind).getNeighbors],()=>h.click(screen.view.btnTabGroup.children[tab].getComponent(Button)),
+        ()=>screen._curSelect===tab && screen._dataList!==before);
+      await settleList(screen);
     }
     // 刷新会整批换掉列表：只有当前列表里的目标才点得进去，所以刷到达标目标就立刻停。
     const discovered=new Set(), everSeen=new Set();
     let count=0, list=screen._dataList||[];
     const current=()=>rowsOf(list,mode);
-    const reached=()=>{ const best=bestOf(current()); return !!(minimum>0 && best && best.site_num>=minimum); };
+    const excluded=new Set(excludeIds||[]);
+    const reached=()=>current().some(item=>!excluded.has(item.id) && (!preferredId || item.id===preferredId) && minimum>0 && item.site_num>=minimum);
     const note=(label)=>{ if (h.log) h.log(label); };
     if (reached()) note(`${kind==='sanshi'?'三尸':'法器'}墓当前列表已有≥${minimum}棺的目标，无需刷新`);
     // 多轮刷新只用于盗掠扫描；填土仍只取一次列表，避免超出任务超时。
@@ -175,23 +205,45 @@ function createDailyRuntime(g,h) {
     }
     return {targets:current(),refresh_count:count,new_players:discovered.size,reached_minimum:reached()};
   }
-  async function other(kind,id) {
-    const {cfg}=config();let screen=h.ui().findOpen(cfg.MineListUI);
-    if (!screen) {await targets(kind,'raid',false);screen=h.ui().findOpen(cfg.MineListUI);}
+  async function readyOther(root,kind,id) {
+    const view=h.ui().find(config().cfg.MineOtherUI);
+    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'目标墓藏打开尚未完成');
+    return await h.wait(()=>{
+      const page=root && (kind==='sanshi'?root.view.mine_other_sanshi:root.view.mine_other_magic_artifact);
+      return page && (!page.node || page.node.activeInHierarchy!==false) &&
+        page._targetId===id && page._loadedTargetId===id && !page._helpBusy &&
+        page.btn_help && page.btn_help.interactable!==false && page;
+    },'目标墓藏信息仍在加载或目标不匹配');
+  }
+  async function other(kind,id,mode) {
+    const {cfg}=config();const active=h.ui().findOpen(cfg.MineOtherUI);
+    const activePage=active && (kind==='sanshi'?active.view.mine_other_sanshi:active.view.mine_other_magic_artifact);
+    if (activePage && active._mineType!==undefined && active._mineType!==kindNumber(kind)) {
+      await closeScreen(cfg.MineOtherUI);
+    } else if (activePage && activePage._targetId===id) return await readyOther(active,kind,id);
+    let screen=h.ui().findOpen(cfg.MineListUI);
+    if (!screen || screen._curSelect!==(mode==='fill'?1:0)) {
+      await targets(kind,mode,false);screen=h.ui().findOpen(cfg.MineListUI);
+    }
     const index=screen._dataList.findIndex(t=>t.id===id);
     if (index<0) throw fail('目标已不在当前UI列表','rejected');
     const node=await h.listNode(screen.view.list_record,index),Type=await h.uiClass('mine-list-item.ts','MineListItem');
-    await h.click(node.getComponent(Type).btn_goto);
+    const item=await h.wait(()=>{
+      const rendered=node.getComponent(Type);
+      return rendered && rendered._data && rendered._data.id===id && rendered;
+    },'目标列表条目仍在更新');
+    if (!screen._dataList[index] || screen._dataList[index].id!==id) throw fail('目标列表已更新，请重新扫描','rejected');
+    await h.click(item.btn_goto);
     const root=await h.wait(()=>h.ui().findOpen(cfg.MineOtherUI),'目标墓藏页未打开');
-    const page=kind==='sanshi'?root.view.mine_other_sanshi:root.view.mine_other_magic_artifact;
-    await h.wait(()=>page && page.btn_help && page.btn_help.interactable!==false,'目标墓藏信息仍在加载');
-    return page;
+    return await readyOther(root,kind,id);
   }
   async function fill(kind,id) {
-    const before=self(kind).helpNumDay,page=await other(kind,id);
+    const before=self(kind).helpNumDay,page=await other(kind,id,'fill');
     if (!page._sameLegion) throw fail('当前目标不是可正常填土的同阴司玩家','rejected');
     const response=await h.observe([mineService(kind).legionHelp],()=>h.click(page.btn_help),()=>self(kind).helpNumDay>before);
     await h.dismissRewards(response && response.items && response.items.length>0);
+    try { await readyOther(h.ui().findOpen(config().cfg.MineOtherUI),kind,id); }
+    catch(e) { throw fail('填土已确认，但目标页尚未完成刷新，停止重复操作','uncertain'); }
     return {confirmed:true};
   }
   // 结算页没有已核实的关闭按钮时，按用户操作习惯点击页面空白处退出。
@@ -238,12 +290,19 @@ function createDailyRuntime(g,h) {
     return await resultScreen(resultCfg);
   }
   async function raid(kind,id) {
-    const page=await other(kind,id),{cfg}=config();
+    const page=await other(kind,id,'raid'),{cfg}=config();
     if (page._sameLegion) throw fail('同阴司目标不可盗掠','rejected');
     const battleCfg=await battle('MineBattleUI');
     if (!battleCfg) throw fail('战斗界面配置未解析，未发起盗掠','unavailable');
     await h.observe([mineService(kind).startRob],()=>h.click(page.btn_help,{waitCompletion:false}),()=>!!h.ui().findOpen(battleCfg));
-    return await waitBattleResult(cfg.MinePveBattleResultUI);
+    const receipt=await waitBattleResult(cfg.MinePveBattleResultUI);
+    // 官方结算关闭回调会打开 MainUI 再 gotoMine；等待它完成，避免抢先另开一遍。
+    try {
+      await h.wait(()=>h.ui().findOpen(cfg.MineUI),'盗掠结算后尚未返回墓藏');
+      const view=h.ui().find(cfg.MineUI);
+      if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏返回动画尚未完成');
+    } catch(e) { throw fail('盗掠已结算，但返回墓藏尚未完成','uncertain'); }
+    return receipt;
   }
   async function arenaPage() {
     const screen=await h.open(config().cfg.ArenaUI);
@@ -283,11 +342,11 @@ function createDailyRuntime(g,h) {
     return await waitBattleResult(cfg.ArenaBattleResultUI);
   }
   return {async dispatch(op,args) {
-    if(op==='tomb_state')return await state(args.kind);
+    if(op==='tomb_state')return await state(args.kind,args.counts_only);
     if(op==='tomb_collect')return await collect(args.kind);
     if(op==='tomb_start')return await start(args.kind);
     if(op==='tomb_recruit')return await recruit(args.kind);
-    if(op==='tomb_targets')return await targets(args.kind,args.mode,args.refresh,args.minimum);
+    if(op==='tomb_targets')return await targets(args.kind,args.mode,args.refresh,args.minimum,args.exclude_ids,args.preferred_id);
     if(op==='tomb_fill')return await fill(args.kind,args.id);
     if(op==='tomb_raid')return await raid(args.kind,args.id);
     if(op==='arena_state')return await arenaState();

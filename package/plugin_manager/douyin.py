@@ -78,12 +78,14 @@ class DouyinCache:
         core = '\n'.join((package/'daily_tasks'/name).read_text(encoding='utf-8-sig')
                          for name in ('daily_runtime.js','sweep_runtime.js'))
         core += '\n' + (manager/'desire_runtime.js').read_text(encoding='utf-8-sig')
+        core += '\n' + (manager/'automation_overlay.js').read_text(encoding='utf-8-sig')
         resident = core + r'''
 if (g.__e0e1PluginRuntime) return {resident_id:g.__e0e1PluginRuntime.id,capabilities:['energy']};
 const api=createEnergyRuntime(g);
+g.__e0e1AutomationOverlay=createAutomationOverlay(g);
 const resident={id,config:null,stopped:false,pending:false,async dispatch(op,args){
   if(op==='configure'){this.config=args;return {status:'ok',value:true};}
-  if(op==='stop'){this.stopped=true;return {status:'ok',value:true};}
+  if(op==='stop'){g.__e0e1AutomationOverlay.destroy();this.stopped=true;return {status:'ok',value:true};}
   if(this.stopped&&!['inspect','capture','restore','home'].includes(op))return {status:'unavailable',message:'插件已停止'};
   if(this.pending)return {status:'uncertain',message:'上一条命令尚未结束'};
   this.pending=true;
@@ -296,6 +298,15 @@ class DouyinTransport(PluginTransport):
             if until is not None and time.monotonic() >= until:
                 raise asyncio.TimeoutError('抖音命令终态未确认，不会重发；请保持游戏运行')
             await asyncio.sleep(.05)
+
+    async def automation_overlay(self, payload):
+        # 与 heartbeat 共用状态文件，不进入可能正在等待业务回执的 _file_lock。
+        status = self.cache.status()
+        if not status or status.get('runtime') != self.runtime or status.get('resident') != self.session_id:
+            return None
+        atomic_json(self.cache.mailbox('automation'), {'token': self.cache.token,
+                    'runtime': self.runtime, 'resident': self.session_id, 'at': time.time() * 1000, 'payload': payload})
+        return status.get('automation')
 
     async def _evaluate(self, *args, **kwargs):
         raise RuntimeError('抖音静态通道不执行动态 JS')

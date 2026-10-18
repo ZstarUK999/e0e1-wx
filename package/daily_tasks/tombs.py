@@ -97,7 +97,9 @@ class _TombTask:
         return TaskResult("waiting", f"{self.name}墓{reason}，距跨日还有{timing.describe(seconds)}", delay)
 
     async def _state(self, *fields: str) -> dict:
-        state = await self.game.tomb_state(self.kind)
+        read = (getattr(self.game, "tomb_counts", self.game.tomb_state)
+                if fields and all(field.endswith("_remaining") for field in fields) else self.game.tomb_state)
+        state = await read(self.kind)
         if not isinstance(state, dict) or type(state.get("ready")) is not bool:
             raise RetryableTaskError(f"{self.name}墓状态缺少明确就绪标记")
         if state["ready"]:
@@ -110,8 +112,10 @@ class _TombTask:
                     raise RetryableTaskError(f"{self.name}墓{field}状态不是明确布尔值")
         return state
 
-    async def _targets(self, mode: str, minimum: int = 0) -> tuple[list[dict], dict]:
-        payload = await self.game.tomb_targets(self.kind, mode, refresh=True, minimum=minimum)
+    async def _targets(self, mode: str, minimum: int = 0, exclude_ids=None, preferred_id=None) -> tuple[list[dict], dict]:
+        payload = await self.game.tomb_targets(self.kind, mode, refresh=True, minimum=minimum,
+                                               **({"exclude_ids": exclude_ids} if exclude_ids else {}),
+                                               **({"preferred_id": preferred_id} if preferred_id else {}))
         scan = {}
         if isinstance(payload, dict):
             scan = {key: payload.get(key, 0) for key in ("refresh_count", "new_players")}
@@ -166,11 +170,30 @@ class TombCycleTask(_TombTask):
 
 
 class TombRaidTask(_TombTask):
-    def __init__(self, game, kind: str, failed_ids: set[int] | None = None) -> None:
+    def __init__(self, game, kind: str, failed_ids: set[int] | None = None, history=None) -> None:
         super().__init__(game, kind)
         self.failed_ids = failed_ids if failed_ids is not None else set()
+        self.loss_streaks = {}
+        self.history = history
+        self._owner = None
+
+    async def _load_history(self):
+        if self.history is None:
+            return
+        identity = await self.game.identity()
+        owner = str(identity.get("player_id") or "") if isinstance(identity, dict) else ""
+        if not owner:
+            raise RetryableTaskError("当前角色ID尚未确认，不能读取墓藏战败名单")
+        if owner != self._owner:
+            self.loss_streaks = self.history.load(owner, self.kind)
+            self.failed_ids.clear()
+            self.failed_ids.update(key for key, count in self.loss_streaks.items() if count >= 3)
+            self._owner = owner
+            if self.failed_ids:
+                LOG.info("%s墓已读取角色%s的打不过名单：%d名玩家，后续跳过", self.name, owner, len(self.failed_ids))
 
     async def _perform(self, ctx: TaskContext) -> TaskResult:
+        await self._load_history()
         state = await self._state("raid_remaining")
         if ctx.stop_requested():
             return TaskResult("waiting", "已请求停止")
@@ -179,13 +202,15 @@ class TombRaidTask(_TombTask):
         if state["raid_remaining"] == 0:
             return self._wait_for_cross_day(ctx, state, "今日盗掠次数已用完")
         minimum = ctx.task.params.get("minimum_tombs", 16)
-        skip_failed = ctx.task.params.get("skip_failed_players", True)
         wins, losses = 0, 0
+        refused = set()
+        retry_target = None
         # 只要还有次数就继续打：每轮重新读次数，打完立刻判断能不能再来一次。
         while state["raid_remaining"] > 0:
             if ctx.stop_requested():
                 return TaskResult("waiting", "已请求停止")
-            targets, scan = await self._targets("raid", minimum)
+            excluded = refused | self.failed_ids
+            targets, scan = await self._targets("raid", minimum, excluded, retry_target)
             if ctx.stop_requested():
                 return TaskResult("waiting", "已请求停止")
             best = max(targets, key=lambda item: item["site_num"], default=None)
@@ -193,29 +218,54 @@ class TombRaidTask(_TombTask):
                      self.name, scan.get("refresh_count", 0), scan.get("new_players", 0),
                      _label(best) if best else "无", best["site_num"] if best else 0, minimum,
                      state["raid_remaining"])
-            target = next((item for item in targets if item["site_num"] >= minimum
-                           and (not skip_failed or item["id"] not in self.failed_ids)), None)
+            eligible = [item for item in targets if item["site_num"] >= minimum and item["id"] not in excluded]
+            target = next((item for item in eligible if item["id"] == retry_target), None)
+            target = target or next(iter(eligible), None)
             if target is None:
                 break
             target_id = target["id"]
-            receipt = _confirmed(await self.game.tomb_raid(self.kind, target_id), f"{self.name}墓盗掠")
+            before = state["raid_remaining"]
+            try:
+                receipt = _confirmed(await self.game.tomb_raid(self.kind, target_id), f"{self.name}墓盗掠")
+            except RetryableTaskError as exc:
+                refused.add(target_id)
+                retry_target = None
+                LOG.warning("%s墓盗掠目标%s未执行，重新扫描其他目标：%s", self.name, _label(target), exc)
+                continue
             if type(receipt.get("win")) is not bool:
                 raise ExecutionUncertain(f"{self.name}墓盗掠胜负未确认，禁止重复调用")
             if not receipt["win"]:
-                self.failed_ids.add(target_id)
                 losses += 1
-                LOG.warning("%s墓盗掠玩家%s战败，已加入当前会话失败名单", self.name, _label(target))
+                count = min(3, self.loss_streaks.get(target_id, 0) + 1)
+                self.loss_streaks[target_id] = count
+                if count >= 3:
+                    self.failed_ids.add(target_id)
+                    refused.add(target_id)
+                    retry_target = None
+                    LOG.warning("%s墓盗掠玩家%s连续战败3次，标记打不过，后续跳过该玩家", self.name, _label(target))
+                else:
+                    retry_target = target_id
+                    LOG.warning("%s墓盗掠玩家%s第%d/3次战败，优先重新寻找该玩家，最多再试%d次",
+                                self.name, _label(target), count, 3-count)
             else:
                 wins += 1
+                self.loss_streaks.pop(target_id, None)
+                self.failed_ids.discard(target_id)
+                retry_target = None
                 LOG.info("%s墓盗掠玩家%s胜利已确认", self.name, _label(target))
+            if self.history is not None:
+                self.history.save(self._owner, self.kind, self.loss_streaks)
             # 打完重新确认还剩几次，不用本地推算。
             state = await self._state("raid_remaining")
             if not state["ready"]:
                 return TaskResult("waiting", f"{self.name}墓界面尚未就绪")
+            # 已确认战败可能不扣盗掠次数；三次战败上限负责阻止死循环。
+            if state["raid_remaining"] > before or (receipt["win"] and state["raid_remaining"] >= before):
+                raise ExecutionUncertain(f"{self.name}墓盗掠已结算但次数未减少，停止重复操作")
         if wins == 0 and losses == 0:
             LOG.info("%s墓本轮没有可盗掠目标（门槛%d），等待下次扫描", self.name, minimum)
             return TaskResult("waiting", f"{self.name}墓暂无单玩家墓数≥{minimum}的可盗掠目标，等待下次扫描",
-                              ctx.task.params.get("rescan_seconds", 60))
+                              ctx.task.retry_seconds if refused else ctx.task.params.get("rescan_seconds", 60))
         LOG.info("%s墓本轮盗掠完成：胜%d次、负%d次，剩余%d次", self.name, wins, losses, state["raid_remaining"])
         return TaskResult("success" if wins else "waiting",
                           f"{self.name}墓本轮盗掠完成：胜{wins}次、负{losses}次，剩余{state['raid_remaining']}次")
@@ -268,8 +318,12 @@ class TombFillTask(_TombTask):
                 refused.add(candidate["id"])
                 continue
             filled.append(candidate["id"])
+            before = state["fill_remaining"]
+            state = await self._state("fill_remaining")
+            if not state["ready"] or state["fill_remaining"] >= before:
+                raise ExecutionUncertain(f"{self.name}墓填土已确认但次数未减少，停止重复操作")
             LOG.info("%s墓为%s填土已确认，本轮剩余填土次数%d", self.name, _label(candidate),
-                     max(state["fill_remaining"] - 1, 0))
+                     state["fill_remaining"])
         if not filled:
             detail = f"，被拒绝{len(refused)}个" if refused else ""
             return TaskResult("waiting", f"{self.name}墓本轮没有成功填土的目标{detail}",

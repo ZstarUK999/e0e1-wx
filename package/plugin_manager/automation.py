@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 
 from package.daily_tasks.config import parse_config
 from package.daily_tasks.energy import EnergyTask
@@ -16,6 +17,7 @@ from package.daily_tasks.scheduler import BEIJING, ExecutionUncertain, Retryable
 from package.daily_tasks.offline_reward import OfflineRewardTask
 from package.daily_tasks.arena import ArenaTask
 from package.daily_tasks.tombs import TombCycleTask, TombFillTask, TombRaidTask
+from package.daily_tasks.tomb_history import TombRaidHistory
 from package.plugin_manager.resident import ResidentGame
 
 from .feature_flags import task_enabled
@@ -30,10 +32,13 @@ class AutomationScheduler:
         self.state = state
         self.view = view
         self.running = False
+        self.run_id = ""
+        self.stopping = False
         self.operation = None
         self._handlers = {}
         self._task_due = {}
         self._active_task = None
+        self._raid_history = TombRaidHistory(self.view.store.path.with_name('tomb_raid_history.json'))
         self._reset_handlers()
 
     # ── 任务处理器 ──
@@ -47,7 +52,7 @@ class AutomationScheduler:
         }
         for kind in ('sanshi', 'artifact'):
             candidates[kind + '_tombs'] = lambda kind=kind: TombCycleTask(game, kind)
-            candidates[kind + '_raid'] = lambda kind=kind: TombRaidTask(game, kind)
+            candidates[kind + '_raid'] = lambda kind=kind: TombRaidTask(game, kind, history=self._raid_history)
             candidates[kind + '_fill'] = lambda kind=kind: TombFillTask(game, kind)
         # 构建期关掉的任务不注册处理器，pick() 自然也不会挑中它们。
         self._handlers = {key: factory() for key, factory in candidates.items() if task_enabled(key)}
@@ -87,16 +92,68 @@ class AutomationScheduler:
                 LOG.info('自动化未启动：当前会话已暂停，%s', self.state.blocked)
                 self.view.set_automation_running(False)
                 return
+            if self.busy:
+                self.view.set_automation_running(False)
+                return
+            self.stopping = False
+            self.run_id = uuid.uuid4().hex
             self.running = True
             self.state.stop_operation = False
             LOG.info('日常自动化已启动')
         else:
             self.running = False
+            self.stopping = True
             self.state.stop_operation = True
             LOG.info('日常自动化已停止，等待当前操作安全收尾')
+            if not self.busy:
+                self.view.set_operation_running(True)
+                self.operation = asyncio.create_task(self._finish_stopping())
         self.view.set_automation_running(self.running)
 
+    async def _return_home_after_stop(self):
+        if not self.state.installed or self.state.blocked or not self.transport.connected:
+            return
+        try:
+            await self.transport.wait_idle()
+            await self.transport.call('home')
+            LOG.info('日常托管已结束，已确认返回游戏主界面')
+            self.view.action_label.setText('托管已结束，已返回游戏主界面')
+            return True
+        except Exception as exc:
+            LOG.warning('托管已停止，返回主界面尚未确认：%s', exc)
+
+    async def _finish_stopping(self):
+        try:
+            await self._return_home_after_stop()
+        finally:
+            self.stopping = False
+            self.view.set_operation_running(False)
+
     # ── 选择 ──
+
+    def next_check(self, now: datetime) -> dict | None:
+        """下一次调度检查：包含单项延迟和每日时间窗，不承诺届时一定有可执行目标。"""
+        parsed = parse_config(self.view.store.snapshot()['daily'])
+        clock = time.monotonic()
+        candidates = []
+        for key, task in parsed.tasks.items():
+            if not task.enabled or key not in self._handlers:
+                continue
+            delay = max(0.0, self._task_due.get(key, 0) - clock)
+            when = now + timedelta(seconds=delay)
+            if task.schedule.kind == 'daily_window':
+                start, end = task.schedule.start, task.schedule.end
+                current = when.time().replace(tzinfo=None)
+                if current < start:
+                    when = datetime.combine(when.date(), start, now.tzinfo)
+                elif current > end:
+                    when = datetime.combine(when.date() + timedelta(days=1), start, now.tzinfo)
+                delay = max(0.0, (when - now).total_seconds())
+            candidates.append((delay, task.priority, key, task.name))
+        if not candidates:
+            return None
+        delay, _, key, name = min(candidates)
+        return {'task_id': key, 'name': name, 'delay_seconds': delay}
 
     def pick(self, now: datetime) -> str | None:
         """按优先级挑一个到期任务；时间窗任务还要落在窗口内。"""
@@ -157,14 +214,18 @@ class AutomationScheduler:
             self.view.set_connection(connected=self.view.game_connected, target_appid=getattr(self.transport, 'TARGET_APPID', TARGET_APPID), runtime_ready=False)
             LOG.warning('插件任务暂停：%s', exc)
         finally:
+            returned_home = False
+            if self.state.stop_operation:
+                returned_home = await self._return_home_after_stop()
+            self.stopping = False
             self._task_due[task_id] = time.monotonic() + delay
             self.view.task_panels[task_id].runtime_message.setText(message or '任务已收尾')
             self._active_task = None
             self.view.set_operation_running(False)
             if manual:
-                self.view.finish_test(task_id, message or '测试已收尾')
+                self.view.finish_test(task_id, '托管已结束，已返回游戏主界面' if returned_home else message or '测试已收尾')
             else:
-                self.view.action_label.setText(message or '任务已收尾')
+                self.view.action_label.setText('托管已结束，已返回游戏主界面' if returned_home else message or '任务已收尾')
 
     async def wait_operation(self) -> None:
         if self.operation:

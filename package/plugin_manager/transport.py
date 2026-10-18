@@ -173,15 +173,17 @@ class PluginTransport:
             desire_script = Path(__file__).resolve().parent / 'desire_runtime.js'
             source = (scripts.joinpath('daily_runtime.js').read_text(encoding='utf-8') + '\n'
                       + scripts.joinpath('sweep_runtime.js').read_text(encoding='utf-8') + '\n'
-                      + desire_script.read_text(encoding='utf-8'))
+                      + desire_script.read_text(encoding='utf-8') + '\n'
+                      + Path(__file__).with_name('automation_overlay.js').read_text(encoding='utf-8'))
             expression = f'''(() => {{
 {source}
 const id = {json.dumps(sid)};
 if (globalThis.__e0e1PluginRuntime) return {{resident_id: globalThis.__e0e1PluginRuntime.id, capabilities:['energy']}};
 const api = createEnergyRuntime(globalThis);
+globalThis.__e0e1AutomationOverlay = createAutomationOverlay(globalThis);
 const resident = {{id, config: null, stopped:false, pending:false, async dispatch(op, args) {{
   if (op === 'configure') {{ this.config = args; return {{status:'ok', value:true}}; }}
-  if (op === 'stop') {{ this.stopped = true; return {{status:'ok', value:true}}; }}
+  if (op === 'stop') {{ globalThis.__e0e1AutomationOverlay.destroy(); this.stopped = true; return {{status:'ok', value:true}}; }}
   if (this.stopped && !['inspect','capture','restore','home'].includes(op)) return {{status:'unavailable',message:'插件已停止'}};
   if (this.pending) return {{status:'uncertain',message:'上一条命令尚未结束'}};
   this.pending = true;
@@ -424,6 +426,15 @@ return {{resident_id:id, capabilities:['energy']}};
         return await self._evaluate(
             '(() => {const g = globalThis; return typeof g.damageCurveReset === "function" '
             '? String(g.damageCurveReset()) : "采集脚本尚未注入";})()', self.context_id, timeout_ms=10000)
+
+    async def automation_overlay(self, payload):
+        # 独立的纯状态通道；不能排在等待战斗回执的业务锁后面。
+        if not self.connected or not self.session_id or self.context_id is None:
+            return None
+        expression = ("(async()=>{const r=globalThis.__e0e1PluginRuntime,o=globalThis.__e0e1AutomationOverlay;"
+                      "if(!r||r.id!==" + json.dumps(self.session_id) + "||!o)return null;"
+                      "const before=o.snapshot();await o.update(" + json.dumps(payload, ensure_ascii=False) + ");return before;})()")
+        return await self._evaluate(expression, self.context_id, timeout_ms=1000)
 
     async def close(self):
         self.connected = False

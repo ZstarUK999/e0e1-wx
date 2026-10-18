@@ -196,24 +196,35 @@ function createEnergyRuntime(g, timing) {
       if (main && main.waitAfterOpen) await bounded(main.waitAfterOpen,'主界面仍在加载');
       else throw error('主界面尚未加载，不能绕过UI直接创建页面');
     }
-    // 保存原ViewParams后等待完整关闭生命周期，findOpen消失不代表动画已结束。
+    // 关闭回调可能另开玩法/墓藏页：每次关闭后重新读取页面栈。
     const pages=normalPages();
-    const views=Object.values(ui().viewParams || {}).filter(v=>pages.includes(v.cfg) && (v.showing || v.loading)).reverse();
-    for (const view of views) {
+    const pending=()=>Object.values(ui().viewParams || {}).filter(v=>pages.includes(v.cfg) && (v.showing || v.loading));
+    for (let round=0;round<32;round++) {
+      if (blockedViews().length) throw error('返回过程中出现战斗或阻挡页面，停止返回主界面');
+      let views=pending();
+      if (!views.length) {
+        // 给关闭回调打开后继页面的异步生命周期留出一个稳定窗口。
+        await new Promise(resolve=>setTimeout(resolve,100));
+        views=pending();
+        if (!views.length) {
+          if (!safe()) throw error('返回后主界面仍被阻挡：'+blockers().join(', '));
+          return true;
+        }
+      }
+      const view=views[views.length-1];
       const retained=ui().find(view.cfg) || view;
       if (retained.waitAfterOpen) await bounded(retained.waitAfterOpen,'功能页面未完成加载');
       const screen=retained.ui || ui().findOpen(view.cfg);
       if (!screen) throw error('界面实例尚未加载');
-      const currentBlocked=blockedViews();
-      if (screen.battleWorld || screen.battleWorldOther || currentBlocked.length)
+      if (screen.battleWorld || screen.battleWorldOther || blockedViews().length)
         throw error('页面加载后出现战斗或阻挡状态，停止返回主界面');
       await click(closeControl(screen,'close'));
       if (retained.waitAfterClose) await bounded(retained.waitAfterClose,'界面关闭动画未完成');
-      else await wait(()=>!ui().findOpen(view.cfg),'界面关闭未完成');
+      await wait(()=>!ui().findOpen(view.cfg),'界面关闭未完成');
     }
-    if (!safe()) throw error('返回后主界面仍被阻挡：'+blockers().join(', '));
-    return true;
+    throw error('返回主界面的页面跳转次数异常，停止继续关闭');
   }
+
   function serialize(value) {
     if (value instanceof Map || Object.prototype.toString.call(value)==='[object Map]')
       return Array.from(value.entries()).sort((a,b)=>String(a[0]).localeCompare(String(b[0]))).map(([k,v])=>[k,serialize(v)]);
@@ -856,6 +867,14 @@ function createEnergyRuntime(g, timing) {
     configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig}):null;
   return {async dispatch(op, args) {
     args=args || {};
+    const overlay=g.__e0e1AutomationOverlay;
+    const stopAllowed=['inspect','identity','capture','home','restore','player_information','reward_info','tomb_state','arena_state'];
+    if(overlay && overlay.shouldStop() && !stopAllowed.includes(op))
+      return {status:'unavailable',message:'已请求退出托管，未发起新的游戏操作'};
+    if(overlay) {
+      const names={home:'返回主界面',tomb_state:'读取墓藏状态',tomb_targets:'扫描墓藏目标',tomb_fill:'为目标填土',tomb_raid:'盗掠并等待战斗结算',tomb_collect:'收取墓藏',tomb_start:'重新开启墓藏',tomb_recruit:'发布墓藏招募',sweep:'体力扫荡',reward_claim:'领取挂机收益',arena_challenge:'斗法并等待战斗结算',restore:'恢复原方案'};
+      if(names[op])overlay.setOperation(names[op]);
+    }
     const readOnly=['inspect','capture','player_information','reward_info','desire_bag_stats','desire_compose_probe','identity'].includes(op);
     if (guard.busy && !readOnly) return {status:'uncertain',message:'已有正常UI操作未完成'};
     if (guard.uncertain && !readOnly) return {status:'uncertain',message:'前次操作结果未知，需核对恢复记录'};
