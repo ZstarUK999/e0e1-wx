@@ -58,6 +58,7 @@ class PluginServicer(plugin_pb2_grpc.PluginServiceServicer):
                     client_version=request.client_version,
                     remote=remote,
                     player_name=request.player_name,
+                    login_player_id=request.login_player_id,
                 )
                 release = updates_domain.current_release(session)
                 latest = release.version if release is not None else ""

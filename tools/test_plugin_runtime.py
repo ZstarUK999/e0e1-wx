@@ -883,7 +883,11 @@ def test_license_mismatch_keeps_ui_on_gate(app,tmp_path,monkeypatch):
             monkeypatch.setattr(m,'build_info',lambda:build_info_module.BuildInfo('release','1.0.0','localhost:1'))
             monkeypatch.setattr(license_module,'load',lambda:{'player_id':'role-7'})
             monkeypatch.setattr(license_module,'verify',lambda payload:True)
-            monkeypatch.setattr(server_client,'handshake',lambda **kwargs:pytest.fail('门禁没过就不该上报'))
+            reports=[]
+            def rejected_report(**kwargs):
+                reports.append(kwargs)
+                return server_client.HandshakeResult(False,'player_id_mismatch','账号未授权','',False)
+            monkeypatch.setattr(server_client,'handshake',rejected_report)
             original=t.call
             async def call(op,args=None):
                 if op=='identity':return {'player_id':'role-9'}
@@ -894,6 +898,41 @@ def test_license_mismatch_keeps_ui_on_gate(app,tmp_path,monkeypatch):
             assert w.gate.title.text()=='此账号未授权'
             assert 'role-9' in w.gate.detail.text()
             assert c.state.blocked
+            await c._handshake_job
+            assert reports[0]['player_id']=='role-9'
+            await c._ensure_authorized()
+            assert len(reports)==1
+        finally:
+            await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload", [None, {"player_id":"role-7", "signature":"bad"}])
+def test_invalid_or_missing_license_still_reports_login(app,tmp_path,monkeypatch,payload):
+    m=runtime()
+    from package.plugin_manager import build_info as build_info_module, license as license_module, server_client
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        calls=[]
+        try:
+            monkeypatch.setattr(m,'build_info',lambda:build_info_module.BuildInfo('release','1.0.0','localhost:1'))
+            monkeypatch.setattr(license_module,'load',lambda:payload)
+            monkeypatch.setattr(license_module,'verify',lambda _:False)
+            def report(**kwargs):
+                calls.append(kwargs)
+                return server_client.HandshakeResult(False,'invalid_license','授权无效','',False)
+            monkeypatch.setattr(server_client,'handshake',report)
+            original=t.call
+            async def call(op,args=None):
+                if op=='identity':return {'player_id':'role-9','name':'来访玩家','legion_name':'阴司'}
+                return await original(op,args)
+            t.call=call
+            await ready(c,s)
+            assert not w.main_ui_shown and c.state.blocked
+            await c._handshake_job
+            await c._ensure_authorized()
+            assert len(calls)==1
+            assert calls[0]['player_id']=='role-9' and calls[0]['player_name']=='来访玩家'
         finally:
             await c.shutdown();w.close()
     asyncio.run(run())

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import shutil
 import subprocess
@@ -305,6 +306,10 @@ def build_command(
     if exclude_grpc:
         # 调试版不连后台，连 gRPC 一起剔掉，省十几 MB
         command += ["--exclude-module", "grpc"]
+    if not exclude_grpc:
+        command += ["--collect-all", "grpc", "--collect-submodules", "google.protobuf",
+                    "--hidden-import", "package.plugin_manager.grpc_stub.plugin_pb2",
+                    "--hidden-import", "package.plugin_manager.grpc_stub.plugin_pb2_grpc"]
     for source, destination in RESOURCES:
         if not (ROOT / source).exists():
             print(f"[warn] 资源缺失，跳过：{source}")
@@ -318,6 +323,33 @@ def build_command(
         command += ["--add-data", f"{certs_dir};certs"]
     command.append(str(ENTRY))
     return command
+
+
+def check_release_dependencies() -> None:
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    for module in ("grpc", "google.protobuf", "package.plugin_manager.grpc_stub.plugin_pb2_grpc"):
+        try:
+            importlib.import_module(module)
+        except (ImportError, RuntimeError) as exc:
+            raise RuntimeError(f"发行版后台模块不可用：{module}（{exc}）。请先用当前 Python 执行 -m pip install -r requirements.txt") from exc
+
+
+def verify_release_bundle(target: Path, onefile: bool = False) -> None:
+    """校验最终 EXE 内的后台模块；防止复用一个缺模块的旧包。"""
+    from PyInstaller.archive.readers import CArchiveReader
+    executable = target if onefile else target / f"{APP_NAME}.exe"
+    archive = CArchiveReader(str(executable))
+    names = set()
+    for name, entry in archive.toc.items():
+        if entry[-1] == "z":
+            names.update(archive.open_embedded_archive(name).toc)
+    required = {"grpc", "google.protobuf", "package.plugin_manager.grpc_stub.plugin_pb2", "package.plugin_manager.grpc_stub.plugin_pb2_grpc"}
+    missing = required - names
+    if missing:
+        raise RuntimeError("发行包缺少后台模块：" + ", ".join(sorted(missing)) + "；请完整重建，不能使用 --skip-build")
+    if not onefile and not any((target / "_internal").rglob("cygrpc*.pyd")):
+        raise RuntimeError("发行包缺少 gRPC 原生模块 cygrpc，请完整重建")
 
 
 def ensure_pyinstaller() -> None:
@@ -490,6 +522,12 @@ def main() -> int:
         print(f"[warn] 客户端证书不在 {certs_dir}，release 包将连不上后台")
     if release:
         generate_grpc_stub()
+        if not args.dry_run:
+            try:
+                check_release_dependencies()
+            except RuntimeError as exc:
+                print(f"[error] {exc}")
+                return 1
 
     features_file = write_bundle_features(load_features_profile(Path(args.features)))
     build_file = write_build_info(mode=args.mode, version=args.version, target=args.target)
@@ -531,6 +569,13 @@ def main() -> int:
             freed = trim(target / "_internal")
             print(f"裁剪冗余：释放 {freed / 1024 / 1024:.1f} MB")
         report(target)
+
+    if release:
+        try:
+            verify_release_bundle(target, args.onefile)
+        except Exception as exc:
+            print(f"[error] 发行包检查失败：{exc}")
+            return 1
 
     if args.license:
         source = Path(args.license)

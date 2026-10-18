@@ -72,11 +72,23 @@
   const onHide = function(){keepAlive.background=true;keepScreenRequested=false;};
   const onShow = function(){keepAlive.background=false;resumedInBackground=false;keepScreenRequested=false;};
   try {if(typeof g.tt.onHide==='function')g.tt.onHide(onHide);if(typeof g.tt.onShow==='function')g.tt.onShow(onShow);} catch(e){keepAlive.error=errorText(e);}
+  let shutdownHandled = false;
+  function applyShutdown() {
+    if(shutdownHandled)return;
+    const request=read('shutdown'), resident=g.__e0e1PluginRuntime;
+    if(!request || request.token!==token || request.runtime!==runtime || !resident || request.resident!==resident.id)return;
+    shutdownHandled=true;stopped=true;resident.stopped=true;
+    releaseKeepAlive();
+    try {if(g.e0e1Season && typeof g.e0e1Season.stop==='function')Promise.resolve(g.e0e1Season.stop()).catch(e=>{lastError=errorText(e);});}catch(e){lastError=errorText(e);}
+    try {if(typeof g.treasureMapOverlayOff==='function')g.treasureMapOverlayOff();if(g.e0e1Perf)g.e0e1Perf.stop();}catch(e){lastError=errorText(e);}
+    Promise.resolve().then(()=>stopDamage()).catch(e=>{lastError=errorText(e);});
+  }
   function heartbeat() {
     const perf=g.e0e1Perf;
     return perf ? perf.measure('douyin.heartbeat.sync',heartbeatBody,null,[]) : heartbeatBody();
   }
   function heartbeatBody() {
+    applyShutdown();
     maintainKeepAlive();
     let hall = false;
     let playerId = '';
@@ -148,6 +160,7 @@
     }
   }
   async function poll() {
+    applyShutdown();
     if (stopped || busy) return;
     const command = read('command');
     if (!command || command.token !== token || command.runtime !== runtime

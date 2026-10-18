@@ -20,7 +20,7 @@ LICENSE_FILE_NAME = "license.bin"
 
 # 部署公钥（Ed25519 裸 32 字节）；换密钥时用 server/backend/tools/show_pubkey.py 取新值
 LICENSE_PUBLIC_KEY = bytes.fromhex(
-    "d50d263c36b1c026432a077abf14bec97c17b6c9c5ff31944e936f916e9d7aa6"
+    "fd25be6d606b920f86e7ed07c82712fd57fabab18767b02581748baf3faa310d"
 )
 
 # 必须与服务端 domain/license.py 的 canonical_payload 完全一致

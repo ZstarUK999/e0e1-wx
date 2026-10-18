@@ -216,11 +216,14 @@ class _LocalCommands:
 class DouyinTransport(PluginTransport):
     TARGET_APPID = APPID
     platform_name = '抖音 PC'
+    shutdown_timeout = 8.0
 
     def __init__(self, cache):
         self.cache = cache
         self.runtime = None
         self._sequence = 0
+        self._closing_requested = False
+        self._detached = False
         self._pending_file = None
         self._file_lock = asyncio.Lock()
         super().__init__(cdp=_LocalCommands(self))
@@ -254,9 +257,26 @@ class DouyinTransport(PluginTransport):
         return {'appid': APPID, 'ready': bool(status.get('game') and status.get('hall')),
                 'context_id': self.context_id, 'resident_id': status.get('resident')}
 
+    def begin_shutdown(self):
+        """独立于命令队列通知游戏停止本实例；不重发或取消业务请求。"""
+        self._closing_requested = True
+        resident = self.session_id
+        if not resident and self._pending_file and self._pending_file.get('action') == 'install':
+            resident = self._pending_file.get('args', {}).get('id')
+        if resident and self.runtime:
+            atomic_json(self.cache.mailbox('shutdown'), {'token':self.cache.token, 'runtime':self.runtime, 'resident':resident})
+
+    def detach_for_shutdown(self):
+        """只停止本地等待，保留未确认命令记录，不代表远端操作已取消。"""
+        self._detached = True
+        self.connected = False
+        self.invalidate()
+
     async def _reply(self, pending, timeout_ms=None):
         until = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000
         while True:
+            if self._detached:
+                raise ContextDestroyed('插件已退出本地等待；远端操作结果未知，不重发')
             status = self.cache.status()
             if status and status['runtime'] != pending['runtime']:
                 self._pending_file = None
@@ -282,6 +302,9 @@ class DouyinTransport(PluginTransport):
 
     async def _rpc(self, action, args=None, timeout_ms=10000):
         async with self._file_lock:
+            cleanup = action in ('idle', 'damage-stop', 'perf-stop') or (action == 'call' and (args or {}).get('op') == 'stop') or (action == 'season-call' and (args or {}).get('name') == 'stop')
+            if self._detached or self._closing_requested and not cleanup:
+                raise ContextDestroyed('插件正在退出，不再发送新操作')
             if self._pending_file:
                 raise RuntimeError('前次抖音命令未确认，禁止发送新命令')
             if not self.cdp.is_connected():

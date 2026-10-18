@@ -74,9 +74,8 @@ def handshake(*, player_id: str, legion_name: str, player_name: str = "") -> Han
         LOG.info('调试版构建：跳过后台鉴权')
         return HandshakeResult.debug_skip()
 
-    payload = license_module.load()
-    if payload is None:
-        return HandshakeResult(False, "no_license", "缺少授权文件 license.bin", "", False)
+    # 缺少或损坏授权也上报实际登录账号，由服务端裁决并记录。
+    payload = license_module.load() or {}
 
     try:
         return _rpc_handshake(payload, player_id, legion_name, info, player_name)
@@ -129,7 +128,7 @@ def _rpc_handshake(
                 issued_at=str(payload.get("issued_at") or ""),
                 nonce=str(payload.get("nonce") or ""),
                 signature=str(payload.get("signature") or ""),
-                player_ids=payload.get("player_ids", []),
+                player_ids=(payload.get("player_ids") if isinstance(payload.get("player_ids"), list) and all(isinstance(value, str) for value in payload["player_ids"]) else []),
             ),
             login_player_id=str(player_id or ""),
             guild_name=str(legion_name or ""),

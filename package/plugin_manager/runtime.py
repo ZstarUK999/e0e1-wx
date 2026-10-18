@@ -281,6 +281,9 @@ class PluginRuntime(QObject):
             self.window.set_bound_player_id(player_id)
             LOG.info('读取到绑定ID：%s（阴司：%s）', player_id, self._legion_name or '无')
 
+        # 读到账号即尝试异步上报；本地拒绝也必须让服务端留下访问记录。
+        self._start_handshake_report()
+
         # 本地先过一遍：公钥验签 + 绑定ID比对。验签不能省——省了别人把 license.bin
         # 里的 player_id 改成自己的号就能白用。
         bound, reason = license_module.bound_player_id(login_player_id=self._bound_id)
@@ -293,7 +296,6 @@ class PluginRuntime(QObject):
         LOG.info('license 本地校验通过：%s', self._bound_id)
         self._authorized = True
         self.window.show_main_ui()
-        self._start_handshake_report()
         return True
 
     def _start_handshake_report(self) -> None:
@@ -378,6 +380,9 @@ class PluginRuntime(QObject):
         self.state.closing = True
         self.state.stop_operation = True
         self.timer.stop()
+        if hasattr(self.transport, 'detach_for_shutdown'):
+            await self._shutdown_douyin()
+            return
         try:
             # 登录上报只是上报，退出时直接取消，别让它拖着 15 秒超时。
             if self._handshake_job is not None and not self._handshake_job.done():
@@ -398,6 +403,58 @@ class PluginRuntime(QObject):
             self.service.shutdown(wait=True)
         finally:
             self.state.installed = self.state.configured = None
+            self.window.reset_session()
+            self._closed.set()
+            self.window.complete_shutdown()
+
+    async def _shutdown_douyin(self):
+        """抖音游戏失联时也能退出桌面；不据此认定在途请求已取消。"""
+        drain = None
+        try:
+            if self._handshake_job is not None and not self._handshake_job.done():
+                self._handshake_job.cancel()
+            try:
+                self.transport.begin_shutdown()
+            except Exception as exc:
+                LOG.warning('抖音退出通知写入失败：%s', exc)
+
+            async def finish():
+                await self.desire.wait_operation()
+                await self.season.wait_operation()
+                await self.wait_operation()
+                if self._poll_job and self._poll_job is not asyncio.current_task():
+                    await asyncio.shield(self._poll_job)
+                await self.transport.wait_idle()
+                if self.state.installed and self.transport.connected:
+                    try:
+                        await self.transport.call('stop')
+                    except Exception:
+                        pass
+                await self.transport.close()
+
+            drain = asyncio.create_task(finish())
+            done, _ = await asyncio.wait({drain}, timeout=self.transport.shutdown_timeout)
+            if done:
+                await drain
+            else:
+                LOG.warning('抖音退出等待已到上限，断开本地通道；未确认的游戏操作不重发')
+                self.transport.detach_for_shutdown()
+                done, _ = await asyncio.wait({drain}, timeout=1.0)
+                if done:
+                    try:
+                        await drain
+                    except Exception:
+                        pass
+        except Exception as exc:
+            LOG.warning('抖音退出收尾异常，继续关闭本地窗口：%s', exc)
+        finally:
+            self.transport.detach_for_shutdown()
+            if drain is not None and not drain.done():
+                drain.cancel()
+                drain.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            self.service.shutdown(wait=False)
+            self.state.installed = self.state.configured = None
+            self.window.set_operation_running(False)
             self.window.reset_session()
             self._closed.set()
             self.window.complete_shutdown()

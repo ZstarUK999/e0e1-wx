@@ -165,7 +165,11 @@ def test_release_handshake_denied_on_mismatch(server, release_client):
 def test_release_handshake_without_license(server, release_client):
     release_client(None)
     result = server_client.handshake(player_id="1001", legion_name="")
-    assert not result.allowed and result.reason == "no_license"
+    assert not result.allowed and result.reason == "invalid_license"
+    from app.db.models import HandshakeLog
+    with session_scope() as session:
+        row = session.query(HandshakeLog).order_by(HandshakeLog.id.desc()).first()
+        assert row.player_id == "1001" and row.reason == "invalid_license"
 
 
 def test_offline_fallback_allows_matching_id(release_client, monkeypatch):
@@ -254,3 +258,15 @@ def test_release_handshake_accepts_second_member(server, release_client):
     assert result.allowed and not result.offline
     result = server_client.handshake(player_id="9999", legion_name="")
     assert not result.allowed and result.reason == "player_id_mismatch"
+
+
+def test_mismatch_log_records_actual_login(server, release_client):
+    release_client(server_license.issue("1001"))
+    result = server_client.handshake(player_id="unauthorized-9009", legion_name="测试阴司")
+    assert not result.allowed and not result.offline
+    from app.db.models import HandshakeLog
+    with session_scope() as session:
+        row = session.query(HandshakeLog).order_by(HandshakeLog.id.desc()).first()
+        assert row.player_id == "unauthorized-9009"
+        assert row.bound_player_id == "1001"
+        assert row.reason == "player_id_mismatch"

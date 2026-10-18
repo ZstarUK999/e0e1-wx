@@ -68,11 +68,12 @@ def record(
     client_version: str,
     remote: str,
     player_name: str = "",
+    login_player_id: str = "",
 ) -> None:
     """落审计日志；公会名和角色名只记录不校验。"""
     session.add(
         HandshakeLog(
-            player_id=verdict.player_id or bound_player_id,
+            player_id=login_player_id or verdict.player_id or bound_player_id,
             bound_player_id=bound_player_id,
             player_name=player_name or "",
             guild=guild or "",
