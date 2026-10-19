@@ -21,12 +21,54 @@
     // verified in the live game, without assuming overwrite semantics of rename.
     try { fs.writeFileSync(prefix + name + '.json', data, 'utf8'); }
     catch(e) {
-      if (!String(e).includes('size limit exceeded') || stressFilling || !reclaimStorage()) throw e;
+      if (!String(e).includes('size limit exceeded') || stressFilling) throw e;
+      if (releaseReserve()) {
+        try { fs.writeFileSync(prefix + name + '.json', data, 'utf8'); return; }
+        catch(retry) { if (!String(retry).includes('size limit exceeded')) throw retry; }
+      }
+      if (!reclaimStorage()) throw e;
       fs.writeFileSync(prefix + name + '.json', data, 'utf8');
     }
   }
   let storageCC = null, reclaiming = false, stressFilling = false;
   const storageCleanup = {files:0, bytes:0, last:[], error:''};
+  const reservePath = prefix + 'reserve-' + runtime + '.bin';
+  const storageReserve = {checked:false, bytes:0, target_bytes:32768, released:0, error:''};
+  let reserveRetryAt = 0;
+  function releaseReserve() {
+    if(!storageReserve.bytes)return false;
+    try {
+      fs.unlinkSync(reservePath);storageReserve.bytes=0;storageReserve.released++;
+      reserveRetryAt=Date.now()+30000;return true;
+    }catch(e){storageReserve.error=errorText(e);return false;}
+  }
+  function allocateReserve(cleanup) {
+    if(storageReserve.bytes || stopped)return;
+    reserveRetryAt=Date.now()+30000;
+    const data=(runtime+'|').padEnd(storageReserve.target_bytes,'r');
+    try {
+      try{fs.writeFileSync(reservePath,data,'utf8');}
+      catch(e){
+        if(!cleanup || !String(e).includes('size limit exceeded') || !reclaimStorage())throw e;
+        fs.writeFileSync(reservePath,data,'utf8');
+      }
+      storageReserve.bytes=storageReserve.target_bytes;storageReserve.error='';
+    }catch(e){storageReserve.error=errorText(e);}
+  }
+  async function checkStorage() {
+    if(storageReserve.checked)return;
+    try {
+      storageCC=await g.System.import('cc');
+      // A successful real allocation is the capacity check; no assumed quota.
+      // Reclaim only our old reserve files left after abnormal termination.
+      for(const name of fs.readdirSync(g.tt.env.USER_DATA_PATH)) {
+        if(/^e0e1-plugin-reserve-[a-z0-9-]+\.bin$/.test(name))
+          fs.unlinkSync(g.tt.env.USER_DATA_PATH+'/'+name);
+      }
+      storageReserve.checked=true;
+      allocateReserve(true);
+    }catch(e){storageReserve.error=errorText(e);}
+  }
   function fileSize(path) {
     const result = fs.statSync(path);
     const stat = result.stats || result;
@@ -128,7 +170,7 @@
       try { write('response',response); return; }
       catch(e) { if (!String(e).includes('size limit exceeded')) throw e; }
     }
-    transfer = {id:response.id, text, offset:0, index:0, size:4096, at:Date.now()};
+    transfer = {id:response.id, text, offset:0, index:0, size:65536, at:Date.now()};
     sendPart();
   }
   function errorText(e) { return String(e && (e.stack || e.message) || e).slice(0, 4000); }
@@ -207,17 +249,34 @@
   const onHide = function(){keepAlive.background=true;keepScreenRequested=false;};
   const onShow = function(){keepAlive.background=false;resumedInBackground=false;keepScreenRequested=false;};
   try {if(typeof g.tt.onHide==='function')g.tt.onHide(onHide);if(typeof g.tt.onShow==='function')g.tt.onShow(onShow);} catch(e){keepAlive.error=errorText(e);}
-  let shutdownHandled = false;
+  let shutdownHandled = false, cleanupPending = false, cleanupError = '';
+  function residentPending() {
+    const resident=g.__e0e1PluginRuntime,guard=g.__e0e1EnergyGuard;
+    let season=null;
+    try {if(g.e0e1Season && typeof g.e0e1Season.pendingState==='function')season=g.e0e1Season.pendingState();}
+    catch(_){return true;}
+    return !!(resident && resident.pending || guard && (guard.pending || guard.action_pending || guard.callback_count) ||
+      season && (season.pending || season.uncertain || season.outstanding));
+  }
+  function reusableResident() {
+    const resident=g.__e0e1PluginRuntime;
+    return !!(resident && resident.stopped && !residentPending() && !busy && !transfer && !cleanupPending && !cleanupError);
+  }
   function applyShutdown() {
     if(shutdownHandled)return;
     const request=read('shutdown'), resident=g.__e0e1PluginRuntime;
     if(!request || request.token!==token || request.runtime!==runtime || !resident || request.resident!==resident.id)return;
-    shutdownHandled=true;stopped=true;resident.stopped=true;
+    shutdownHandled=true;stopped=true;resident.stopped=true;releaseReserve();
     releaseKeepAlive();
+    if(g.__e0e1BattleAssist)g.__e0e1BattleAssist.destroy();
     if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
-    try {if(g.e0e1Season && typeof g.e0e1Season.stop==='function')Promise.resolve(g.e0e1Season.stop()).catch(e=>{lastError=errorText(e);});}catch(e){lastError=errorText(e);}
-    try {if(typeof g.treasureMapOverlayOff==='function')g.treasureMapOverlayOff();if(g.e0e1Perf)g.e0e1Perf.stop();}catch(e){lastError=errorText(e);}
-    Promise.resolve().then(()=>stopDamage()).catch(e=>{lastError=errorText(e);});
+    cleanupPending=true;
+    Promise.resolve().then(async()=>{
+      if(g.e0e1Season && typeof g.e0e1Season.stop==='function')await g.e0e1Season.stop();
+      if(typeof g.treasureMapOverlayOff==='function')g.treasureMapOverlayOff();
+      if(g.e0e1Perf)g.e0e1Perf.stop();
+      await stopDamage();
+    }).catch(e=>{cleanupError=lastError=errorText(e);}).finally(()=>{cleanupPending=false;heartbeat();});
   }
   function heartbeat() {
     const perf=g.e0e1Perf;
@@ -232,6 +291,8 @@
       Promise.resolve(overlay.update(control.payload)).catch(e=>{lastError=errorText(e);});
     }
     maintainKeepAlive();
+    if(storageReserve.checked && !busy && !transfer && !storageReserve.bytes && Date.now()>=reserveRetryAt)
+      allocateReserve(false);
     let hall = false;
     let playerId = '';
     const game = !!(g.UIManager && g.ROLE && g.System);
@@ -243,7 +304,10 @@
     try {
       write('state', {token, build, runtime, appid: 'tt310e47b3ae06acc002', at: Date.now(),
         game, hall, busy, lastSequence, resident: g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.id || null,
-        protocol: 'static-v1', storage_cleanup: storageCleanup, storage_probe: storageProbe, automation: g.__e0e1AutomationOverlay ? g.__e0e1AutomationOverlay.snapshot() : null, player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
+        phase: stopped ? (cleanupPending || busy || residentPending() || transfer ? 'stopping' : 'stopped') : 'running',
+        resident_stopped: !!(g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.stopped),
+        resident_pending: residentPending(), reusable: reusableResident(), cleanup_pending:cleanupPending, cleanup_error:cleanupError,
+        protocol: 'static-v1', storage_reserve: storageReserve, storage_cleanup: storageCleanup, storage_probe: storageProbe, automation: g.__e0e1AutomationOverlay ? g.__e0e1AutomationOverlay.snapshot() : null, player_id: playerId, error: lastError, keep_alive: {...keepAlive}});
     } catch (e) { lastError = errorText(e); }
   }
   function receipt(value) { return typeof value === 'string' ? JSON.parse(value) : value; }
@@ -266,7 +330,19 @@
     const resident = g.__e0e1PluginRuntime;
     switch (action) {
       case 'ping': return 2;
-      case 'install': return staticScripts.resident(args.id);
+      case 'install': {
+        if(resident && resident.id!==args.id) {
+          // poll owns the queue while dispatching; busy is expected here.
+          if(!resident.stopped || residentPending() || transfer || cleanupPending || cleanupError)
+            throw Error('旧插件实例尚未安全停止，请等待收尾或完全退出小游戏后重新进入');
+          if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
+          delete g.__e0e1PluginRuntime;
+        }
+        stopped=false;shutdownHandled=false;cleanupError='';lastAutomationAt=0;
+        const installed=await staticScripts.resident(args.id);
+        await checkStorage();
+        return installed;
+      }
       case 'call':
         return resident && resident.id === args.id ? resident.dispatch(args.op, args.payload || {})
           : {status: 'uncertain', message: '游戏会话身份已改变'};
@@ -279,6 +355,7 @@
       case 'perf-stop': return g.e0e1Perf ? g.e0e1Perf.stop() : null;
       case 'damage-inject': return enableDamage();
       case 'damage-stop': return stopDamage();
+      case 'battle-assist-timing': return g.__e0e1BattleAssist ? g.__e0e1BattleAssist.timingPreview() : [];
       case 'damage-status': return typeof g.damageCurveStatus === 'function' ? g.damageCurveStatus() : null;
       case 'damage-snapshot': return typeof g.damageCurveJson === 'function' ? g.damageCurveJson() : null;
       case 'damage-debug': return typeof g.damageCurveDebug === 'function' ? g.damageCurveDebug() : null;
@@ -313,7 +390,7 @@
       lastError = errorText(e);
       try { write('response',{token,runtime,id,ok:false,error:'回执传输失败（用户目录空间不足或文件写入异常），操作不会重发: '+lastError}); } catch(_) {}
     }
-    if (stopped || busy || transfer) return;
+    if (busy || transfer) return;
     const command = read('command');
     if (!command || command.token !== token || command.runtime !== runtime
         || typeof command.id !== 'string' || !Number.isSafeInteger(command.sequence)
@@ -328,6 +405,9 @@
     try {
       if (Date.now() > command.deadline) throw new Error('命令已过期，未执行');
       if (typeof command.action !== 'string' || 'expression' in command) throw new Error('仅支持结构化命令');
+      if(stopped && !['install','idle','damage-stop','perf-stop'].includes(command.action) &&
+         !(command.action==='call' && ['stop','home','restore','inspect','capture'].includes((command.args || {}).op)))
+        throw Error('插件已停止，拒绝新业务操作');
       response = {token, runtime, id: command.id, ok: true, value: await dispatch(command.action, command.args)};
     } catch (e) {
       response = {token, runtime, id: command.id, ok: false, error: errorText(e)};
@@ -339,14 +419,19 @@
       try { write('response', {token, runtime, id: command.id, ok: false, error: '回执序列化或写入失败: ' + lastError}); } catch (_) {}
     } finally { busy = false; heartbeat(); }
   }
-  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;transfer=null;clearResponse();releaseKeepAlive();if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
+  g.__e0e1DouyinBridge = {runtime, build, stop() { stopped = true;releaseReserve();transfer=null;clearResponse();releaseKeepAlive();if(g.__e0e1BattleAssist)g.__e0e1BattleAssist.destroy();if(g.__e0e1AutomationOverlay)g.__e0e1AutomationOverlay.destroy();
     try {if(typeof g.tt.offHide==='function')g.tt.offHide(onHide);if(typeof g.tt.offShow==='function')g.tt.offShow(onShow);
       if(screenWrapper && g.tt.setKeepScreenOn===screenWrapper)g.tt.setKeepScreenOn=screenOriginal;} catch (_) {}
-    clearInterval(tick);clearInterval(pulse);clearInterval(replay); }};
+    clearInterval(tick);clearInterval(transferPump);clearInterval(pulse);clearInterval(replay); }};
   const pulse = setInterval(heartbeat, 500);
   const tick = setInterval(function () {
     if (!busy) poll().catch(e => {lastError = errorText(e); heartbeat();});
   }, 100);
+  // Large reports use a fast acknowledgement pump only while transferring.
+  // Idle command polling stays at 100ms; no extra filesystem I/O when idle.
+  const transferPump = setInterval(function () {
+    if (transfer && !busy) poll().catch(e=>{lastError=errorText(e);heartbeat();});
+  }, 10);
   let stressStarted = false;
   async function storageStress() {
     const request=read('storage-stress-request');

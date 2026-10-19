@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QMainWindow
 WindowFactory = Callable[[], QMainWindow]
 
 
-def run_gui(window_factory: WindowFactory, *, app_name: str, organization: str = "e0e1") -> int:
+def run_gui(window_factory: WindowFactory, *, app_name: str, organization: str = "e0e1", executor_factory=None) -> int:
     """准备子进程环境后，以 qasync 事件循环托管主窗口。"""
     mp.freeze_support()
     from package.runtime.process_bootstrap import configure_multiprocessing_for_gui_subprocesses
@@ -18,4 +18,4 @@ def run_gui(window_factory: WindowFactory, *, app_name: str, organization: str =
     configure_multiprocessing_for_gui_subprocesses()
     from package.runtime.async_app import run_qasync_window
 
-    return run_qasync_window(window_factory, app_name=app_name, organization=organization)
+    return run_qasync_window(window_factory, app_name=app_name, organization=organization, executor_factory=executor_factory)

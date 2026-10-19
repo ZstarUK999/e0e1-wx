@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -26,6 +28,7 @@ from package.daily_tasks.scheduler import ExecutionUncertain, RetryableTaskError
 
 APPID = 'tt310e47b3ae06acc002'
 MARKER = b'/* e0e1-douyin-plugin-bridge-v1 */'
+LOG = logging.getLogger('plugin_manager.douyin')
 ANCHOR = re.compile(rb'(__tt_define__\("game\.js",\(function\([^)]*\)\{"use strict";)')
 
 
@@ -74,6 +77,8 @@ class DouyinCache:
         self.build = ''
         self.version = ''
         self._last_status = None
+        self._diagnostic_key = None
+        self._next_diagnostic = 0.0
 
     def mailbox(self, name):
         return self.user / f'e0e1-plugin-{name}.json'
@@ -87,13 +92,16 @@ class DouyinCache:
                          for name in ('daily_runtime.js','sweep_runtime.js'))
         core += '\n' + (manager/'desire_runtime.js').read_text(encoding='utf-8-sig')
         core += '\n' + (manager/'automation_overlay.js').read_text(encoding='utf-8-sig')
+        core += '\n' + (manager/'pve_assist_overlay.js').read_text(encoding='utf-8-sig')
+        core += '\n' + (manager/'battle_assist_runtime.js').read_text(encoding='utf-8-sig')
         resident = core + r'''
 if (g.__e0e1PluginRuntime) return {resident_id:g.__e0e1PluginRuntime.id,capabilities:['energy']};
 const api=createEnergyRuntime(g);
 g.__e0e1AutomationOverlay=createAutomationOverlay(g);
+g.__e0e1BattleAssist=createBattleAssistRuntime(g);
 const resident={id,config:null,stopped:false,pending:false,async dispatch(op,args){
-  if(op==='configure'){this.config=args;return {status:'ok',value:true};}
-  if(op==='stop'){g.__e0e1AutomationOverlay.destroy();this.stopped=true;return {status:'ok',value:true};}
+  if(op==='configure'){g.__e0e1GameOverlaysEnabled=!args.ui || args.ui.game_overlays!==false;await g.__e0e1BattleAssist.configure(args.battle_assist);this.config=args;return {status:'ok',value:true};}
+  if(op==='stop'){g.__e0e1BattleAssist.destroy();g.__e0e1AutomationOverlay.destroy();this.stopped=true;return {status:'ok',value:true};}
   if(this.stopped&&!['inspect','capture','restore','home'].includes(op))return {status:'unavailable',message:'插件已停止'};
   if(this.pending)return {status:'uncertain',message:'上一条命令尚未结束'};
   this.pending=true;
@@ -158,7 +166,11 @@ return {resident_id:id,capabilities:['energy']};
             target.write_bytes(patched)
             if sha(target.read_bytes()) != sha(patched):
                 raise RuntimeError('抖音缓存写入后校验失败')
+        previous_version = self.version
         self.version = folder.name
+        if changed or previous_version != self.version:
+            LOG.info('抖音缓存准备：版本=%s 修改=%s 入口=%s 备份=%s build=%s',
+                     self.version,changed,target,backup,self.build[:12])
         return changed
 
     def status(self):
@@ -174,6 +186,37 @@ return {resident_id:id,capabilities:['energy']};
             if value and value.get('build') == self.build and 0 <= time.time() * 1000 - value.get('at', 0) < 5000:
                 return value
         return None
+
+    def log_diagnostics(self):
+        """Read only allowlisted fields. Never log tokens, commands or battle data."""
+        reason='ok';value={};path=self.mailbox('state')
+        try:
+            value=json.loads(path.read_text(encoding='utf-8-sig'))
+            if not isinstance(value,dict):raise ValueError('state is not an object')
+            age=time.time()*1000-float(value.get('at',0))
+            if not math.isfinite(age):raise ValueError('invalid heartbeat timestamp')
+            if value.get('token')!=self.token:reason='token_mismatch'
+            elif value.get('build')!=self.build:reason='build_mismatch_need_reenter'
+            elif value.get('appid')!=APPID:reason='appid_mismatch'
+            elif value.get('protocol')!='static-v1':reason='protocol_mismatch'
+            elif not 0<=age<5000:reason='stale_heartbeat'
+        except (OSError,ValueError,TypeError) as exc:
+            reason=type(exc).__name__;value={};age=None
+        key=(reason,value.get('runtime'),value.get('resident'),value.get('phase'),value.get('game'),value.get('hall'))
+        now=time.monotonic()
+        if key==self._diagnostic_key and now<self._next_diagnostic:return
+        self._diagnostic_key=key;self._next_diagnostic=now+60
+        fields={k:value.get(k) for k in ('runtime','resident','phase','game','hall','busy','resident_stopped',
+                'resident_pending','reusable','cleanup_pending','lastSequence')}
+        fields.update(reason=reason,heartbeat_age_ms=round(age) if age is not None else None,
+                      expected_build=self.build[:12],actual_build=str(value.get('build') or '')[:12],
+                      cache_version=self.version,state_exists=path.exists())
+        # Keep errors bounded; some SDK errors contain the full JS stack.
+        fields['bridge_error']=str(value.get('error') or '')[:500]
+        fields['cleanup_error']=str(value.get('cleanup_error') or '')[:300]
+        fields['storage_reserve']=value.get('storage_reserve')
+        fields['storage_cleanup']=value.get('storage_cleanup')
+        LOG.info('抖音连接诊断：%s',json.dumps(fields,ensure_ascii=False))
 
     def restore(self):
         restored = []
@@ -226,7 +269,7 @@ class _LocalCommands:
 class DouyinTransport(PluginTransport):
     TARGET_APPID = APPID
     platform_name = '抖音 PC'
-    shutdown_timeout = 8.0
+    shutdown_timeout = 4.0
 
     def __init__(self, cache):
         self.cache = cache
@@ -236,6 +279,7 @@ class DouyinTransport(PluginTransport):
         self._detached = False
         self._pending_file = None
         self._file_lock = asyncio.Lock()
+        self._logged_rpc = set()
         super().__init__(cdp=_LocalCommands(self))
 
     async def connect(self, port=None):
@@ -255,17 +299,21 @@ class DouyinTransport(PluginTransport):
             self.connected = False
             self.invalidate()
             return {'appid': '', 'ready': False, 'context_id': None, 'resident_id': None}
-        atomic_json(self.cache.mailbox('lease'), {'token': self.cache.token,
-                    'runtime': status['runtime'], 'resident': status.get('resident'), 'at': time.time() * 1000})
+        if self.session_id and status.get('resident') == self.session_id and self.session_id in self._owned_ids:
+            atomic_json(self.cache.mailbox('lease'), {'token': self.cache.token,
+                        'runtime': status['runtime'], 'resident': self.session_id, 'at': time.time() * 1000})
         if self.runtime != status['runtime']:
             self.invalidate()
+            self._logged_rpc.clear()
             self.runtime = status['runtime']
         self.connected = True
         self.context_id = self.runtime
         if status.get('resident') in self._owned_ids:
             self.session_id = status['resident']
         return {'appid': APPID, 'ready': bool(status.get('game') and status.get('hall')),
-                'context_id': self.context_id, 'resident_id': status.get('resident')}
+                'context_id': self.context_id, 'resident_id': status.get('resident'),
+                'resident_stopped': status.get('resident_stopped'), 'reusable': status.get('reusable'),
+                'message': '链路已连接，首次挂载请关闭游戏弹窗并返回大厅' if not status.get('hall') else ''}
 
     def begin_shutdown(self):
         """独立于命令队列通知游戏停止本实例；不重发或取消业务请求。"""
@@ -284,7 +332,15 @@ class DouyinTransport(PluginTransport):
 
     async def _reply(self, pending, timeout_ms=None):
         until = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000
+        next_notice = time.monotonic() + 5.0
         while True:
+            if time.monotonic() >= next_notice:
+                bridge=self.cache.status() or {}
+                logging.getLogger('plugin_manager').warning(
+                    '抖音命令仍在等待回执：action=%s id=%s bridge_phase=%s busy=%s cleanup=%s chunk=%s',
+                    pending.get('action'),pending.get('id'),bridge.get('phase'),bridge.get('busy'),
+                    bridge.get('cleanup_pending'),pending.get('_reply_ack'))
+                next_notice = time.monotonic() + 10.0
             if self._detached:
                 raise ContextDestroyed('插件已退出本地等待；远端操作结果未知，不重发')
             status = self.cache.status()
@@ -307,14 +363,17 @@ class DouyinTransport(PluginTransport):
                         raise RuntimeError('抖音回执分块序号无效，操作不会重发')
                     if index == len(parts):
                         parts.append(data)
+                        pending['_reply_chars'] = pending.get('_reply_chars',0) + len(data)
                         # Timeout measures lack of progress, not total report size.
                         if timeout_ms is not None:
                             until = time.monotonic() + timeout_ms / 1000
                     elif parts[index] != data:
                         raise RuntimeError('抖音回执分块内容变化，操作不会重发')
-                    atomic_json(self.cache.mailbox('response-ack'), {
-                        'token': self.cache.token, 'runtime': pending['runtime'],
-                        'id': pending['id'], 'index': index})
+                    if pending.get('_reply_ack') != index:
+                        atomic_json(self.cache.mailbox('response-ack'), {
+                            'token': self.cache.token, 'runtime': pending['runtime'],
+                            'id': pending['id'], 'index': index})
+                        pending['_reply_ack'] = index
                     if not response.get('final'):
                         if until is not None and time.monotonic() >= until:
                             raise asyncio.TimeoutError('抖音回执分块等待超时，操作不会重发')
@@ -325,10 +384,12 @@ class DouyinTransport(PluginTransport):
                             or response.get('id') != pending['id']):
                         raise RuntimeError('抖音分块回执身份不匹配，操作不会重发')
                     pending.pop('_reply_parts', None)
+                    pending.pop('_reply_ack', None)
                 else:
                     atomic_json(self.cache.mailbox('response-ack'), {
                         'token': self.cache.token, 'runtime': pending['runtime'], 'id': pending['id']})
                     pending.pop('_reply_parts', None)
+                    pending.pop('_reply_ack', None)
                 self._pending_file = None
                 if not response.get('ok'):
                     raise RuntimeError(response.get('error') or '抖音脚本执行失败')
@@ -362,26 +423,47 @@ class DouyinTransport(PluginTransport):
             command = {'token':self.cache.token,'runtime':self.runtime,'id':uuid.uuid4().hex,
                        'sequence':self._sequence,'action':action,'args':args or {},
                        'deadline':time.time()*1000+timeout_ms}
+            key=(self.runtime,action,str((args or {}).get('op') or (args or {}).get('name') or ''))
+            first=key not in self._logged_rpc
+            self._logged_rpc.add(key)
+            started=time.monotonic()
+            if first:
+                LOG.info('抖音命令开始：action=%s op=%s id=%s runtime=%s timeout_ms=%s',action,key[2],command['id'],self.runtime,timeout_ms)
             self._pending_file=command
             try:
-                atomic_json(self.cache.mailbox('command'),command)
-            except (OSError,ValueError):
-                self._pending_file=None
+                try:
+                    atomic_json(self.cache.mailbox('command'),command)
+                except (OSError,ValueError):
+                    self._pending_file=None
+                    raise
+                result=await self._reply(command,timeout_ms)
+                elapsed=time.monotonic()-started
+                if first or elapsed>=1:
+                    LOG.info('抖音命令完成：action=%s op=%s id=%s elapsed=%.3fs result_type=%s chunk_chars=%s',
+                             action,key[2],command['id'],elapsed,type(result).__name__,command.get('_reply_chars',0))
+                return result
+            except Exception as exc:
+                LOG.exception('抖音命令失败：action=%s op=%s id=%s elapsed=%.3fs error_type=%s',
+                              action,key[2],command['id'],time.monotonic()-started,type(exc).__name__)
+                self.cache.log_diagnostics()
                 raise
-            return await self._reply(command,timeout_ms)
 
     async def install(self):
         probe=await self.probe()
         if not probe['ready'] or probe['appid']!=APPID:
             raise RuntimeError('必须确认遗弃之地大厅就绪后才能注入')
         if probe['resident_id'] and probe['resident_id']!=self.session_id:
-            raise RuntimeError('游戏已有其他插件实例；请关闭旧实例并重进小游戏')
+            if probe.get('reusable') is not True:
+                raise RuntimeError('旧插件实例仍在运行或收尾，当前功能未就绪；请完全退出小游戏后重新进入')
+            logging.getLogger('plugin_manager').info('旧抖音实例已停止且无在途操作，准备安全接管：%s',probe['resident_id'])
         async with self._lock:
             if self._inflight is not None:
                 raise ExecutionUncertain('前次命令未确认，不安装新实例')
             generation=self._generation
             sid=self.session_id or uuid.uuid4().hex
             receipt=await self._rpc('install',{'id':sid})
+            if await self._rpc('ping',timeout_ms=5000) != 2:
+                raise RuntimeError('抖音插件挂载后健康检查无回执')
             if generation!=self._generation or not isinstance(receipt,dict) or receipt.get('resident_id')!=sid:
                 raise RuntimeError('抖音驻留脚本安装回执不匹配')
             self.session_id=sid
@@ -454,6 +536,8 @@ class DouyinTransport(PluginTransport):
     async def perf_start(self): return await self._rpc('perf-start')
     async def perf_snapshot(self): return await self._rpc('perf-status')
     async def perf_stop(self): return await self._rpc('perf-stop')
+    async def battle_assist_timing(self): return await self._rpc('battle-assist-timing', timeout_ms=2000)
+
     async def damage_status(self): return await self._rpc('damage-status')
     async def damage_snapshot(self): return await self._rpc('damage-snapshot',timeout_ms=30000)
     async def damage_debug(self): return await self._rpc('damage-debug')
@@ -495,6 +579,7 @@ class DouyinService(QObject):
             except Exception as exc:
                 self.error = str(exc)
             self._next_prepare = time.monotonic() + 5
+        self.cache.log_diagnostics()
         state = self.snapshot()
         self.state_changed.emit(state)
         player_id = str(state.get('player_id') or '')

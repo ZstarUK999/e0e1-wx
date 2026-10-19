@@ -3,12 +3,15 @@ function createAutomationOverlay(g) {
   let data={active:false,run_id:'',task:'',status:''}, stopRequested=false;
   let cc=null, loading=null, panel=null, title=null, detail=null, exitLabel=null, timer=null;
   let lastUpdate=0, operation='', position=null;
-  const valid=node=>!!node && node.isValid!==false;
+  const valid=node=>!!node && (cc && typeof cc.isValid==='function'?cc.isValid(node,true):node.isValid!==false);
   const snapshot=()=>({run_id:data.run_id,active:!!data.active,stop_requested:stopRequested});
-  function remove() {
-    if(timer!==null){clearInterval(timer);timer=null;}
+  function unmount() {
     if(valid(panel))panel.destroy();
     panel=title=detail=exitLabel=null;
+  }
+  function remove() {
+    if(timer!==null){clearInterval(timer);timer=null;}
+    unmount();
   }
   function stop() {
     if(!data.active || stopRequested)return;
@@ -22,7 +25,7 @@ function createAutomationOverlay(g) {
   function mount() {
     const manager=g.UIManager && g.UIManager.ins;
     const host=manager && manager.system;
-    if(!cc || !valid(host))return;
+    if(!cc || !valid(host)){unmount();return;}
     if(valid(panel) && panel.parent===host)return;
     if(valid(panel))panel.destroy();
     const size=dimensions(host),width=Math.min(340,size.width-24),height=154;
@@ -63,6 +66,7 @@ function createAutomationOverlay(g) {
   }
   function render() {
     if(!data.active){remove();return;}
+    if(g.__e0e1GameOverlaysEnabled===false){unmount();return;}
     mount();if(!valid(panel))return;
     const stopping=stopRequested || data.phase==='stopping';
     title.string=stopping?'正在退出托管':data.phase==='waiting'?'正在等待 · 托管正常':data.phase==='paused'?'托管已暂停':'正在托管 · 可拖动';

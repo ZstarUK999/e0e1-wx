@@ -258,6 +258,11 @@ var E0E1_DUAL = null;
 var E0E1_LOCAL_DUAL = null;
 var E0E1_REPLAY_CONTEXTS = [];
 var E0E1_REPLAY_SERIAL = 0;
+// Both worlds share this game's metrics object, even when replay start was
+// already running before the controller hook was installed. Weak keys do not
+// retain completed battles or change the game's objects.
+var E0E1_PAIR_KEYS = new WeakMap();
+var E0E1_PAIR_SERIAL = 0;
 var E0E1_ORIGIN_SOURCES = [
   { table: "MagicArtifactBaseCfg", fields: ["skill"], label: "法器" },
   { table: "MagicArtifactStoneCfg", fields: ["skill"], label: "法器宝石" },
@@ -1366,8 +1371,13 @@ function e0e1RecordFactors(state,source,skillId,damage,target,info,t) {
 // 拆成独立函数是因为要在 createBattle 的钩子里同步调用：
 // 好友切磋跳过时第一件事就是 detachBattleWorlds 把 World 移出 getBattles()，
 // 只靠 500ms 轮询的话，用户一进战斗就点跳过我们就一次都轮不到。
+function e0e1ReportableWorld(world) {
+  var type=world && world.options && world.options.battleData && world.options.battleData.type;
+  return !!E0E1_PVP_TYPE[type] || type===18 || type===24 || type===25;
+}
+
 function e0e1TryAttachWorld(world) {
-  if (!world || world.isQuitted || !world.battleSignal) return false;
+  if (!world || world.isQuitted || !world.battleSignal || !e0e1ReportableWorld(world)) return false;
   for (var i = 0; i < E0E1_HOOKS.length; i++) {
     if (E0E1_HOOKS[i].world === world) return true;
   }
@@ -1397,15 +1407,22 @@ function e0e1TryAttachWorld(world) {
   }
   E0E1_HOOKS.push({ world: world, handler: handler, tickHandler: tickHandler,
                     state: state, side: side });
-  if (state.replay || side === "self") e0e1ResetPvpIfNewBattle(state);
+  if (state.replay || side === "self" || e0e1PairKey(state)) e0e1ResetPvpIfNewBattle(state);
   E0E1_SIDES[side] = state;
   return true;
 }
 
 // 分数采样是全局累积的（不走 E0E1_SIDES），不按场次归零的话
 // 第二场会接着第一场的秒数往下记，时间轴被拼成两场之和。
+function e0e1PairKey(state) {
+  var mi=e0e1MineInfoOf(state.world), metrics=mi && mi.pvpMetrics;
+  if (!metrics || typeof metrics !== 'object') return null;
+  var key=E0E1_PAIR_KEYS.get(metrics);
+  if (!key) {key='world-pair:'+(++E0E1_PAIR_SERIAL);E0E1_PAIR_KEYS.set(metrics,key);}
+  return key;
+}
 function e0e1ResetPvpIfNewBattle(state) {
-  var key = state.replay ? "replay-session:" + state.replay.sessionId : String(state.instanceId) + "|" + String(state.battleType) + "|" + String(state.seed);
+  var key = e0e1PairKey(state) || (state.replay ? "replay-session:" + state.replay.sessionId : String(state.instanceId) + "|" + String(state.battleType) + "|" + String(state.seed));
   if (!E0E1_PVP.instanceKey) {
     E0E1_PVP.instanceKey = key;
     E0E1_PVP.battleType = state.battleType;
@@ -1424,7 +1441,7 @@ function e0e1ResetPvpIfNewBattle(state) {
 }
 
 function e0e1WatchWorld(world) {
-  if (!world) return;
+  if (!e0e1ReportableWorld(world)) return;
   if (E0E1_WATCHED.indexOf(world) < 0) {
     E0E1_WATCHED.push(world);
     if (E0E1_WATCHED.length > 8) E0E1_WATCHED.shift();

@@ -31,6 +31,10 @@ class SessionCdpClient(LocalCdpClient):
         self._fail_all_pending(RuntimeError('游戏CDP连接断开'))
 
 
+class CdpConnectionPending(RuntimeError):
+    """连接握手尚未完成，等待下一轮重新建立连接。"""
+
+
 class ContextDestroyed(RuntimeError):
     """CDP明确确认指定执行上下文不存在，而不是普通通信错误。"""
 
@@ -99,10 +103,22 @@ class PluginTransport:
     async def connect(self, port):
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError('CDP端口无效')
-        await self.cdp.connect(f'ws://127.0.0.1:{port}', timeout_ms=3000)
+        self.connected = False
+        stage = 'WebSocket连接'
+        try:
+            await self.cdp.connect(f'ws://127.0.0.1:{port}', timeout_ms=3000)
+            stage = 'Runtime.enable握手'
+            await self.cdp.send('Runtime.enable', timeout_ms=5000)
+        except (Exception, asyncio.CancelledError) as exc:
+            self.port = None
+            self.invalidate()
+            with contextlib.suppress(Exception):
+                await self.cdp.close()
+            if isinstance(exc, TimeoutError):
+                raise CdpConnectionPending(f'游戏CDP {stage}超时（端口{port}），等待自动重连') from exc
+            raise
         self.port = port
         self.connected = True
-        await self.cdp.send('Runtime.enable', timeout_ms=2000)
 
     async def _evaluate(self, expression, context_id=None, timeout_ms=3000):
         params = {'expression': expression, 'returnByValue': True, 'awaitPromise': True}
@@ -174,16 +190,19 @@ class PluginTransport:
             source = (scripts.joinpath('daily_runtime.js').read_text(encoding='utf-8') + '\n'
                       + scripts.joinpath('sweep_runtime.js').read_text(encoding='utf-8') + '\n'
                       + desire_script.read_text(encoding='utf-8') + '\n'
-                      + Path(__file__).with_name('automation_overlay.js').read_text(encoding='utf-8'))
+                      + Path(__file__).with_name('automation_overlay.js').read_text(encoding='utf-8') + '\n'
+                      + Path(__file__).with_name('pve_assist_overlay.js').read_text(encoding='utf-8')+'\n'
+                      + Path(__file__).with_name('battle_assist_runtime.js').read_text(encoding='utf-8'))
             expression = f'''(() => {{
 {source}
 const id = {json.dumps(sid)};
 if (globalThis.__e0e1PluginRuntime) return {{resident_id: globalThis.__e0e1PluginRuntime.id, capabilities:['energy']}};
 const api = createEnergyRuntime(globalThis);
 globalThis.__e0e1AutomationOverlay = createAutomationOverlay(globalThis);
+globalThis.__e0e1BattleAssist = createBattleAssistRuntime(globalThis);
 const resident = {{id, config: null, stopped:false, pending:false, async dispatch(op, args) {{
-  if (op === 'configure') {{ this.config = args; return {{status:'ok', value:true}}; }}
-  if (op === 'stop') {{ globalThis.__e0e1AutomationOverlay.destroy(); this.stopped = true; return {{status:'ok', value:true}}; }}
+  if (op === 'configure') {{ globalThis.__e0e1GameOverlaysEnabled = !args.ui || args.ui.game_overlays !== false; await globalThis.__e0e1BattleAssist.configure(args.battle_assist); this.config = args; return {{status:'ok', value:true}}; }}
+  if (op === 'stop') {{ globalThis.__e0e1BattleAssist.destroy(); globalThis.__e0e1AutomationOverlay.destroy(); this.stopped = true; return {{status:'ok', value:true}}; }}
   if (this.stopped && !['inspect','capture','restore','home'].includes(op)) return {{status:'unavailable',message:'插件已停止'}};
   if (this.pending) return {{status:'uncertain',message:'上一条命令尚未结束'}};
   this.pending = true;
@@ -388,6 +407,11 @@ return {{resident_id:id, capabilities:['energy']}};
             result = {"ok": True, "message": "已取消", "enabled": False}
         self._damage_persistent = ""
         return result
+
+    async def battle_assist_timing(self):
+        return await self._evaluate(
+            'globalThis.__e0e1BattleAssist ? globalThis.__e0e1BattleAssist.timingPreview() : []',
+            self.context_id, timeout_ms=2000)
 
     async def damage_status(self):
         return await self._evaluate(

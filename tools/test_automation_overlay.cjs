@@ -42,6 +42,11 @@ function find(name,node=host){if(node.name===name)return node;for(const child of
  assert.match(find('当前操作').getComponent(Label).string,/1分4秒后检查/);
  await overlay.update({run_id:'three',active:true,phase:'waiting',next_task:'',next_check_at:null,status:'当前没有启用的定时任务'});
  assert.match(find('当前操作').getComponent(Label).string,/没有启用/);
+ g.__e0e1GameOverlaysEnabled=false;
+ await overlay.update({run_id:'hidden',active:true});
+ assert.equal(host.children.length,0);assert.equal(timers.size,1,'hidden mode retains the safety lease watchdog');
+ now+=13000;for(const fn of timers.values())fn();assert(overlay.shouldStop());
+ g.__e0e1GameOverlaysEnabled=true;await overlay.update({run_id:'restored',active:true});assert.equal(host.children.length,1);
  overlay.destroy();assert.equal(timers.size,0);assert.equal(host.children.length,0);
  console.log('PASS automation status, drag, stop latch, restart, lease expiry and complete timer/node cleanup');
 })().catch(error=>{console.error(error);process.exitCode=1;});

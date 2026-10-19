@@ -21,6 +21,7 @@ from .gate import PHASE_INIT, StartupGate
 from .feature_flags import panel_enabled, task_enabled
 from .panels import BloodmoonPanel, DailyPanel, DamagePanel, DebugPanel, DesirePanel, GlobalPanel, PlayerPanel, TaskPanel, TreasurePanel
 from .store import PluginConfigStore
+from .battle_assist import create_battle_assist_panel, create_zhongkui_panel
 
 PAGE_TASKS = {
     "energy": ("energy", "offline_reward"),
@@ -88,7 +89,9 @@ class PluginWindow(QMainWindow):
         self._capabilities = None
         self._offset_dialog = None
         self.chrome_opener = open_chrome
-        self.setWindowTitle("遗弃之地 · 插件管理器")
+        info = build_info()
+        self.version_text = f'v{info.version} · {"发行版" if info.is_release else "调试版"}'
+        self.setWindowTitle(f'遗弃之地 · 插件管理器 · {self.version_text}')
         self.resize(1080, 780)
         self.setMinimumSize(820, 560)
         self.tree = QTreeWidget()
@@ -118,19 +121,31 @@ class PluginWindow(QMainWindow):
             if not panel_enabled(key) or not visible_tasks(key):
                 continue
             self._add_page(key, self._task_page(key, title))
+        self._add_page("battle_assist", create_battle_assist_panel(self.store))
+        self._add_page("control_chain", create_battle_assist_panel(self.store))
+        self._add_page("zhongkui", create_zhongkui_panel(self.store))
         self._add_page("bloodmoon", BloodmoonPanel(self.store))
         self._add_page("player", PlayerPanel(self.store))
         self._add_page("treasure", TreasurePanel(self.store))
         self._add_page("damage", DamagePanel(self.store))
         self._add_page("desire", DesirePanel(self.store))
         self._add_page("debug", DebugPanel())
-        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("bloodmoon", "血月战场"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
+        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("battle_assist", "PVE辅助"), ("bloodmoon", "血月战场"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
             if not panel_enabled(key):
                 continue
             item = QTreeWidgetItem([title])
             item.setData(0, Qt.ItemDataRole.UserRole, key)
             self.tree.addTopLevelItem(item)
             self.items[key] = item
+        assist_item = self.items.get("battle_assist")
+        if assist_item is not None:
+            item = QTreeWidgetItem(assist_item, ["控制链"])
+            item.setData(0, Qt.ItemDataRole.UserRole, "control_chain")
+            self.items["control_chain"] = item
+            zhongkui_item = QTreeWidgetItem(assist_item, ["钟馗伏魔"])
+            zhongkui_item.setData(0, Qt.ItemDataRole.UserRole, "zhongkui")
+            self.items["zhongkui"] = zhongkui_item
+            assist_item.setExpanded(True)
         daily_item = self.items.get("daily")
         for key, title in (("energy", "体力扫荡"), ("mines", "阴墟墓葬"), ("arena", "定时斗法")):
             if daily_item is None or not panel_enabled(key) or not visible_tasks(key):
@@ -147,6 +162,8 @@ class PluginWindow(QMainWindow):
         self.connection_label = QLabel("未连接 · 运行服务未接入")
         self.bound_id_label = QLabel("绑定ID：未读取")
         self.statusBar().addWidget(self.action_label, 1)
+        self.version_label = QLabel(self.version_text)
+        self.statusBar().addPermanentWidget(self.version_label)
         self.statusBar().addPermanentWidget(self.bound_id_label)
         self.statusBar().addPermanentWidget(self.connection_label)
         # 门禁阶段状态栏也一起收起来，占位面板才是真的"空白"。
@@ -363,7 +380,10 @@ class PluginWindow(QMainWindow):
             button = self.task_panels[task_id].test_button
             if button.isEnabled() != enabled:
                 button.setEnabled(enabled)
-            tooltip = '' if supported else '此任务业务尚未接入'
+            tooltip = ('此任务业务尚未接入' if not supported else
+                       '正在退出插件' if self._closing else
+                       '游戏或插件尚未就绪，请查看底部连接状态' if not (self.game_connected and self.runtime_ready) else
+                       '当前已有操作执行中，请等待收尾' if not available else '')
             if action.toolTip() != tooltip:
                 action.setToolTip(tooltip)
                 button.setToolTip(tooltip)
@@ -403,14 +423,20 @@ class PluginWindow(QMainWindow):
             self.close()
 
     def set_connection(self, *, connected: bool, target_appid: str = "", runtime_ready: bool = False, message: str = ""):
+        was_ready = self.runtime_ready
         self.game_connected = bool(connected and target_appid == self.TARGET_APPID)
         self.runtime_ready = self.game_connected and bool(runtime_ready)
         if self.game_connected:
-            text = "游戏已连接 · " + ("插件就绪" if self.runtime_ready else "等待插件初始化")
+            text = "游戏已连接 · 插件就绪" if self.runtime_ready else "通信已连接 · 功能尚未就绪"
         else:
             text = message or ("非目标游戏，不启用插件" if connected else "等待游戏连接")
         if self.connection_label.text() != text:
             self.connection_label.setText(text)
+        if not self.runtime_ready or not was_ready:
+            task_text = '游戏与插件已就绪，等待启动托管或手动测试' if self.runtime_ready else (message or '功能尚未就绪，等待连接游戏并完成挂载')
+            for panel in self.task_panels.values():
+                if panel.runtime_message.text() != task_text:
+                    panel.runtime_message.setText(task_text)
         self.set_automation_ready(self.game_connected and self.runtime_ready and not self._closing)
         self._update_test_actions()
 

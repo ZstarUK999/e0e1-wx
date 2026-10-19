@@ -46,12 +46,14 @@ async def wait_for_application_exit(window_factory: WindowFactory) -> int:
     return 0
 
 
-def run_qasync_window(window_factory: WindowFactory, *, app_name: str = "e0e1-wx-gui", organization: str = "e0e1") -> int:
+def run_qasync_window(window_factory: WindowFactory, *, app_name: str = "e0e1-wx-gui", organization: str = "e0e1", executor_factory=None) -> int:
     """启动 QApplication，并以 qasync 事件循环托管主窗口。"""
     configure_high_dpi_for_qt()
     app = QApplication.instance() or QApplication(sys.argv)
     configure_application(app, app_name=app_name, organization=organization)
     loop = create_qasync_loop(app)
+    if executor_factory is not None:
+        loop.set_default_executor(executor_factory())
     shutdown_bridge = install_ctrl_c_shutdown(app)
     try:
         with loop:

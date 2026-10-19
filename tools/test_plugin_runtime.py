@@ -603,7 +603,7 @@ def test_resident_script_tracks_pending_operation_and_small_config_messages():
         source=next(params['expression'] for method,params in fake.messages if params and 'createEnergyRuntime' in params.get('expression',''))
         # 用Node假运行api，仅验证生成的驻留容器，不操作任何游戏数据。
         split=source.index('const id =')
-        source=source[:source.index('function createEnergyRuntime')]+'function createEnergyRuntime(g){return {dispatch:async()=>await g.release};}\n'+__import__('pathlib').Path('package/plugin_manager/automation_overlay.js').read_text(encoding='utf-8')+'\n'+source[split:]
+        source=source[:source.index('function createEnergyRuntime')]+'function createEnergyRuntime(g){return {dispatch:async()=>await g.release};}\nfunction createBattleAssistRuntime(){return {configure:async()=>{},destroy(){}};}\n'+__import__('pathlib').Path('package/plugin_manager/automation_overlay.js').read_text(encoding='utf-8')+'\n'+source[split:]
         code='''const assert=require('node:assert/strict'); const vm=require('node:vm');
 const source=require('fs').readFileSync(process.argv[1],'utf8'); const g={};let resolve;g.release=new Promise(r=>resolve=r);vm.createContext(g);vm.runInContext(source,g);
 (async()=>{const r=g.__e0e1PluginRuntime;const job=r.dispatch('sweep',{});assert.equal(r.pending,true);const blocked=await r.dispatch('eye',{});assert.equal(blocked.status,'uncertain');await r.dispatch('configure',{daily:{enabled:false}});assert.equal(r.pending,true);resolve({status:'ok',value:1});await job;assert.equal(r.pending,false);await r.dispatch('stop',{});assert.equal((await r.dispatch('sweep',{})).status,'unavailable');})().catch(e=>{console.error(e);process.exit(1)});'''
@@ -1049,6 +1049,110 @@ def test_idle_overlay_reports_waiting_and_next_check_timestamp(app,tmp_path):
             assert value['active'] and value['phase']=='waiting'
             assert '体力' in value['next_task']
             assert 88 < value['next_check_at']/1000-time.time() <= 90
+        finally:
+            await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+def test_update_download_runs_without_blocking_runtime_and_reports_progress(app,tmp_path,monkeypatch):
+    import threading
+    from package.plugin_manager import runtime as module
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        entered=threading.Event();release=threading.Event()
+        monkeypatch.setattr(module.updater,'pending_update',lambda:None)
+        monkeypatch.setattr(module.updater,'check',lambda **kwargs:{'version':'9.9','changed':[{}],'removed':[]})
+        def prepare(plan,progress,cancel_event):
+            entered.set();progress(5,10,'app.bin');release.wait(1)
+        monkeypatch.setattr(module.updater,'prepare',prepare)
+        try:
+            await c._check_update_once()
+            for _ in range(100):
+                if entered.is_set():break
+                await asyncio.sleep(.005)
+            assert entered.is_set() and not c._update_job.done()
+            await asyncio.sleep(.01)
+            assert '50%' in w.action_label.text()
+            release.set();await c._update_job
+            assert c._update_checked and '自动安装' in w.action_label.text()
+        finally:
+            release.set();await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+def test_update_failure_retries_and_handles_removal_only(app,tmp_path,monkeypatch):
+    from package.plugin_manager import runtime as module
+    async def run():
+        c,s,t,w=make_controller(tmp_path);checks=[];downloads=[]
+        monkeypatch.setattr(module.updater,'pending_update',lambda:None)
+        def check(**kwargs):
+            checks.append(1)
+            if len(checks)==1:raise RuntimeError('offline')
+            return {'version':'9.9','changed':[],'removed':['old.dll']}
+        monkeypatch.setattr(module.updater,'check',check)
+        monkeypatch.setattr(module.updater,'prepare',lambda plan,**kwargs:downloads.append(plan))
+        try:
+            await c._check_update_once();await c._update_job
+            assert not c._update_checked and c._next_update_check>0
+            await c._check_update_once();assert len(checks)==1
+            c._next_update_check=0
+            await c._check_update_once();await c._update_job
+            assert c._update_checked and downloads[0]['removed']==['old.dll']
+        finally:
+            await c.shutdown();w.close()
+    asyncio.run(run())
+
+
+def test_handshake_timeout_cleans_connection_and_next_attempt_recovers():
+    async def run():
+        from package.plugin_manager.transport import PluginTransport,CdpConnectionPending
+        class SlowCdp(FakeCdp):
+            fail=True
+            closed=0
+            async def close(self):
+                self.closed+=1
+                await super().close()
+            async def send(self,method,params=None,**kw):
+                if method=='Runtime.enable':
+                    assert not transport.connected
+                    if self.fail:raise TimeoutError()
+                return await super().send(method,params,**kw)
+        cdp=SlowCdp();transport=PluginTransport(cdp=cdp)
+        with pytest.raises(CdpConnectionPending,match='Runtime.enable'):
+            await transport.connect(62000)
+        assert not transport.connected and not cdp.live and cdp.closed==1
+        assert transport.port is None and not transport.contexts
+        cdp.fail=False
+        await transport.connect(62000)
+        assert transport.connected and cdp.live and transport.port==62000
+    asyncio.run(run())
+
+
+def test_handshake_cancellation_closes_socket_and_is_not_swallowed():
+    async def run():
+        from package.plugin_manager.transport import PluginTransport
+        class CancelCdp(FakeCdp):
+            async def send(self,method,params=None,**kw):raise asyncio.CancelledError()
+        cdp=CancelCdp();transport=PluginTransport(cdp=cdp)
+        with pytest.raises(asyncio.CancelledError):await transport.connect(62000)
+        assert not transport.connected and not cdp.live and transport.port is None
+    asyncio.run(run())
+
+
+def test_probe_timeout_pauses_daily_and_retains_operation_identity(app,tmp_path):
+    async def run():
+        c,s,t,w=make_controller(tmp_path)
+        try:
+            await ready(c,s)
+            installed=c.state.installed
+            c.automation.running=True
+            async def timeout():raise TimeoutError()
+            t.probe=timeout
+            await c.poll()
+            assert c.state.stop_operation and c.state.blocked
+            assert c.state.blocked_session==installed
+            assert c.state.installed==installed,'timeout must not imply an action was cancelled or a resident destroyed'
+            assert '未响应' in w.connection_label.text()
         finally:
             await c.shutdown();w.close()
     asyncio.run(run())

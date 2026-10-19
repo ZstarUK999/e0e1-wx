@@ -59,6 +59,8 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/daily_tasks/sweep_runtime.js", "package/daily_tasks"),
     ("package/plugin_manager/desire_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/automation_overlay.js", "package/plugin_manager"),
+    ("package/plugin_manager/pve_assist_overlay.js", "package/plugin_manager"),
+    ("package/plugin_manager/battle_assist_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/douyin_bridge.js", "package/plugin_manager"),
     ("tools/config/daily_tasks.json", "tools/config"),
     ("tools/js", "tools/js"),

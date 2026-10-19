@@ -43,7 +43,7 @@ function fixture(){
   observe:async(expected,action,verify)=>{assert.ok(expected.every(fn=>typeof fn==='function'));await action();assert.ok(verify());return {items:[]};},
   dismissRewards:async()=>{},home:async()=>{},log:message=>logs.push(String(message))};
  const g={ROLE,System:{import:async()=>({MineItemState:types})}};
- const sandbox={setTimeout,clearTimeout};vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../package/daily_tasks/daily_runtime.js'),'utf8'),sandbox);
+ const sandbox={setTimeout,clearTimeout};vm.runInNewContext(fs.readFileSync(process.env.DAILY_RUNTIME_SOURCE || path.join(__dirname,'../package/daily_tasks/daily_runtime.js'),'utf8'),sandbox);
  return {api:sandbox.createDailyRuntime(g,h),events,ROLE,cfg,windows,views,h,recruitItem,other,pages,logs,
   setRefreshList:fn=>{refreshProvider=fn;},refreshCount:()=>refreshIndex,
   useBlankResult:()=>{blankResult=true;},blankTaps:()=>blankTaps,
@@ -245,4 +245,56 @@ test('retry scan keeps looking for the preferred player instead of stopping at a
  const f=fixture();f.setRefreshList(index=>index===1?[{id:12,siteNum:20}]:[{id:13,siteNum:20}]);
  const scan=await f.api.dispatch('tomb_targets',{kind:'sanshi',mode:'raid',refresh:true,minimum:16,preferred_id:13});
  assert.equal(scan.refresh_count,2);assert.equal(scan.targets[0].id,13);
+});
+
+
+test('two fills then server refusal switches player through native next button without recreating target UI',async()=>{
+ const f=fixture();f.setInitialList(()=>[{id:11,siteNum:0},{id:12,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind:'artifact',mode:'fill',refresh:false});
+ await f.api.dispatch('tomb_fill',{kind:'artifact',id:11});await f.api.dispatch('tomb_fill',{kind:'artifact',id:11});
+ const root=f.windows.get(f.cfg.MineOtherUI);root._mineType=1;root._openMineType=1;root.targetIds=[11,12];root.targetIndex=0;
+ const help=f.other.btn_help.run;f.other.btn_help.run=()=>{throw Object.assign(new Error('暂无可填土墓藏'),{status:'rejected'});};
+ await assert.rejects(f.api.dispatch('tomb_fill',{kind:'artifact',id:11}),/暂无可填土墓藏/);f.other.btn_help.run=help;
+ root.view.btn_next={name:'native-next',run:async()=>{await new Promise(r=>setTimeout(r,10));root.targetIndex=1;f.other._targetId=12;f.other._loadedTargetId=12;}};
+ await f.api.dispatch('tomb_fill',{kind:'artifact',id:12});
+ assert.equal(f.ROLE.artifactMine.helpNumDay,3);assert(f.events.includes('native-next'));assert(!f.events.includes('goto:12'));
+});
+
+test('nonadjacent target fully exits old page and ignores a released transitional component',async()=>{
+ const f=fixture();f.setInitialList(()=>[{id:11,siteNum:0},{id:12,siteNum:0}]);
+ await f.api.dispatch('tomb_targets',{kind:'artifact',mode:'fill',refresh:false});await f.api.dispatch('tomb_fill',{kind:'artifact',id:11});
+ const old=f.windows.get(f.cfg.MineOtherUI);
+ f.h.home=async()=>{f.events.push('safe-home');old.view=null;f.windows.delete(f.cfg.MineOtherUI);};
+ const baseClick=f.h.click;
+ f.h.click=async button=>{
+   if(button.name==='goto:12'){
+     await baseClick(button);const fresh=f.windows.get(f.cfg.MineOtherUI);
+     f.windows.set(f.cfg.MineOtherUI,old);
+     setTimeout(()=>f.windows.set(f.cfg.MineOtherUI,fresh),10);return;
+   }
+   return await baseClick(button);
+ };
+ f.h.wait=async predicate=>{for(let i=0;i<30;i++){const v=predicate();if(v)return v;await new Promise(r=>setTimeout(r,3));}throw Error('wait failed');};
+ await f.api.dispatch('tomb_fill',{kind:'artifact',id:12});
+ assert(f.events.includes('safe-home'));assert.equal(f.ROLE.artifactMine.helpNumDay,2);
+ assert.notEqual(f.windows.get(f.cfg.MineOtherUI),old);
+});
+
+
+test('a released MineOtherUI during PageTurning is observed without dereferencing its null view',async()=>{
+ const f=fixture();f.cfg.PageTurning={id:'PageTurning'};
+ await f.api.dispatch('tomb_targets',{kind:'artifact',mode:'fill',refresh:false});
+ const baseClick=f.h.click;
+ f.h.click=async button=>{
+   if(button.name==='goto:11'){
+     await baseClick(button);const fresh=f.windows.get(f.cfg.MineOtherUI);
+     f.windows.set(f.cfg.MineOtherUI,{view:null});f.windows.set(f.cfg.PageTurning,{});
+     setTimeout(()=>f.windows.set(f.cfg.MineOtherUI,fresh),8);
+     setTimeout(()=>f.windows.delete(f.cfg.PageTurning),15);return;
+   }
+   if(button===f.other.btn_help)assert(!f.windows.has(f.cfg.PageTurning),'do not fill during the native transition');
+   return await baseClick(button);
+ };
+ f.h.wait=async predicate=>{for(let i=0;i<30;i++){const v=predicate();if(v)return v;await new Promise(r=>setTimeout(r,3));}throw Error('wait failed');};
+ await f.api.dispatch('tomb_fill',{kind:'artifact',id:11});assert.equal(f.ROLE.artifactMine.helpNumDay,1);
 });

@@ -40,7 +40,7 @@ def test_store_defaults_independent_and_only_configuration(app, tmp_path):
     s, _ = modules()
     store = s.PluginConfigStore(tmp_path / "plugins.json")
     state = store.snapshot()
-    assert set(state) == {"version", "daily", "player", "ui", "treasure", "damage", "desire", "bloodmoon"}
+    assert set(state) == {"version", "daily", "player", "ui", "treasure", "damage", "desire", "bloodmoon", "battle_assist"}
     assert state["ui"]["delay_ms"] == 500
     assert state["treasure"] == {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30}
     assert state["damage"] == {"enabled": False, "auto_csv": True}
@@ -100,10 +100,10 @@ def test_invalid_saved_config_is_not_overwritten(app, tmp_path):
 
 def test_tree_navigation_and_truthful_unconnected_state(window):
     tree = window.tree
-    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "血月战场", "玩家信息透视", "摸金地图", "PVP伤害分析", "三尸合成", "调试信息"]
+    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "PVE辅助", "血月战场", "玩家信息透视", "摸金地图", "PVP伤害分析", "三尸合成", "调试信息"]
     root = tree.topLevelItem(1)
     assert [root.child(i).text(0) for i in range(root.childCount())] == ["体力扫荡", "阴墟墓葬", "定时斗法"]
-    assert set(window.pages) == {"global", "daily", "energy", "mines", "arena", "bloodmoon", "player", "treasure", "damage", "desire", "debug"}
+    assert set(window.pages) == {"global", "daily", "energy", "mines", "arena", "battle_assist", "control_chain", "zhongkui", "bloodmoon", "player", "treasure", "damage", "desire", "debug"}
     assert "未接入" in window.connection_label.text()
     assert not window.game_connected
     # 血月页已接入：有开关，但游戏与插件未就绪时按钮一律不可用。
@@ -641,3 +641,24 @@ def test_fast_shutdown_never_flashes_wait_dialog(window, app):
     app.processEvents()
     assert window._shutdown_dialog is None
     assert not window._shutdown_delay_timer.isActive()
+
+
+def test_game_overlay_switch_persists_without_disabling_task_logic(window):
+    box=window.pages['global'].game_overlays
+    daily=window.store.snapshot()['daily']
+    assist=window.store.snapshot()['battle_assist']
+    box.setChecked(False)
+    assert window.store.snapshot()['ui']['game_overlays'] is False
+    assert window.store.snapshot()['daily']==daily
+    assert window.store.snapshot()['battle_assist']==assist
+    box.setChecked(True)
+    assert window.store.snapshot()['ui']['game_overlays'] is True
+
+
+def test_legacy_config_starts_overlay_isolation_until_explicitly_enabled():
+    from package.plugin_manager.store import default_config, validate_config
+    raw=default_config()
+    raw['ui'].pop('game_overlays')
+    assert validate_config(raw)['ui']['game_overlays'] is False
+    raw['ui']['game_overlays']=True
+    assert validate_config(raw)['ui']['game_overlays'] is True

@@ -680,19 +680,26 @@ function createEnergyRuntime(g, timing) {
     const awaken = [];
     eachMap(snapshot.epicAwakening, 20, (branches, bookId) => {
       if (!isMap(branches)) return;
-      const parts = [];
-      eachMap(branches, 20, (level, branchId) => parts.push(label(branchId, 'SkillBookEvolutionCfg') + ' Lv.' + level));
-      if (parts.length) awaken.push(label(bookId, 'SkillBookCfg') + '：' + parts.join('、'));
+      const main = [], parts = [];
+      eachMap(branches, 20, (level, branchId) => {
+        const row = rowOf('SkillBookEvolutionCfg', branchId);
+        const text = label(branchId, 'SkillBookEvolutionCfg') + ' Lv.' + level;
+        (row && Number(row.evolutionPath) === 2 ? main : parts).push(text);
+      });
+      if (main.length || parts.length) {
+        awaken.push(label(bookId, 'SkillBookCfg') + (main.length ? ' · 主阶：' + main.join('、') : ' · 主阶资料未下发'));
+        if (parts.length) awaken.push('    分支：' + parts.join('、'));
+      }
     });
     const combines = [];
     eachMap(snapshot.skillCombineLevel, 20, (level, id) =>
       combines.push((nameOf('RareskillCombCfg', id) || nameOf('SkillBookCfg', id) || ('ID' + id)) + ' Lv.' + level));
     const bookLines = [].concat(
       books.length ? ['装备中：' + books.join('、')] : [],
-      levels.length ? ['天书等级：' + levels.join('、')] : [],
-      epics.length ? ['顶级天书：' + epics.join('、')] : [],
-      awaken.length ? ['顶级天书觉醒：' + awaken.join('；')] : [],
-      combines.length ? ['天书组合：' + combines.join('、')] : []);
+      levels.length ? ['天书等级：', ...levels.map(line => '  ' + line)] : [],
+      epics.length ? ['顶级天书：', ...epics.map(line => '  ' + line)] : [],
+      awaken.length ? ['顶级天书觉醒：', ...awaken.map(line => '  ' + line)] : [],
+      combines.length ? ['天书组合：', ...combines.map(line => '  ' + line)] : []);
     if (bookLines.length) out.push('── 天书 ──\n  ' + bookLines.join('\n  '));
 
     const desire = (planMap, title) => {

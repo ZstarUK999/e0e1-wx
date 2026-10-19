@@ -24,7 +24,7 @@ const table=rows=>({list:rows,getById:id=>rows.find(r=>r.id===Number(id))});
  console.log('PASS actual equipped fashion is first, display-only and missing snapshots are distinguished');
  const damage=await load('damage_curve_probe.js',`return {classify:e0e1Classify,newState:e0e1NewState,handler:e0e1MakeHandler,collect:e0e1CollectSide,
  setCfg(c){E0E1_CFG=c;E0E1_EVO=null;E0E1_ORIGIN=null;},setManagers(b,d){E0E1_BM=b;E0E1_DUAL=d;},patch:e0e1PatchBattleManager,
- sweep:e0e1AttachAll,watched(){return E0E1_WATCHED.length;},replays(){return E0E1_REPLAY_CONTEXTS.length;},stop:damageCurveStop,sides(){return E0E1_SIDES;},pvp(){return E0E1_PVP;}};`);
+ watch:e0e1WatchWorld,sweep:e0e1AttachAll,watched(){return E0E1_WATCHED.length;},replays(){return E0E1_REPLAY_CONTEXTS.length;},stop:damageCurveStop,sides(){return E0E1_SIDES;},pvp(){return E0E1_PVP;}};`);
  damage.setCfg(cfg);
  assert.equal(damage.classify(11100).cat,'leifa');assert.equal(damage.classify(11101).cat,'leifa');
  assert.equal(damage.classify(222).cat,'fashion');assert.match(damage.classify(11100).origin,/雷法尊者/);
@@ -59,6 +59,27 @@ const table=rows=>({list:rows,getById:id=>rows.find(r=>r.id===Number(id))});
  damage.patch();await c.start({isReplay:true,openType:2,seed:3});assert.equal(damage.sides().self.world,c.selfBattleWorld);
  damage.stop();assert.equal(manager.createBattle,originalCreate);
  console.log('PASS stopping and re-enabling restores original methods without duplicate hooks');
+ // Bloodmoon replay discovered after start: no replay tag, enemy world first.
+ function untaggedPair(seed,enemyFirst){
+   const metrics={}, make=isSelf=>manager.createBattle(20,{mineInfo:{isSelf,score:800,pvpMetrics:metrics},battleData:{type:20,randomSeed:seed,leftTeam:{team:[]},rightTeam:{team:[]}}});
+   const self=make(true),other=make(false);
+   for(const world of enemyFirst?[other,self]:[self,other])damage.watch(world);
+   assert.equal(damage.sides().self.world,self);assert.equal(damage.sides().other.world,other);
+   return {self,other};
+ }
+ untaggedPair(43,false);
+ damage.pvp().samples.push({sec:99});
+ const pair=untaggedPair(44,true);
+ assert.equal(damage.pvp().samples.length,0);
+ damage.handler(damage.sides().other)({},11100,123,{compBoss:true},false);
+ damage.watch(pair.self);damage.watch(pair.other);
+ assert.equal(damage.collect(damage.sides().other).totalDamage,123);
+ damage.pvp().samples.push({sec:55});
+ untaggedPair(44,false); // Same seed, different metrics means a new battle.
+ assert.equal(damage.pvp().samples.length,0);
+ assert.equal(damage.collect(damage.sides().other).totalDamage,0);
+ damage.stop();
+ console.log('PASS untagged bloodmoon replay retains enemy data in either order and isolates repeated seeds');
  const template=fs.readFileSync(path.join(__dirname,'../package/plugin_manager/damage_report/template.py'),'utf8');
  const reportScript=template.match(/<script>\s*([\s\S]*?)<\/script>/)[1];new vm.Script(reportScript);
  const render=reportScript.slice(reportScript.indexOf('  function renderBookComparison'),reportScript.indexOf('  // ── 拆解图'));

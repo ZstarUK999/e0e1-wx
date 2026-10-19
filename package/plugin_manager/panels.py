@@ -272,6 +272,12 @@ class GlobalPanel(QWidget):
         self.delay.setSuffix(" 毫秒")
         self.delay.setValue(store.snapshot()["ui"]["delay_ms"])
         self.form.addRow("UI 操作间隔", self.delay)
+        self.game_overlays = QCheckBox("显示日常／PVE游戏悬浮窗")
+        self.game_overlays.setObjectName("ui.game_overlays")
+        self.game_overlays.setChecked(store.snapshot()["ui"]["game_overlays"])
+        self.game_overlays.setToolTip("关闭后移除日常和PVE的自定义悬浮窗，用于白屏对照排查；日常、控制链和3倍按钮功能仍保留。")
+        self.form.addRow("游戏悬浮窗", self.game_overlays)
+        self.game_overlays.toggled.connect(store.set_game_overlays)
         note = QLabel("每一步 UI 操作之间等待的时间，方便观察执行过程；只影响节奏，不改变任何安全检查。\n"
                       "目标游戏需要你自己在微信里打开：插件不会主动打开微信或小游戏。")
         note.setWordWrap(True)
@@ -287,6 +293,7 @@ class GlobalPanel(QWidget):
         store.changed.connect(lambda state: self.sync(state))
 
     def sync(self, state):
+        set_checked(self.game_overlays,state["ui"]["game_overlays"])
         value = state["ui"]["delay_ms"]
         if self.delay.value() != value:
             self.delay.setValue(value)

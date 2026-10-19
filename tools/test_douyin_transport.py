@@ -223,6 +223,8 @@ def test_douyin_probe_renews_runtime_and_resident_bound_keepalive_lease(tmp_path
         live(cache, runtime='lease-runtime', resident='lease-resident')
         transport = DouyinTransport(cache)
         await transport.connect()
+        transport.session_id='lease-resident'
+        transport._owned_ids.add('lease-resident')
         await transport.probe()
         lease = json.loads(cache.mailbox('lease').read_text(encoding='utf-8'))
         assert lease['token'] == cache.token

@@ -815,7 +815,7 @@ await (async function () {
     return done({ reset: true });
   }
 
-  g.e0e1Season = { ready: true, version: VERSION };
+  g.e0e1Season = { ready: true, version: VERSION, pendingState: function(){return {pending:state.pending,uncertain:state.uncertain,outstanding:state.outstanding};} };
   var methods = { flags: flags, march: march, speedUp: speedUp, candidates: candidates,
     attack: attack, marks: marks, diagnose: diagnose, stop: stop, reset: reset };
   Object.keys(methods).forEach(function (name) { g.e0e1Season[name] = exportCall(name, methods[name]); });

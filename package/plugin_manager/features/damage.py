@@ -34,6 +34,9 @@ class DamageFeature:
         self._report_path = None
         self._next_poll = 0.0
         self._perf_running = False
+        self._take_lock = asyncio.Lock()
+        self._snapshot_signature = None
+        self._next_snapshot = 0.0
         self.panel.set_report_directory(REPORT_DIR)
 
     # ── 面板操作 ──
@@ -65,6 +68,8 @@ class DamageFeature:
                 self._last = None
                 self._pending = None
                 self._battle_key = None
+                self._snapshot_signature = None
+                self._next_snapshot = 0.0
                 self._written = False
                 self.panel.set_status(str(message))
                 self.panel.set_summary('已清空，进入下一场 PVP 会重新开始采集')
@@ -130,6 +135,8 @@ class DamageFeature:
                 self._injected = False
                 self._pending = None
                 self._battle_key = None
+                self._snapshot_signature = None
+                self._next_snapshot = 0.0
                 self._written = False
                 self.panel.set_status('未启用（打开开关后自动开始）')
                 self.panel.set_hint('')
@@ -146,59 +153,80 @@ class DamageFeature:
             self.panel.set_status(f'采集检查失败：{exc}')
 
     async def take(self, *, force: bool = False) -> None:
-        """取一次状态与快照：更新面板；战斗结束（没有 World 了）时落盘出报告。"""
+        # Polling and manual refresh share a single fetch/report operation.
+        if self._take_lock.locked():
+            return
+        async with self._take_lock:
+            await self._take(force=force)
+
+    async def _take(self, *, force: bool = False) -> None:
         status = await self.transport.damage_status()
         hooked = int(status.get('hooked') or 0) if isinstance(status, dict) else 0
-
+        sides = (status.get('sides') or {}) if isinstance(status, dict) else {}
+        signature = (getattr(self.transport, 'context_id', None), json.dumps({
+            'sides': sides, 'samples': status.get('pvpSamples') if isinstance(status, dict) else None,
+        }, sort_keys=True))
+        identities = tuple((key, (sides.get(key) or {}).get('instanceId')) for key in ('self','other'))
+        previous_ids = getattr(self, '_snapshot_ids', None)
+        changed = signature != self._snapshot_signature
+        has_retained = any(isinstance(side, dict) and side.get('eventCount') for side in sides.values())
+        # The JS collector retains the final pure-data snapshot after World detach.
+        # Fetch it once when its revision differs, before writing the final report.
+        fetch = force or changed and (hooked > 0 or has_retained or self._pending is not None)
+        if fetch and hooked > 0 and not force and identities == previous_ids and time.monotonic() < self._next_snapshot:
+            fetch = False
+        if fetch:
+            started = time.monotonic()
+            data = await self.transport.damage_snapshot()
+            if isinstance(data, dict) and self._has_data(data):
+                self._snapshot_signature = signature
+                self._snapshot_ids = identities
+                self._next_snapshot = time.monotonic() + 3.0
+                self._last = data
+                key = self._battle_key_of(data)
+                if key != self._battle_key:
+                    if self._pending is not None and not self._written:
+                        await self.write_report(self._pending, '上一场')
+                    self._battle_key = key
+                    self._written = False
+                self._pending = data
+                self._written = False
+                self.panel.set_status(self.status_text(data))
+                self.panel.set_hint(self.hint(data))
+                self.panel.set_summary(self.summary(data))
+                elapsed = time.monotonic() - started
+                if elapsed >= 1.0:
+                    LOG.info('伤害快照同步耗时 %.2f秒', elapsed)
+            elif hooked > 0:
+                self.panel.set_status('采集中 · 等待伤害事件')
+        if (force or hooked <= 0) and self._pending is not None and (force or not self._written):
+            self._written = await self.write_report(self._pending, '当前' if force else '本场')
         if hooked <= 0:
-            # 没有挂上任何 World：上一场已经结束，把它最后一次快照落盘
-            if self._pending is not None and not self._written:
-                self.write_report(self._pending, '本场')
-                self._written = True
-            detail = ''
-            if isinstance(status, dict):
-                hooked = int(status.get('hooked') or 0)
-                detail = '' if hooked else '（未挂上任何 World）'
-            self.panel.set_status(f'采集中 · 等待进入 PVP 对局{detail}')
+            self.panel.set_status('采集中 · 等待进入 PVP 对局（未挂上任何 World）')
             self.panel.set_hint(self.hint(self._pending or {}))
-            return
 
-        data = await self.transport.damage_snapshot()
-        if not isinstance(data, dict) or not self._has_data(data):
-            self.panel.set_status('采集中 · 等待伤害事件')
-            return
-
-        self._last = data
-        key = self._battle_key_of(data)
-        if key != self._battle_key:
-            # 换了新的一场：先把上一场没落盘的补上，再开始记新的
-            if self._pending is not None and not self._written:
-                self.write_report(self._pending, '上一场')
-            self._battle_key = key
-            self._written = False
-        self._pending = data
-
-        self.panel.set_status(self.status_text(data))
-        self.panel.set_hint(self.hint(data))
-        self.panel.set_summary(self.summary(data))
-        if force:
-            self.write_report(data, '当前')
-            self._written = True
-
-    def write_report(self, data: dict, label: str) -> None:
+    async def write_report(self, data: dict, label: str) -> bool:
+        if not self._is_pvp_data(data):
+            return False
+        config = self.store.snapshot().get('damage') or {}
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        started = time.monotonic()
+        self.panel.message.setText('正在后台生成伤害报告…')
         try:
-            config = self.store.snapshot().get('damage') or {}
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-            written = write_outputs(data, REPORT_DIR, stamp, save_json=True,
-                                    write_csv=bool(config.get('auto_csv')), keep_events=True)
+            written = await asyncio.to_thread(
+                write_outputs, data, REPORT_DIR, stamp, save_json=True,
+                write_csv=bool(config.get('auto_csv')), keep_events=True)
             html = next((p for p in written if p.suffix == '.html'), None)
             self._report_path = html
             self.panel.set_report_directory(REPORT_DIR)
             self.panel.refresh_report_history(preferred=html)
-            LOG.info('%s伤害报告已生成：%s', label, html)
+            self.panel.message.setText('伤害报告已生成')
+            LOG.info('%s伤害报告已生成：%s（后台耗时 %.2f秒）', label, html, time.monotonic()-started)
+            return True
         except OSError as exc:
             LOG.error('伤害报告写入失败：%s', exc)
             self.panel.message.setText(f'报告写入失败：{exc}')
+            return False
 
     # ── 渲染 ──
 
@@ -211,7 +239,17 @@ class DamageFeature:
         return None
 
     @staticmethod
+    def _is_pvp_data(data) -> bool:
+        # Official dual-score, client-result and frame-sync PvP battle types.
+        allowed = {8, 16, 18, 19, 20, 24, 25, 26}
+        types = [side.get('battleType') for key in ('self', 'other', 'pvp')
+                 if isinstance(side := data.get(key), dict) and side.get('battleType') is not None]
+        return bool(types) and all(value in allowed for value in types)
+
+    @staticmethod
     def _has_data(data) -> bool:
+        if not DamageFeature._is_pvp_data(data):
+            return False
         for side in (data.get('self'), data.get('other')):
             if isinstance(side, dict) and side.get('eventCount'):
                 return True

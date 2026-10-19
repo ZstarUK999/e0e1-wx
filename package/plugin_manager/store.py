@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, Signal
 from package.daily_tasks.config import parse_config
 
 from .feature_flags import task_enabled
+from .battle_assist import default_battle_assist, validate_battle_assist
 from .paths import default_config_path
 
 SECONDS_MAX = 604800
@@ -67,13 +68,14 @@ def default_config() -> dict:
     daily = {"version": 1, "enabled": False, "timezone": "Asia/Shanghai", "poll_seconds": 1,
              "summary_interval_seconds": 3600, "tasks": tasks}
     return {"version": 1, "daily": daily, "player": {"enabled": False},
-            "ui": {"delay_ms": 500},
+            "ui": {"delay_ms": 500, "game_overlays": True},
             "treasure": {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30},
             "damage": {"enabled": False, "auto_csv": True},
             # 三尸自动合成：kind 1贪 2嗔 3痴；expected_rate 是报告里理论曲线的默认成功率（百分数）。
             "desire": {"kind": 1, "start_quality": 1, "max_material_quality": 4,
                        "fail_limits": {"1": 4, "2": 4, "3": 4, "4": 4},
                        "max_attempts": 200, "expected_rate": 30.0},
+            "battle_assist": default_battle_assist(),
             "bloodmoon": {"enabled": False,
                           "flag_probe": {"refresh_seconds": 5, "top_members": 3},
                           "speed_up": {"enabled": False, "max_times": 15,
@@ -113,8 +115,8 @@ def _build_daily_tasks(raw_tasks) -> dict:
 
 
 def validate_config(raw: dict) -> dict:
-    if not isinstance(raw, dict) or not {"version", "daily", "player"}.issubset(raw) or set(raw) - {"version", "daily", "player", "ui", "treasure", "damage", "desire", "bloodmoon"}:
-        raise ValueError("插件配置仅允许 version/daily/player/ui/treasure/damage/desire/bloodmoon，不接受运行状态")
+    if not isinstance(raw, dict) or not {"version", "daily", "player"}.issubset(raw) or set(raw) - {"version", "daily", "player", "ui", "treasure", "damage", "desire", "bloodmoon", "battle_assist"}:
+        raise ValueError("插件配置仅允许 version/daily/player/ui/treasure/damage/desire/bloodmoon/battle_assist，不接受运行状态")
     if type(raw["version"]) is not int or raw["version"] != 1:
         raise ValueError("插件配置 version 必须是1")
     raw_daily = raw["daily"]
@@ -147,10 +149,15 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(player, dict) or set(player) != {"enabled"} or type(player["enabled"]) is not bool:
         raise ValueError("player配置只接受enabled布尔开关")
     ui = raw.get("ui", {"delay_ms": 500})
-    if not isinstance(ui, dict) or set(ui) - {"delay_ms", "auto_open_game"}:
+    if not isinstance(ui, dict) or set(ui) - {"delay_ms", "auto_open_game", "game_overlays"}:
         # auto_open_game 已废弃（不再自动打开游戏），老配置里遇到就忽略。
-        raise ValueError("ui配置只接受delay_ms")
+        raise ValueError("ui配置只接受delay_ms/game_overlays")
+    ui=dict(ui)
     ui.pop("auto_open_game", None)
+    # Existing configurations enter the no-custom-overlay diagnostic mode on first upgrade.
+    ui.setdefault("game_overlays", False)
+    if type(ui["game_overlays"]) is not bool:
+        raise ValueError("game_overlays须为布尔开关")
     if type(ui.get("delay_ms")) is not int or not 0 <= ui["delay_ms"] <= 5000:
         raise ValueError("ui配置只接受0至5000毫秒的整数delay_ms")
     treasure = raw.get("treasure", {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30})
@@ -172,7 +179,7 @@ def validate_config(raw: dict) -> dict:
     bloodmoon = _validate_bloodmoon(raw.get("bloodmoon"))
     return {"version": 1, "daily": daily.raw, "player": dict(player), "ui": dict(ui),
             "treasure": dict(treasure), "damage": dict(damage), "desire": desire,
-            "bloodmoon": bloodmoon}
+            "bloodmoon": bloodmoon, "battle_assist": validate_battle_assist(raw.get("battle_assist"))}
 
 
 def _validate_desire(raw) -> dict:
@@ -307,6 +314,11 @@ class PluginConfigStore(QObject):
         raw["player"]["enabled"] = enabled
         self._commit(raw)
 
+    def set_game_overlays(self, enabled: bool) -> None:
+        raw=self.snapshot()
+        raw['ui']['game_overlays']=enabled
+        self._commit(raw)
+
     def set_ui_delay(self, delay_ms: int) -> None:
         raw = self.snapshot()
         raw["ui"]["delay_ms"] = delay_ms
@@ -326,6 +338,11 @@ class PluginConfigStore(QObject):
     def set_desire(self, patch: dict) -> None:
         raw = self.snapshot()
         raw["desire"].update(copy.deepcopy(patch))
+        self._commit(raw)
+
+    def set_battle_assist(self, config: dict) -> None:
+        raw = self.snapshot()
+        raw["battle_assist"] = copy.deepcopy(config)
         self._commit(raw)
 
     def set_bloodmoon(self, patch: dict) -> None:

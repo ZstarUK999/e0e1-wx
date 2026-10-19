@@ -86,6 +86,7 @@ function createDailyRuntime(g,h) {
   async function closeScreen(which) {
     const view=h.ui().find(which), screen=view && view.ui;
     if (!screen) return;
+    if(!screen.view)throw fail('页面正在释放，未点击关闭或导航按钮','uncertain');
     const button=screen.view.btn_close || screen.view.button_close || screen.view.btn_back;
     if (!button) throw fail('页面关闭按钮未核实');
     await h.click(button);
@@ -142,6 +143,7 @@ function createDailyRuntime(g,h) {
     minimum=Number(minimum)||0;
     // 目标页有官方列表入口，不必为打开列表绕回大厅。
     const otherRoot=h.ui().findOpen(cfg.MineOtherUI);
+    if(otherRoot && !otherRoot.view)throw fail('目标墓藏正在释放，未发起新的导航','uncertain');
     let existing=h.ui().findOpen(cfg.MineListUI);
     if (existing && existing.mineType!=null && existing.mineType!==kindNumber(kind)) {
       await closeScreen(cfg.MineListUI);existing=null;
@@ -205,22 +207,49 @@ function createDailyRuntime(g,h) {
     }
     return {targets:current(),refresh_count:count,new_players:discovered.size,reached_minimum:reached()};
   }
-  async function readyOther(root,kind,id) {
-    const view=h.ui().find(config().cfg.MineOtherUI);
-    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'目标墓藏打开尚未完成');
+  function otherPage(root,kind) {
+    return root && root.view && (kind==='sanshi'?root.view.mine_other_sanshi:root.view.mine_other_magic_artifact);
+  }
+  function navigating() {
+    const which=config().cfg.PageTurning;
+    if(!which)return false;
+    const retained=h.ui().find(which);
+    return !!h.ui().findOpen(which) || !!(retained && (retained.loading || retained.showing));
+  }
+  async function readyOther(_root,kind,id) {
+    const cfg=config().cfg, view=h.ui().find(cfg.MineOtherUI);
+    if(view && view.waitAfterOpen)await h.bounded(view.waitAfterOpen,'目标墓藏打开尚未完成');
+    // The native list callback destroys the previous MineOtherUI before asynchronously creating its replacement.
+    // Reacquire it on every observation; never retain the pre-transition component or dereference its released view.
     return await h.wait(()=>{
-      const page=root && (kind==='sanshi'?root.view.mine_other_sanshi:root.view.mine_other_magic_artifact);
+      if(navigating())return false;
+      const root=h.ui().findOpen(cfg.MineOtherUI),retained=h.ui().find(cfg.MineOtherUI);
+      if(!root || root.isValid===false || !root.view || retained && (retained.loading || retained.showing===false))return false;
+      const page=otherPage(root,kind);
       return page && (!page.node || page.node.activeInHierarchy!==false) &&
         page._targetId===id && page._loadedTargetId===id && !page._helpBusy &&
         page.btn_help && page.btn_help.interactable!==false && page;
-    },'目标墓藏信息仍在加载或目标不匹配');
+    },'目标墓藏信息仍在加载、切换或目标不匹配');
   }
   async function other(kind,id,mode) {
     const {cfg}=config();const active=h.ui().findOpen(cfg.MineOtherUI);
-    const activePage=active && (kind==='sanshi'?active.view.mine_other_sanshi:active.view.mine_other_magic_artifact);
-    if (activePage && active._mineType!==undefined && active._mineType!==kindNumber(kind)) {
-      await closeScreen(cfg.MineOtherUI);
-    } else if (activePage && activePage._targetId===id) return await readyOther(active,kind,id);
+    if(active && !active.view)throw fail('目标墓藏正在释放，停止切换玩家','uncertain');
+    const activePage=otherPage(active,kind),sameKind=active &&
+      (active._mineType===undefined || active._mineType===kindNumber(kind));
+    if(activePage && sameKind && activePage._targetId===id)return await readyOther(active,kind,id);
+    if(active) {
+      // The next-player button keeps the existing page alive and awaits its native transition.
+      if(activePage && sameKind && active._openMineType===kindNumber(kind) &&
+         Array.isArray(active.targetIds) && active.targetIds[active.targetIndex+1]===id && active.view.btn_next) {
+        await readyOther(active,kind,activePage._targetId);
+        await h.click(active.view.btn_next);
+        return await readyOther(null,kind,id);
+      }
+      // Non-adjacent target: finish the normal back/close lifecycle before opening a new list.
+      // Do not launch gotoOtherMine while the old MineOtherUI is still being destroyed.
+      await h.home();
+      await h.wait(()=>!h.ui().findOpen(cfg.MineOtherUI) && !navigating(),'旧目标墓藏尚未退出，未切换玩家');
+    }
     let screen=h.ui().findOpen(cfg.MineListUI);
     if (!screen || screen._curSelect!==(mode==='fill'?1:0)) {
       await targets(kind,mode,false);screen=h.ui().findOpen(cfg.MineListUI);
