@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import multiprocessing as mp
+import os
+import threading
 import queue
 import socket
 from typing import Awaitable, Callable
@@ -2361,6 +2363,13 @@ class AsyncDevtoolsWorker:
 
 def devtools_worker_main(event_queue: mp.Queue, command_queue: mp.Queue) -> None:
     """共享 DevTools worker 进程入口。"""
+    parent = mp.parent_process()
+    if parent is not None:
+        # 独立线程等待父进程句柄，即使 asyncio 或 Frida 清理卡住也能释放监听端口。
+        def watch_parent():
+            parent.join()
+            os._exit(0)
+        threading.Thread(target=watch_parent, name='devtools-parent-watch', daemon=True).start()
     asyncio.run(AsyncDevtoolsWorker(event_queue, command_queue).run())
 
 

@@ -155,7 +155,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     <section class="card">
       <h2>三尸合成概率</h2>
-      <p class="note">前三种常驻展示；批次与日期范围选好后点「应用」才会计算。
+      <p class="note">批次选择会同步筛选全部统计和图表；不选批次表示全部；可按时间顺序仅显示筛选结果的前 N 次合成，留空显示全部。日期统计在当前结果内计算。
         「配置表概率」是二合一在该材料品质上的理论成功率，读自游戏内的合成配置表。</p>
 
       <h3>1 · 总表</h3>
@@ -172,6 +172,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <label>批次（可多选，Ctrl/Shift 或拖动）
           <select id="batch" multiple size="6"></select>
         </label>
+        <label>显示前多少次合成<input id="attempt-limit" type="number" min="1" step="1" placeholder="全部" inputmode="numeric"></label>
         <button class="btn" id="batch-apply" type="button">应用</button>
       </div>
       <div id="table-batch"></div>
@@ -212,7 +213,8 @@ HTML_TEMPLATE = r"""<!doctype html>
 (function () {
   "use strict";
   var DATA = JSON.parse(document.getElementById("payload").textContent);
-  var RECORDS = DATA.records || [];
+  var ALL_RECORDS = DATA.records || [];
+  var RECORDS = ALL_RECORDS.slice();
   var COLS = [
     { k: "name", t: "" }, { k: "n", t: "合成次数" }, { k: "ok", t: "成功" }, { k: "fail", t: "失败" },
     { k: "rate", t: "成功率" }, { k: "avg", t: "平均连续失败" }, { k: "max", t: "最长连续失败" },
@@ -245,7 +247,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var g = gapsOf(rows).gaps;
     var sum = g.reduce(function (a, b) { return a + b; }, 0);
     return { n: n, ok: ok, fail: n - ok, rate: n ? ok / n : 0,
-             avg: g.length ? sum / g.length : 0, max: g.length ? Math.max.apply(null, g) : 0 };
+             avg: g.length ? sum / g.length : 0, max: g.length ? Math.max.apply(null, g) : 0, trailing: gapsOf(rows).trailing };
   }
   function cfgOf(quality) {
     var v = (DATA.cfg_ratio || {})[String(quality)];
@@ -410,6 +412,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.getElementById("meta-sub").textContent =
       "生成时间 " + (DATA.generated_at || "") + " · 日志 " + (DATA.log_path || "");
 
+    function renderSelected() {
     var s = summarize(RECORDS);
     var stats = document.getElementById("stats");
     stats.innerHTML = "";
@@ -435,6 +438,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     });
     renderTable(document.getElementById("table-quality"), qualityRows);
 
+      drawHistogram(RECORDS);
+      document.getElementById("date-apply").click();
+    }
+
     var select = document.getElementById("batch");
     select.innerHTML = "";
     (DATA.batches || []).forEach(function (b) {
@@ -447,7 +454,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.getElementById("batch-apply").addEventListener("click", function () {
       var chosen = Array.prototype.filter.call(select.options, function (o) { return o.selected; })
         .map(function (o) { return Number(o.value); });
-      var rows = RECORDS.filter(function (r) { return chosen.indexOf(r.batch) >= 0; });
+      RECORDS = chosen.length ? ALL_RECORDS.filter(function (r) { return chosen.indexOf(r.batch) >= 0; }) : ALL_RECORDS.slice();
+      var limitText = document.getElementById("attempt-limit").value.trim();
+      if (/^[1-9][0-9]*$/.test(limitText)) {
+        var limit = Number(limitText);
+        if (Number.isSafeInteger(limit)) RECORDS = RECORDS.slice(0, limit);
+      }
+      var rows = RECORDS;
+      renderSelected();
       var out = chosen.map(function (b) {
         var sub = rows.filter(function (r) { return r.batch === b; });
         return rowFor("第" + b + "次", sub);
@@ -455,6 +469,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (out.length > 1) out.push(rowFor("合计", rows));
       renderTable(document.getElementById("table-batch"), out);
     });
+
+    document.getElementById("attempt-limit").addEventListener("input", function () { document.getElementById("batch-apply").click(); });
+    select.addEventListener("change", function () { document.getElementById("batch-apply").click(); });
 
     document.getElementById("date-apply").addEventListener("click", function () {
       var from = document.getElementById("date-from").value;
@@ -486,7 +503,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var pInput = document.getElementById("p-input");
     pInput.value = String(DATA.expected_rate === undefined ? 30 : DATA.expected_rate);
     pInput.addEventListener("input", function () { drawHistogram(RECORDS); });
-    drawHistogram(RECORDS);
+    renderSelected();
 
     document.getElementById("theme-toggle").addEventListener("click", function () {
       var root = document.documentElement;

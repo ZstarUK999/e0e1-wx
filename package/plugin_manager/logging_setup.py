@@ -20,6 +20,9 @@ class FileLogging:
         self.file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s',datefmt='%Y-%m-%d %H:%M:%S'))
         self.listener=logging.handlers.QueueListener(self.queue_handler.queue,self.file_handler)
         self.logger.addHandler(self.queue_handler)
+        self.memory_logger=logging.getLogger('plugin_manager.memory')
+        self.memory_logger.propagate=False
+        self.memory_logger.addHandler(self.queue_handler)
         self.listener.start()
         self.closed=False
 
@@ -27,6 +30,7 @@ class FileLogging:
         if self.closed:return
         self.closed=True
         self.logger.removeHandler(self.queue_handler)
+        self.memory_logger.removeHandler(self.queue_handler)
         self.listener.stop()
         self.file_handler.close()
         self.logger.setLevel(self.original_level)

@@ -108,6 +108,58 @@ async def ready(controller, service):
     await controller.poll()
 
 
+def test_startup_activity_cleanup_gates_feature_configuration(app, tmp_path):
+    async def run():
+        controller, service, transport, window = make_controller(tmp_path)
+        cleared = [False]
+        async def cleanup():return {'ready':cleared[0], 'message':'等待开屏活动关闭'}
+        transport.dismiss_startup = cleanup
+        try:
+            await controller.poll()
+            service.update(status='running', worker_alive=True, miniapp=True, frida=True, cdp_port=62000, miniapp_epoch=1)
+            await controller.poll()
+            assert controller.state.installed
+            assert not any(op == 'configure' for op, _ in transport.calls)
+            assert '开屏活动' in window.action_label.text()
+            cleared[0] = True
+            await controller.poll()
+            assert any(op == 'configure' for op, _ in transport.calls)
+        finally:
+            await controller.shutdown()
+            window.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('task', ['daily', 'desire', 'pet_fodder'])
+def test_restart_resumes_supported_task_once_from_new_session(app, tmp_path, task):
+    async def run():
+        c, s, t, w = make_controller(tmp_path)
+        calls = []
+        try:
+            w.store.set_daily_enabled(True)
+            c.desire.request = lambda op, args=None: calls.append(('desire', op))
+            c.automation.set_automation = lambda running: calls.append(('daily', running))
+            c.automation.begin = lambda name, **kwargs: calls.append((name, kwargs))
+            c.restart_resume.observe({task}, 'old', healthy=True)
+            c.restart_resume.arm()
+            c.restart_resume.launched = True
+            c.state.installed = 'old'
+            assert not c._resume_restarted_tasks()
+            c.state.installed = 'new'
+            c.state.blocked = '开屏尚未确认'
+            assert not c._resume_restarted_tasks()
+            c.state.blocked = ''
+            assert c._resume_restarted_tasks()
+            assert not c._resume_restarted_tasks()
+            assert len(calls) == 1
+            assert calls[0] == {'daily': ('daily', True), 'desire': ('desire', 'start'),
+                                'pet_fodder': ('pet_fodder', {'manual': True})}[task]
+        finally:
+            await c.shutdown()
+            w.close()
+    asyncio.run(run())
+
+
 def test_waits_for_wechat_without_launching_it(app,tmp_path):
     async def run():
         c,s,t,w=make_controller(tmp_path,False)
@@ -1156,3 +1208,82 @@ def test_probe_timeout_pauses_daily_and_retains_operation_identity(app,tmp_path)
         finally:
             await c.shutdown();w.close()
     asyncio.run(run())
+
+
+def test_game_script_failures_preserve_error_objects_and_stack_without_spam(caplog):
+    import logging
+    from package.plugin_manager.transport import PluginTransport
+    fake=FakeCdp();transport=PluginTransport(cdp=fake);transport.context_id=7
+    stack={'callFrames':[{'functionName':'renderOverlay','url':'battle.js','lineNumber':12,'columnNumber':3}]}
+    event={'params':{'executionContextId':7,'type':'error','args':[{'value':'[对战辅助]'},
+        {'type':'object','subtype':'error','description':'TypeError: renderer invalid'}], 'stackTrace':stack}}
+    with caplog.at_level(logging.ERROR,logger='plugin_manager'):
+        fake.handlers['Runtime.consoleAPICalled'](event)
+        fake.handlers['Runtime.consoleAPICalled'](event)
+        fake.handlers['Runtime.consoleAPICalled']({'params':{**event['params'],'executionContextId':8}})
+        fake.handlers['Runtime.exceptionThrown']({'params':{'exceptionDetails':{'executionContextId':7,
+            'exception':{'description':'RangeError: bad geometry'},'stackTrace':stack}}})
+        fake.handlers['Runtime.exceptionThrown']({'params':{'exceptionDetails':{'executionContextId':8,
+            'exception':{'description':'other context failure'}}}})
+    assert caplog.text.count('TypeError: renderer invalid')==1
+    assert 'RangeError: bad geometry' in caplog.text and 'renderOverlay battle.js:13:4' in caplog.text
+    assert 'other context failure' not in caplog.text
+
+
+def test_battle_diagnostic_console_breadcrumb_is_persisted(caplog):
+    import logging
+    from package.plugin_manager.transport import PluginTransport
+    fake=FakeCdp();transport=PluginTransport(cdp=fake);transport.context_id=7
+    with caplog.at_level(logging.INFO,logger='plugin_manager'):
+        fake.handlers['Runtime.consoleAPICalled']({'params':{'executionContextId':7,'type':'log',
+            'args':[{'value':'[plugin.diagnostic]'},{'value':'{"stage":"heartbeat","time":13}'}]}})
+    assert '战斗诊断' in caplog.text and 'heartbeat' in caplog.text
+
+
+def test_zhongkui_runtime_publishes_live_status_and_marks_timeout_stale():
+    from types import SimpleNamespace
+    from package.plugin_manager.runtime import PluginRuntime
+    published=[]
+    class Transport:
+        fail=False
+        async def battle_assist_timing(self):return []
+        async def battle_assist_status(self):
+            if self.fail:raise TimeoutError()
+            return {'active':True,'monsters':[{'name':'妖物甲','wave':2}]}
+    transport=Transport()
+    panel=SimpleNamespace(set_monster_status=lambda value,stale=False:published.append((value,stale)))
+    fake=SimpleNamespace(transport=transport,_next_battle_timing=0,
+        session=SimpleNamespace(engine_state={},stale=lambda epoch:False),
+        state=SimpleNamespace(closing=False,installed='one'),window=SimpleNamespace(pages={'zhongkui':panel}))
+    fake._publish_zhongkui=lambda value,stale=False:PluginRuntime._publish_zhongkui(fake,value,stale)
+    fake._publish_battle_assist_timing=lambda rows:None
+    async def run():
+        await PluginRuntime._sync_battle_assist_timing(fake,{'battle_assist':{'enabled':True}})
+        assert published[-1][0]['monsters'][0]['name']=='妖物甲' and not published[-1][1]
+        fake._next_battle_timing=0;transport.fail=True
+        await PluginRuntime._sync_battle_assist_timing(fake,{'battle_assist':{'enabled':True}})
+        assert published[-1]==(None,True)
+        await PluginRuntime._sync_battle_assist_timing(fake,{'battle_assist':{'enabled':False}})
+        assert published[-1]==(None,False)
+    asyncio.run(run())
+
+
+def test_native_promise_object_error_preserves_error_code_without_getters(caplog):
+    import logging
+    from package.plugin_manager.transport import PluginTransport
+    class Cdp(FakeCdp):
+        async def send(self,method,params=None,**kwargs):
+            assert method=='Runtime.getProperties' and params['ownProperties'] is True
+            return {'result':{'result':[
+                {'name':'errMsg','value':{'type':'string','value':'launch:fail session unavailable'}},
+                {'name':'errno','value':{'type':'number','value':123}},
+                {'name':'token','value':{'type':'string','value':'secret-never-log'}},
+                {'name':'message','get':{'objectId':'getter'}}]}}
+    async def run():
+        t=PluginTransport(cdp=Cdp());t.context_id=7
+        t._exception({'params':{'exceptionDetails':{'executionContextId':7,'text':'Uncaught (in promise) #<Object>',
+            'exception':{'type':'object','objectId':'error-1'}}}})
+        await asyncio.gather(*t._exception_tasks)
+    with caplog.at_level(logging.ERROR,logger='plugin_manager'):asyncio.run(run())
+    assert 'launch:fail session unavailable' in caplog.text and '123' in caplog.text
+    assert 'secret-never-log' not in caplog.text

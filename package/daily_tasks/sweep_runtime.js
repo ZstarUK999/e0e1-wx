@@ -52,7 +52,7 @@ function createEnergyRuntime(g, timing) {
     return ['Debug','MoveDebug','TipsUI','PowerUp','FightPowerUp'].some(key=>cfg[key] && view.cfg === cfg[key]);
   }
   function normalPages() {
-    return ['AttrUp','GameMethod','Hangup','DesireUI','MagicArtifactUI','PetUI','Setting','MineUI','MineOtherUI','MineOtherMagicArtifactUI','MineListUI','ArenaUI','ChatUI','ChatRecruitUI','MainMoreUI']
+    return ['AttrUp','GameMethod','Hangup','DesireUI','MagicArtifactUI','PetUI','Draw','Setting','MineUI','MineOtherUI','MineOtherMagicArtifactUI','MineListUI','ArenaUI','ChatUI','ChatRecruitUI','MainMoreUI']
       .map(key=>cfg[key]).filter(Boolean);
   }
   function blockedViews() {
@@ -124,6 +124,7 @@ function createEnergyRuntime(g, timing) {
       control=which===cfg.MineUI?method.view.btn_mine:method.view.btn_arena;
     }
     else if (which===cfg.PetUI) control=main.view.button_pet;
+    else if (which===cfg.Draw) control=main.view.button_draw;
     else if (which===cfg.DesireUI) control=main.view.btn_desire;
     else if (which===cfg.Hangup) {
       const Type=await uiClass('main_ui_hang_up_button.ts','main_ui_hang_up_button');
@@ -143,12 +144,19 @@ function createEnergyRuntime(g, timing) {
     if (retained.waitAfterOpen) await bounded(retained.waitAfterOpen,'页面打开动画未结束');
     return await wait(()=>ui().findOpen(which),'页面尚未显示');
   }
-  async function switchTab(screen,index) {
+  async function switchTab(screen,index,label) {
     if (screen.curSelectedIndex!==index) {
       const node=screen.view.btnTabGroup.children[index];
       await click(node.getComponent(Button));
     }
-    return await wait(()=>screen.pages && screen.pages[index],'UI页签未加载');
+    try {
+      return await wait(()=>screen.pages && screen.pages[index],'UI页签未加载');
+    } catch(e) {
+      if(g.console && typeof g.console.error==='function')g.console.error('[plugin.error]','UI页签诊断 '+JSON.stringify({page:label,index,
+        selected:screen.curSelectedIndex,loadedPages:Object.keys(screen.pages || {}).slice(0,20),
+        valid:!!screen.node && screen.node.isValid!==false,active:!!screen.node && screen.node.activeInHierarchy}));
+      throw e;
+    }
   }
   async function listNode(list,index) {
     if (!list || typeof list.getItemByListId!=='function') throw error('UI列表不可用');
@@ -180,7 +188,7 @@ function createEnergyRuntime(g, timing) {
   }
   function closeControl(screen,handler) {
     const view=screen.view || {};
-    if (view.btn_close || view.button_close) return view.btn_close || view.button_close;
+    if (view.btn_close || view.button_close || view.btn_Close) return view.btn_close || view.button_close || view.btn_Close;
     const buttons=screen.node && screen.node.getComponentsInChildren ? screen.node.getComponentsInChildren(cc.Button) : [];
     const match=buttons.find(b=>b.clickCallback===screen[handler || 'close'] || (b.clickEvents || []).some(e=>e.handler===handler));
     if (!match) throw error('未找到页面已绑定的UI关闭按钮');
@@ -249,7 +257,7 @@ function createEnergyRuntime(g, timing) {
   }
   async function desireScreen() {
     const screen = await open(cfg.DesireUI);
-    const page=await switchTab(screen,0);
+    const page=await switchTab(screen,0,'三尸');
     const Type=await uiClass('ui-desire-switch-btn.ts','UIDesireSwitchBtn');
     const buttons=await wait(()=>{const items=page.switch_btns.getComponentsInChildren(Type);return items.length?items:null;},'三尸方案按钮未加载');
     return {screen,page,buttons};
@@ -260,7 +268,7 @@ function createEnergyRuntime(g, timing) {
     const m = screen.module;
     if ((m._pendingTemperEntryLocks && m._pendingTemperEntryLocks.size) || (m._temperEntryLockSyncs && m._temperEntryLockSyncs.size))
       throw error('法器有未保存操作，不能自动切方案');
-    const page=await switchTab(screen,pageType);
+    const page=await switchTab(screen,pageType,'法器');
     return {screen, page, module:m};
   }
   async function petScreen() {
@@ -608,7 +616,8 @@ function createEnergyRuntime(g, timing) {
   function nameOf(table, id) {
     const row = rowOf(table, id);
     if (!row) return null;
-    for (const value of [row.name, row.Name, row.cfgName, row.title, row.note]) {
+    const item=table==='DesireCfg'?(row.itemId && typeof row.itemId==='object'?row.itemId:rowOf('ItemCfg',row.itemId)):null;
+    for (const value of [row.name, row.Name, row.cfgName, row.title, row.note,item && item.name]) {
       if (cjk(value)) return String(value);
     }
     return null;
@@ -616,7 +625,8 @@ function createEnergyRuntime(g, timing) {
   function descOf(table, id) {
     const row = rowOf(table, id);
     if (!row) return null;
-    for (const value of [row.desc, row.des, row.description]) {
+    const item=table==='DesireCfg'?(row.itemId && typeof row.itemId==='object'?row.itemId:rowOf('ItemCfg',row.itemId)):null;
+    for (const value of [row.desc, row.des, row.description,item && item.desc,item && item.des]) {
       if (cjk(value)) return String(value);
     }
     return null;
@@ -648,6 +658,85 @@ function createEnergyRuntime(g, timing) {
   function label(id, table, fallback) {
     return nameOf(table, id) || fallback || ('ID' + id);
   }
+  function magicPlanPvp(plan) {
+    let up=0,down=0;const missing=[];
+    eachMap(plan && plan.entry,30,entry=>{
+      if(!entry)return;
+      const row=rowOf('MagicArtifactEntryCfg',entry.cfgId);
+      if(!row){missing.push(entry.cfgId);return;}
+      if(Number(row.attrType)===117)up+=Number(entry.value||0)/100;
+      if(Number(row.attrType)===118)down+=Number(entry.value||0)/100;
+    });
+    return {up,down,total:up+down,missing};
+  }
+
+  function pvpEstimateInput(snapshot) {
+    const missing=[];
+    const value=(map,key)=>Number(map && (typeof map.get==='function'?(map.get(key)??map.get(String(key))):map[key]))||0;
+    const total=map=>(value(map,117)+value(map,118))/100;
+    const desireScore=map=>{
+      let score=0;
+      eachMap(map,200,id=>{const row=rowOf('DesireCfg',id);if(row)score+=total(row.attr);else if(Number(id)>0)missing.push('三尸'+id+'配置缺失');});
+      return score;
+    };
+    const currentDesire=desireScore(snapshot.desirePlan);
+    let bestDesire=currentDesire,bestDesireId='当前';const desirePlans=[];
+    eachMap(snapshot.allDesirePlan,30,(plan,id)=>{
+      const score=desireScore(plan);
+      let up=0,down=0;
+      eachMap(plan,200,id=>{const row=rowOf('DesireCfg',id);if(row){up+=value(row.attr,117)/100;down+=value(row.attr,118)/100;}});
+      desirePlans.push({id:String(id),up,down,total:score});
+      if(score>bestDesire){bestDesire=score;bestDesireId=String(id);}
+    });
+    const magic=snapshot.magic,magicPlans=[];
+    if(magic)eachMap(magic.plan,30,(plan,id)=>{
+      const totals=magicPlanPvp(plan);
+      missing.push(...totals.missing.map(id=>'法器词条'+id+'配置缺失'));
+      magicPlans.push({id:String(id),name:String(plan && plan.name || id),up:totals.up,down:totals.down,pvp:totals.total});
+    });
+    const currentMagic=magicPlans.find(p=>magic && Number(p.id)===Number(magic.onUsePlan));
+    const bestMagic=magicPlans.reduce((best,p)=>!best||p.pvp>best.pvp?p:best,currentMagic||null);
+    const faces=[];
+    eachMap(snapshot.equipment,8,(item,slot)=>{
+      const row=item && rowOf('EquipmentCfg',item.configId);
+      const level=isMap(snapshot.equipmentLevel)?(snapshot.equipmentLevel.get(Number(slot))??snapshot.equipmentLevel.get(String(slot))??(item && item.level)):item && item.level;
+      const growth=row && row.LevelGrowthAttr;
+      const base=growth && growth[Number(level)];
+      if(!row || !base)missing.push('脸谱部位'+slot+'基础配置或等级缺失');
+      let pvp=total(base);const baseAttributes=[],entries=[];
+      eachMap(base,100,(raw,id)=>baseAttributes.push({id:Number(id),name:nameOf('AttrCfg',id)||String(id),value:raw,style:(rowOf('AttrCfg',id)||{}).style}));
+      if(item && Array.isArray(item.entry))item.entry.forEach(entry=>{
+        const cfg=rowOf('EquipmentEntryCfg',entry.id);
+        if(!cfg)missing.push('脸谱词条'+entry.id+'配置缺失');
+        if(cfg && [117,118].includes(Number(cfg.group)))pvp+=Number(entry.value||0)/100;
+        entries.push({...entry,name:cfg && cfg.name || String(entry.id),attribute_id:cfg && cfg.group,style:(rowOf('AttrCfg',cfg && cfg.group)||{}).style});
+      });
+      faces.push({slot:Number(slot),config_id:item && item.configId,name:row && row.name || '',level:Number(level)||0,
+        quality:row && row.quality,star:row && row.star,item_id:item && item.id,flag:item && item.flag,pvp,base_attributes:baseAttributes,entries});
+    });
+    const kind=faces.length===8 && faces.every(f=>/二郎/.test(f.name))?'erlang':
+      faces.length===8 && faces.every(f=>/悟空/.test(f.name))?'wukong':'other';
+    if(!isMap(snapshot.attribute))missing.push('玩家属性未下发');
+    else if((!snapshot.attribute.has(117)&&!snapshot.attribute.has('117'))||(!snapshot.attribute.has(118)&&!snapshot.attribute.has('118')))missing.push('PVP增伤或减免属性未下发');
+    if(!isMap(snapshot.desirePlan))missing.push('当前三尸方案未下发');
+    if(!isMap(snapshot.allDesirePlan))missing.push('三尸其他方案未下发');
+    if(!magic || !isMap(magic.plan) || !currentMagic)missing.push('当前法器方案未下发');
+    if(faces.length!==8)missing.push('八件脸谱资料不完整');
+    let erlangSnapshot=null;
+    if(kind==='erlang'){
+      try{erlangSnapshot=JSON.parse(JSON.stringify(snapshot,(_key,v)=>isMap(v)?{__map__:Array.from(v.entries())}:v));}
+      catch(e){missing.push('完整二郎历史快照无法序列化');}
+    }
+    return {player_id:String(snapshot.id||''),base_up:value(snapshot.attribute,117)/100,base_down:value(snapshot.attribute,118)/100,
+      desire:{current:currentDesire,best:bestDesire,best_id:bestDesireId,extra:Math.max(0,bestDesire-currentDesire),plans:desirePlans},
+      magic:{current_id:magic && magic.onUsePlan,current_name:currentMagic && currentMagic.name,current:currentMagic && currentMagic.pvp,
+        best:bestMagic && bestMagic.pvp,best_id:bestMagic && bestMagic.id,best_name:bestMagic && bestMagic.name,
+        plans:magicPlans,extra:bestMagic && currentMagic?Math.max(0,bestMagic.pvp-currentMagic.pvp):0},
+      face_kind:kind,face_complete:faces.length===8 && !missing.some(x=>x.startsWith('脸谱')),
+      face_pvp:faces.reduce((n,f)=>n+f.pvp,0),faces,erlang_snapshot:erlangSnapshot,
+      equipment_plan:snapshot.equipmentUesPlan,suits:isMap(snapshot.equipmentSuit)?Array.from(snapshot.equipmentSuit.entries()):[],missing};
+  }
+
   function snapshotSections(snapshot) {
     const out = [];
     const head = [];
@@ -702,30 +791,39 @@ function createEnergyRuntime(g, timing) {
       combines.length ? ['天书组合：', ...combines.map(line => '  ' + line)] : []);
     if (bookLines.length) out.push('── 天书 ──\n  ' + bookLines.join('\n  '));
 
+    const desireTotals=[];
     const desire = (planMap, title) => {
       const lines = [];
       const grouped = {};
       let up = 0, down = 0;
       eachMap(planMap, 80, (id, key) => {
         const slot = Math.floor(Number(key) / 65536);
-        const name = nameOf('DesireCfg', id);
-        if (!name) return;
+        const name = nameOf('DesireCfg', id) || ('三尸ID'+id+'（名称未识别）');
         const desc = descOf('DesireCfg', id);
         const text = name + (desc ? ' —— ' + desc.replace(/\s+/g, ' ').slice(0, 60) : '');
         (grouped[slot] = grouped[slot] || []).push(text);
-        up += percentFrom(desc, 'pvp增伤');
-        down += percentFrom(desc, 'pvp减伤') + percentFrom(desc, 'pvp减免');
+        const config=rowOf('DesireCfg',id),attrs=config && config.attr;
+        const attr=key=>Number(attrs && (typeof attrs.get==='function'?(attrs.get(key)??attrs.get(String(key))):attrs[key]))||0;
+        up += attr(117)/100;
+        down += attr(118)/100;
       });
       Object.keys(grouped).sort().forEach(slot => grouped[slot].forEach((text, index) => {
         lines.push(title + ' 槽' + slot + '#' + (index + 1) + ' ' + text);
       }));
-      if (up || down) lines.push(title + ' 汇总：PVP增伤 ' + up + '%' + (down ? '、PVP减伤 ' + down + '%' : ''));
+      const fmt=n=>String(Math.round(n*100)/100);
+      desireTotals.push({title,total:up+down});
+      lines.push(title + ' 常驻属性汇总：PVP增伤 ' + fmt(up) + '%、PVP减伤 ' + fmt(down) + '%、PVP合计 '+fmt(up+down)+'%');
       return lines;
     };
     const desireLines = desire(snapshot.desirePlan, '[当前]');
-    eachMap(snapshot.allDesirePlan, 8, (planMap, planId) => {
-      desireLines.push(...desire(planMap, '[方案' + planId + ']'));
+    const signature=map=>isMap(map)?JSON.stringify(Array.from(map.entries()).map(([k,v])=>[String(k),String(v)]).sort((a,b)=>a[0].localeCompare(b[0]))):null;
+    eachMap(snapshot.allDesirePlan, 30, (planMap, planId) => {
+      const current=signature(planMap)===signature(snapshot.desirePlan);
+      desireLines.push(...desire(planMap, '[方案' + planId + ']'+(current?'[当前使用]':'')));
     });
+    const currentDesireTotal=desireTotals[0] || {title:'[当前]',total:0};
+    const bestDesireTotal=desireTotals.reduce((best,p)=>p.total>best.total?p:best,currentDesireTotal);
+    desireLines.push('三尸补差：最高 '+Math.round(bestDesireTotal.total*100)/100+'%（'+bestDesireTotal.title+'） − 当前 '+Math.round(currentDesireTotal.total*100)/100+'% = +'+Math.round(Math.max(0,bestDesireTotal.total-currentDesireTotal.total)*100)/100+'%');
     if (desireLines.length) out.push('── 三尸 ──\n  ' + desireLines.join('\n  '));
 
     const equipLines = [];
@@ -786,24 +884,36 @@ function createEnergyRuntime(g, timing) {
       const head2 = [];
       const current = nameOf('MagicArtifactBaseCfg', magic.onUseMagic);
       if (current) head2.push('当前法器 ' + current);
+      if (magic.onUsePlan !== undefined) {
+        const selected=isMap(magic.plan)?(magic.plan.get(Number(magic.onUsePlan))??magic.plan.get(String(magic.onUsePlan))):null;
+        head2.push('当前法器方案 '+magic.onUsePlan+(selected && selected.name?'「'+selected.name+'」':''));
+      }
       if (magic.refineLevel !== undefined) head2.push('精炼' + magic.refineLevel + '阶');
       if (head2.length) magicLines.push('· ' + head2.join(' '));
+      if(magic.onUsePlan!==undefined){
+        const selected=isMap(magic.plan)?(magic.plan.get(Number(magic.onUsePlan))??magic.plan.get(String(magic.onUsePlan))):null;
+        magicLines.push('· 当前实际装备：方案'+magic.onUsePlan+(selected?'「'+(selected.name||magic.onUsePlan)+'」':''));
+      }
+      const magicTotals=[];
       eachMap(magic.plan, 8, (item, planId) => {
         if (!item) return;
         const parts = [];
-        let up = 0, down = 0;
+        const totals=magicPlanPvp(item);
+        magicTotals.push({id:String(planId),name:String(item.name||planId),...totals});
         eachMap(item.entry, 8, (entry) => {
           if (!entry || entry.cfgId === undefined) return;
           const row = rowOf('MagicArtifactEntryCfg', entry.cfgId);
           const name = row && cjk(row.des) ? row.des : null;
           parts.push((name || ('词条ID' + entry.cfgId)) + ' ' + attrText(row && row.attrType, entry.value));
-          if (!name) return;
-          if (/pvp增伤/i.test(name)) up += Number(entry.value) / 100;
-          else if (/pvp减伤|pvp减免/i.test(name)) down += Number(entry.value) / 100;
         });
-        magicLines.push('· 方案「' + (item.name || planId) + '」' + (parts.length ? '：' + parts.join('、') : ''));
-        if (up || down) magicLines.push('   └ 汇总：PVP增伤 ' + (Math.round(up * 100) / 100) + '%' + (down ? '、PVP减伤 ' + (Math.round(down * 100) / 100) + '%' : ''));
+        magicLines.push('· '+(Number(planId)===Number(magic.onUsePlan)?'[当前使用／实际装备] ':'[备用，未装备] ')+'方案'+planId+'「' + (item.name || planId) + '」' + (parts.length ? '：' + parts.join('、') : ''));
+        const fmt=n=>Math.round(n*100)/100;
+        magicLines.push('   └ 汇总：PVP增伤 '+fmt(totals.up)+'%、PVP减伤 '+fmt(totals.down)+'%、PVP合计 '+fmt(totals.total)+'%');
       });
+      const used=magicTotals.find(p=>Number(p.id)===Number(magic.onUsePlan));
+      const best=magicTotals.reduce((best,p)=>!best || p.total>best.total?p:best,used||null);
+      if(best)magicLines.push('最高PVP候选：方案'+best.id+'「'+best.name+'」'+(used && best.id===used.id?'（当前已装备，无需补差）':'（未装备，仅用于补差预估）'));
+      if(used && best)magicLines.push('法器补差：最高 '+Math.round(best.total*100)/100+'%（方案'+best.id+'「'+best.name+'」） − 当前 '+Math.round(used.total*100)/100+'%（方案'+used.id+'「'+used.name+'」） = +'+Math.round(Math.max(0,best.total-used.total)*100)/100+'%');
     }
     if (magicLines.length) out.push('── 法器 ──\n  ' + magicLines.join('\n  '));
 
@@ -848,12 +958,12 @@ function createEnergyRuntime(g, timing) {
       sections = [];
     }
     if (screen.isSelf) {
-      return {subject:'本人（完整信息）', text:sections.length ? sections.join('\n') : '快照中没有可展示的数据'};
+      return {subject:'本人（完整信息）',pvp_estimate:pvpEstimateInput(snapshot), text:sections.length ? sections.join('\n') : '快照中没有可展示的数据'};
     }
     const hidden = hideNames(Number(snapshot.previewHide) || 0);
     const head = ['玩家信息（本地快照全量，参考 player_info_dump）',
       hidden.length ? '对方设置了隐藏：' + hidden.join('、') : '对方未设置隐藏'];
-    return {subject:'玩家信息（全量快照）', text:head.concat(sections).join('\n')};
+    return {subject:'玩家信息（全量快照）',pvp_estimate:pvpEstimateInput(snapshot), text:head.concat(sections).join('\n')};
   }
   const log=message=>{ if (g.console) g.console.info('[plugin.ui]', String(message)); };
   // 战斗界面（MineBattleUI 等）在独立的 BattleUICfgId 里，不在 CommonUICfgId。
@@ -865,7 +975,7 @@ function createEnergyRuntime(g, timing) {
     }
     return battleCfg;
   }
-  const extra=typeof createDailyRuntime==='function'?createDailyRuntime(g,{ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,
+  const extra=typeof createDailyRuntime==='function'?createDailyRuntime(g,{ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,closeControl,
     configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig}):null;
   // 三尸合成是独立的运行时（package/plugin_manager/desire_runtime.js），
   // 只借用这里的通用UI辅助，不进日常任务的任何分支。
@@ -875,14 +985,14 @@ function createEnergyRuntime(g, timing) {
   return {async dispatch(op, args) {
     args=args || {};
     const overlay=g.__e0e1AutomationOverlay;
-    const stopAllowed=['inspect','identity','capture','home','restore','player_information','reward_info','tomb_state','arena_state'];
+    const stopAllowed=['inspect','identity','capture','home','restore','player_information','reward_info','tomb_state','arena_state','free_summon_state','pet_hatch_state','pet_fodder_state'];
     if(overlay && overlay.shouldStop() && !stopAllowed.includes(op))
       return {status:'unavailable',message:'已请求退出托管，未发起新的游戏操作'};
     if(overlay) {
-      const names={home:'返回主界面',tomb_state:'读取墓藏状态',tomb_targets:'扫描墓藏目标',tomb_fill:'为目标填土',tomb_raid:'盗掠并等待战斗结算',tomb_collect:'收取墓藏',tomb_start:'重新开启墓藏',tomb_recruit:'发布墓藏招募',sweep:'体力扫荡',reward_claim:'领取挂机收益',arena_challenge:'斗法并等待战斗结算',restore:'恢复原方案'};
+      const names={home:'返回主界面',pet_fodder_merge:'鬼仆狗粮合成',free_summon:'免费召唤',pet_hatch_start:'解封阴契',pet_hatch_claim:'领取解封结果',tomb_state:'读取墓藏状态',tomb_targets:'扫描墓藏目标',tomb_fill:'为目标填土',tomb_raid:'盗掠并等待战斗结算',tomb_collect:'收取墓藏',tomb_start:'重新开启墓藏',tomb_recruit:'发布墓藏招募',sweep:'体力扫荡',reward_claim:'领取挂机收益',arena_challenge:'斗法并等待战斗结算',restore:'恢复原方案'};
       if(names[op])overlay.setOperation(names[op]);
     }
-    const readOnly=['inspect','capture','player_information','reward_info','desire_bag_stats','desire_compose_probe','identity'].includes(op);
+    const readOnly=['inspect','capture','player_information','reward_info','desire_bag_stats','desire_compose_probe','identity','pet_fodder_state'].includes(op);
     if (guard.busy && !readOnly) return {status:'uncertain',message:'已有正常UI操作未完成'};
     if (guard.uncertain && !readOnly) return {status:'uncertain',message:'前次操作结果未知，需核对恢复记录'};
     if (!readOnly) guard.busy=true;
@@ -892,9 +1002,23 @@ function createEnergyRuntime(g, timing) {
       if (op==='inspect') value={...(await energyTiming()),energy:g.ROLE.energy.energyValue,maximum:roleHelper.getMaxEnergy(),safe:safe()&&!guard.busy&&!guard.uncertain,
         blockers:[...blockers(),...(guard.busy || guard.pending || guard.action_pending?['存在未完成操作']:[]),...(guard.uncertain?['前次操作结果未知']:[])]};
       else if (op==='capture') value=capture();
-      else if (op==='player_information') value=playerInformation();
+      else if (op==='player_information') {
+        if(args.target_id){
+          const id=Number(args.target_id);
+          if(!Number.isSafeInteger(id)||id<=0)throw Error('玩家ID无效');
+          const {GameService}=await g.System.import('chunks:///_virtual/define-index.ts');
+          const reply=await GameService.getRolePreviewInfo({targetId:id});
+          if(!reply || reply.code!==0)throw Error(String(reply && reply.error || '玩家公开资料查询失败')+' ('+String(reply && reply.code)+')');
+          const snapshot=reply.getData().preview;
+          if(!snapshot || Number(snapshot.id)!==id)throw Error('玩家公开资料ID不匹配');
+          const hidden=hideNames(Number(snapshot.previewHide)||0);
+          value={subject:'玩家 '+String(snapshot.name||'')+' · '+id,pvp_estimate:pvpEstimateInput(snapshot),
+            text:['玩家信息（公开资料快照）',hidden.length?'对方设置了隐藏：'+hidden.join('、'):'对方未设置隐藏',...snapshotSections(snapshot)].join('\n')};
+        }else value=playerInformation();
+      }
       else if (op==='identity') value=identity();
       else if (op==='reward_info') value=await rewardInfo();
+      else if (op==='pet_fodder_state') value=await extra.dispatch(op,args);
       else if (op==='home') value=await home();
       else {
         if (!safe()) throw error('当前界面被阻挡：'+blockers().join(', '));

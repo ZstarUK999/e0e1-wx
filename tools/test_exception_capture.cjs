@@ -1,0 +1,10 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const source=fs.readFileSync(__dirname+'/../package/plugin_manager/exception_capture.js','utf8');
+const handlers={},logs=[];let getters=0;
+const g={console:{error:(...x)=>logs.push(x),info:()=>{}},wx:{onError:f=>handlers.nativeError=f,onUnhandledRejection:f=>handlers.promise=f,offError:()=>{},offUnhandledRejection:()=>{}},addEventListener:(n,f)=>handlers[n]=f,removeEventListener:()=>{}};
+vm.createContext(g);vm.runInContext(source,g);const first=handlers.nativeError;vm.runInContext(source,g);assert.equal(first,handlers.nativeError);
+const reason={errMsg:'launch failed',errno:123};Object.defineProperty(reason,'message',{get(){getters++;throw Error('getter');}});
+handlers.promise({reason});handlers.promise({reason});assert.equal(logs.length,1);assert.equal(getters,0);assert(logs[0][1].includes('launch failed'));
+handlers.nativeError('at game.js:315:107592');assert(logs[1][1].includes('107592'));
+for(let i=0;i<50;i++)handlers.nativeError('error'+i);assert.equal(logs.length,20);
+g.__e0e1ExceptionCapture.dispose();assert.equal(g.__e0e1ExceptionCapture,undefined);console.log('global exception capture tests passed');

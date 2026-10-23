@@ -166,6 +166,16 @@ def test_real_node_python_bridge_reuses_resident_and_damage_script(tmp_path):
             transport = DouyinTransport(cache)
             await transport.connect()
             assert await transport._rpc('ping') == 2
+            # 真实静态桥中执行开屏清理；动态 eval/Function 均被禁用。
+            startup = await transport.dismiss_startup()
+            assert startup['ready'] is False
+            assert startup['message'] == '确认大厅稳定'
+            assert (await transport.legion_read('42'))['name'] == '测试阴司'
+            scanned = await transport.legion_scan_call('player','12000100')
+            assert scanned['id'] == '12000100' and scanned['sName'] == '540服'
+            batch=await transport.legion_scan_call('players',['12000100','12000101'])
+            assert [row['value']['id'] for row in batch]==['12000100','12000101']
+            assert (await transport.legion_scan_call('search','测试阴司'))['id'] == '42'
             result = await transport._rpc('damage-debug', timeout_ms=30000)
             assert result == {'text':'中文😀'*100000}
             for _ in range(30):

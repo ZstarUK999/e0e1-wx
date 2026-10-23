@@ -370,7 +370,192 @@ function createDailyRuntime(g,h) {
       ()=>!!h.ui().findOpen(battleCfg)||!!h.ui().findOpen(cfg.ArenaBattleResultUI),30000);
     return await waitBattleResult(cfg.ArenaBattleResultUI);
   }
+  async function summonPage() {
+    const {cfg}=config(),screen=await h.open(cfg.Draw);
+    const index=screen.drawTypeInfos.findIndex(x=>x.cfgId===1 && x.eType===1);
+    if(index<0)throw fail('常规免费召唤入口未解锁');
+    if(screen.curSelectPage!==index)await h.click(screen.view.node_pages[index].getComponent(config().Button));
+    await h.wait(()=>screen.curSelectPage===index && !screen.inDrawing,'召唤页尚未就绪');
+    return screen;
+  }
+  async function summonState() {
+    await summonPage();
+    const {data}=config(),clock=await serverClock(false),cd=Number(data.ConstantCfg.config.DrawAdCd)*60;
+    const own=g.ROLE.recruit && g.ROLE.recruit.items.get(1),last=own?Number(own.lastFreeTime)/1000:0;
+    if(!Number.isFinite(cd) || cd<=0 || !Number.isFinite(last))throw fail('免费召唤冷却配置尚未同步');
+    // Match the native strict `serverTime-lastFreeTime > cooldown` test.
+    return {remaining_seconds:Math.max(0,Math.ceil(last+cd-clock.server_now+0.001)),cooldown_seconds:cd};
+  }
+  async function closeReward(which,handler) {
+    const screen=await h.wait(()=>h.ui().findOpen(which),'奖励页面尚未打开');
+    if('isFinish' in screen)await h.wait(()=>screen.isFinish,'奖励动画尚未完成');
+    await h.click(h.closeControl(screen,handler));
+    await h.wait(()=>!h.ui().find(which),'奖励页面尚未关闭');
+  }
+  async function freeSummon() {
+    const info=await summonState();
+    if(info.remaining_seconds>0)throw fail('免费召唤仍在冷却','rejected');
+    const {cfg,defs}=config(),screen=await summonPage(),before=Number(g.ROLE.recruit.items.get(1)?.lastFreeTime || 0);
+    let result;
+    try {
+      result=await h.observe([defs.RoleService.recruit],()=>h.click(screen.view.button_drawAd,{waitCompletion:false}),
+        ()=>Number(g.ROLE.recruit.items.get(1)?.lastFreeTime || 0)>before,120000);
+    } catch(error) {
+      // An ad callback can arrive later; do not replay an unconfirmed click.
+      if(error.status!=='rejected')error.status='uncertain';
+      throw error;
+    }
+    if((result.baseItems || []).length || (result.coinItems || []).length)await closeReward(cfg.DrawReward,'onClickClose');
+    await h.wait(()=>!screen.inDrawing,'免费召唤动画尚未收尾');
+    return {confirmed:true,cooldown_seconds:info.cooldown_seconds};
+  }
+  async function petPage() {
+    const {cfg,Button}=config(),screen=await h.open(cfg.PetUI);
+    const {PetPageType}=await g.System.import('chunks:///_virtual/ui-pet.ts');
+    if(!PetPageType || !Number.isInteger(PetPageType.Hatch))throw fail('阴契页签枚举未解析');
+    if(screen.curPage!==PetPageType.Hatch)await h.click(screen.view.node_pageList[PetPageType.Hatch].getComponent(Button));
+    return await h.wait(()=>screen.curPage===PetPageType.Hatch && screen.view.node_page_hatch,'阴契页面尚未加载');
+  }
+  async function petState(ids) {
+    await petPage();
+    const {data}=config(),{petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
+    const {roleHelper}=await g.System.import('chunks:///_virtual/role-helper.ts');
+    if(!Array.isArray(ids) || ids.some(id=>!Number.isInteger(id) || data.ItemCfg.getById(id)?.type!==data.ItemType.PET_ITEM))throw fail('阴契种类无效','rejected');
+    const eggs=ids.map(id=>data.ItemCfg.getById(id)).filter(x=>roleHelper.getItemCount(x.id)>0 && data.PetIncubateCfg.getById(x.param?.[0]));
+    eggs.sort((a,b)=>b.quality-a.quality || b.sort-a.sort || b.id-a.id);
+    let claim=0;
+    for(let slot=1;slot<=4;slot++)if(petHelper.checkPetHatchCompleteListSlotExist(slot)[0]>0){claim=slot;break;}
+    const freeSlot=petHelper.getFreePetHatchSlot();
+    const {CommonUnlockFunctionType}=await g.System.import('chunks:///_virtual/common-unlock-button.ts');
+    const unlock=data.UnlockCfg.getById(CommonUnlockFunctionType.PET_HATCH_QUEUE);
+    const queueUnlocked=!!unlock && roleHelper.checkCondition(unlock.condition);
+    const queueCount=petHelper.getPetHatchQueueNum();
+    const queueCapacity=petHelper.getUnlockedPetHatchSlotCount()*Number(data.ConstantCfg.config.PetIncubateSlotBornListNum);
+    // Match native tryHatch: fill direct slots first, then its pos:0 queue branch.
+    const canQueue=queueUnlocked && !petHelper.checkPetHatchFull() && !petHelper.checkPetHatchQueueFull();
+    return {item_id:eggs[0]?.id || null,free_slot:freeSlot,can_place:freeSlot>0 || canQueue,
+      queue_count:queueCount,queue_capacity:queueCapacity,claim_slot:claim,
+      remaining_seconds:petHelper.getMinSecondsUntilPetHatchFinish() || 60};
+  }
+  async function petStart(id) {
+    const status=await petState([id]);
+    if(!status.can_place || status.item_id!==id)throw fail('阴契不足，或解封槽及队列已满／尚未解锁','rejected');
+    const page=await petPage(),{defs}=config(),{roleHelper}=await g.System.import('chunks:///_virtual/role-helper.ts');
+    const index=page.curEggs.indexOf(id);
+    if(index<0)throw fail('所选阴契不在当前列表','rejected');
+    const node=await h.listNode(page.list_eggs,index),Type=await h.uiClass('pet-egg-item.ts','PetEggItem');
+    const item=node.getComponent(Type),before=roleHelper.getItemCount(id);
+    if(!item || item.eggId!==id)throw fail('阴契列表条目未匹配','rejected');
+    await h.observe([defs.PetService.bornPet],()=>h.click(item.btnHatch),()=>roleHelper.getItemCount(id)===before-1 &&
+      (status.free_slot>0 || g.ROLE.pet.bornList.length===status.queue_count+1));
+    return {confirmed:true};
+  }
+  async function petClaim(slot) {
+    const page=await petPage(),{defs,cfg}=config(),{petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
+    if(!Number.isInteger(slot) || slot<1 || slot>4 || petHelper.checkPetHatchCompleteListSlotExist(slot)[0]<=0)throw fail('该解封槽尚未完成','rejected');
+    const Type=await h.uiClass('hatch-slot-item.ts','HatchSlotItem'),item=page.node.getComponentsInChildren(Type).find(x=>x.index===slot);
+    if(!item || item.inClaim)throw fail('解封槽正在领取','rejected');
+    const completed=()=>[1,2,3,4].reduce((sum,index)=>sum+petHelper.checkPetHatchCompleteListSlotExist(index)[0],0);
+    // Native one-click claim is visible only for multiple completed contracts.
+    if(completed()>1 && page.unlockReceiveAll && page.btn_recive_all?.node?.activeInHierarchy!==false){
+      const result=await h.observe([defs.PetService.getBornPetAll],()=>h.click(page.btn_recive_all,{waitCompletion:false}),()=>completed()===0);
+      await h.wait(()=>page.node.getComponentsInChildren(Type).every(x=>!x.inClaim),'一键解封动画尚未收尾');
+      if((result.items || []).length){
+        await h.wait(()=>h.ui().findOpen(cfg.UINewPet) || h.ui().findOpen(cfg.Congrats),'解封结果尚未显示');
+        // The native full-screen close control is the blank-area tap; multiple
+        // rare pets may share one result screen and need more than one tap.
+        for(let count=0;h.ui().findOpen(cfg.UINewPet) && count<100;count++)
+          await h.click(h.closeControl(h.ui().findOpen(cfg.UINewPet),'closeSelf'));
+        await h.wait(()=>!h.ui().find(cfg.UINewPet),'鬼仆结果尚未关闭');
+        await h.dismissRewards(true);
+      }
+      return {confirmed:true};
+    }
+    await h.observe([defs.PetService.getBornPet],()=>h.click(item.btn_claim),()=>!item.inClaim);
+    await closeReward(cfg.UINewPet,'closeSelf');
+    await h.dismissRewards();
+    return {confirmed:true};
+  }
+  async function fodderPets() {
+    const {petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
+    const own=g.ROLE.pet,protectedIds=new Set([String(own.fightId)]);
+    const plans=own.formation && own.formation.plan;
+    if(plans && typeof plans.forEach==='function')plans.forEach(slots=>{
+      if(slots && typeof slots.forEach==='function')slots.forEach(id=>protectedIds.add(String(id)));
+    });
+    return Array.from(own.bag.values()).map(p=>{
+      const quality=Number(p.quality),progress=Number(p.mergerCount);
+      return {id:p.id,quality,progress,eligible:Number.isInteger(quality) && quality>=2 && quality<=4 &&
+        Number.isInteger(progress) && progress>=0 && p.lock===0 && !protectedIds.has(String(p.id)) && petHelper.checkPetInFormation(p.id)===-1};
+    });
+  }
+  async function fodderPage() {
+    const {cfg,Button}=config(),screen=await h.open(cfg.PetUI);
+    const {PetPageType}=await g.System.import('chunks:///_virtual/ui-pet.ts');
+    if(!Number.isInteger(PetPageType?.QualityUp))throw fail('献祭页签枚举未解析');
+    if(screen.curPage!==PetPageType.QualityUp)await h.click(screen.view.node_pageList[PetPageType.QualityUp].getComponent(Button));
+    const page=await h.wait(()=>screen.curPage===PetPageType.QualityUp && screen.view.node_page_qualityUp,'献祭页面尚未加载');
+    return {screen,page};
+  }
+  async function fodderMerge(pair) {
+    const {cfg,defs,data}=config();
+    const validate=async()=>{
+      const pets=await fodderPets(),target=pets.find(p=>p.id===pair.target_id),material=pets.find(p=>p.id===pair.material_id);
+      if(!target?.eligible || !material?.eligible || target.id===material.id || target.quality!==material.quality ||
+         target.quality!==pair.quality || target.progress!==pair.target_progress || material.progress!==pair.material_progress)
+        throw fail('献祭目标、材料或进度已变化，未执行合成','rejected');
+      const legal=target.progress===0 && material.progress===0 || target.progress===1 && material.progress===1 ||
+        target.progress>=3 && (target.progress===3 || target.progress>=7) && material.progress===3;
+      if(!legal)throw fail('不符合狗粮合成进度策略','rejected');
+      const {petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
+      if(!petHelper.getQualityUpCanUsePets(target.id).includes(material.id))throw fail('材料不符合游戏献祭规则','rejected');
+      return {target,material};
+    };
+    await validate();
+    const {screen,page}=await fodderPage();
+    const index=screen.petList.findIndex(p=>p.id===pair.target_id);
+    if(index<0)throw fail('献祭目标不在当前鬼仆列表','rejected');
+    if(screen.curSelectId!==pair.target_id)await h.click(await h.listNode(screen.view.list_pet,index));
+    await h.wait(()=>screen.curSelectId===pair.target_id && page.curSelectPetId===pair.target_id,'献祭目标尚未选中');
+    await h.click(page.node_unSelect.active?page.btn_openSelect:page.btn_openSelect2);
+    await h.wait(()=>page.node_selectRoot.active,'献祭材料列表未展开');
+    const mi=page.canUseInfos.findIndex(p=>p.type==='pet' && p.id===pair.material_id);
+    if(mi<0)throw fail('指定鬼仆不在可献祭材料列表','rejected');
+    const current=page.curUseInfos[page.curUseIndex];
+    if(current?.type!=='pet' || current.id!==pair.material_id)await h.click(await h.listNode(page.list_selectItem,mi));
+    const chosen=page.curUseInfos.filter(Boolean);
+    if(chosen.length!==1 || chosen[0].type!=='pet' || chosen[0].id!==pair.material_id)throw fail('献祭材料选择未确认','rejected');
+    await h.click(page.btn_closeSelect2);
+    await h.wait(()=>!page.node_selectRoot.active,'献祭材料列表尚未关闭');
+    const {target,material}=await validate();
+    const minimum=Number(data.PetQualityCfg.getById(target.quality)?.minNum);
+    if(!Number.isFinite(minimum) || minimum<=0)throw fail('献祭进阶配置未同步');
+    const overflow=target.progress+material.progress>minimum;
+    const result=await h.observe([defs.PetService.petMerge],async()=>{
+      await h.click(page.btn_qualityUp,{waitCompletion:false});
+      if(overflow){
+        const dialog=await h.wait(()=>h.ui().findOpen(cfg.CommonConfirm),'献祭溢出确认未显示');
+        if(!String(dialog.view.label_desc?.string || '').includes('燃魂灯亮度将会溢出'))
+          throw fail('献祭出现未预期的确认弹窗，已停止','uncertain');
+        await h.click(dialog.view.btn_confirm,{waitCompletion:false});
+      }
+    },()=>{
+      const after=g.ROLE.pet.bag.get(target.id);
+      return !g.ROLE.pet.bag.has(material.id) && after && (Number(after.quality)>target.quality || Number(after.mergerCount)!==target.progress);
+    });
+    const after=g.ROLE.pet.bag.get(target.id),advanced=Number(after.quality)>target.quality;
+    if(advanced)await closeReward(cfg.UIPetQualityUp,'close');
+    await h.dismissRewards((result.items || []).length>0);
+    return {confirmed:true,advanced,quality:Number(after.quality),progress:Number(after.mergerCount)};
+  }
   return {async dispatch(op,args) {
+    if(op==='pet_fodder_state')return {pets:await fodderPets()};
+    if(op==='pet_fodder_merge')return await fodderMerge(args);
+    if(op==='free_summon_state')return await summonState();
+    if(op==='free_summon')return await freeSummon();
+    if(op==='pet_hatch_state')return await petState(args.item_ids);
+    if(op==='pet_hatch_start')return await petStart(args.item_id);
+    if(op==='pet_hatch_claim')return await petClaim(args.slot);
     if(op==='tomb_state')return await state(args.kind,args.counts_only);
     if(op==='tomb_collect')return await collect(args.kind);
     if(op==='tomb_start')return await start(args.kind);

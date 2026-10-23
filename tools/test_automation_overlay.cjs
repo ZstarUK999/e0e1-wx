@@ -1,8 +1,9 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),path=require('node:path');
 class Transform{setContentSize(w,h){this.width=w;this.height=h;}}
-class Label{}
-Label.Overflow={CLAMP:1};
-class Graphics{roundRect(){}fill(){}}
+class Label{set string(value){this.writes=(this.writes||0)+1;this.value=value;}get string(){return this.value;}}
+Label.CacheMode={CHAR:2};
+Label.Overflow={CLAMP:1,SHRINK:2};
+class Graphics{roundRect(){}fill(){}clear(){}}
 class Node{
  constructor(name){this.name=name;this.children=[];this.parts=new Map();this.events={};this.isValid=true;this.layer=1;this.position={x:0,y:0};}
  addComponent(Type){const value=new Type();value.node=this;this.parts.set(Type,value);return value;}
@@ -25,10 +26,27 @@ function find(name,node=host){if(node.name===name)return node;for(const child of
  assert.equal(timers.size,1);assert.equal(host.children.length,1);
  assert.match(find('当前操作').getComponent(Label).string,/三尸盗掠扫描/);
  overlay.setOperation('等待战斗结算');assert.match(find('当前操作').getComponent(Label).string,/等待战斗结算/);
- const panel=host.children[0],before=panel.position.y;
+ const panel=host.children[0];
+ assert.equal(find('托管状态（拖动）').getComponent(Transform).width,396,'Label initialization must preserve title width');
+ const shortHeight=panel.getComponent(Transform).height;
+ const longOperation='等待当前战斗结算后收取所有奖励并重新开启下一轮墓藏，正在确认返回主界面后继续处理剩余任务';
+ overlay.setOperation(longOperation);
+ const detailNode=find('当前操作'),detailLabel=detailNode.getComponent(Label);
+ assert.equal(detailLabel.string.replace(/\n/g,''),'三尸盗掠扫描'+longOperation,'wrapped text must remain complete');
+ assert(panel.getComponent(Transform).height>shortHeight,'long content expands panel');
+ assert.equal(detailNode.getComponent(Transform).height,detailLabel.string.split('\n').length*detailLabel.lineHeight+8);
+ const exitNode=find('退出托管');
+ assert(detailNode.position.y-detailNode.getComponent(Transform).height/2>exitNode.position.y+17,'button must remain below text');
+ assert.equal(find('托管状态（拖动）').getComponent(Label).enableWrapText,false);
+ overlay.setOperation('等待战斗结算');
+ const before=panel.position.y;
  find('托管状态（拖动）').events.move({getUIDelta:()=>({x:10,y:-20})});assert.equal(panel.position.y,before-20);
  for(let i=0;i<20;i++)await overlay.update({run_id:'one',active:true,task:'三尸盗掠扫描'});
  assert.equal(host.children.length,1);assert.equal(timers.size,1);
+ const text=find('当前操作').getComponent(Label),writes=text.writes;
+ assert.equal(text.cacheMode,Label.CacheMode.CHAR);
+ for(let i=0;i<100;i++)for(const fn of timers.values())fn();
+ assert.equal(text.writes,writes,'unchanged text must not rebuild');
  find('退出托管').events.end({});assert.ok(overlay.shouldStop());
  await overlay.update({run_id:'one',active:true});assert.ok(overlay.shouldStop(),'stale active updates cannot clear a stop request');
  await overlay.update({run_id:'one',active:false});assert.equal(timers.size,0);assert.equal(host.children.length,0);

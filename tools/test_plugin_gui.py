@@ -26,6 +26,21 @@ def modules():
         raise
 
 
+def test_scanned_player_double_click_switches_page_and_emits_target(window):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidgetItem
+    scan=window.pages['legion'].scan
+    spy=QSignalSpy(window.player_requested)
+    row=QTreeWidgetItem(scan.tree,['扫描玩家','12300123'])
+    row.setData(0,Qt.ItemDataRole.UserRole,('player',12300123))
+    scan.tree.itemDoubleClicked.emit(row,0)
+    assert window.stack.currentWidget() is window.pages['player']
+    assert spy.count()==1 and spy.at(0)==['12300123']
+    assert '12300123' in window.pages['player'].subject.text()
+    window.pages['player'].current_player_button.click()
+    assert spy.at(1)==['']
+
+
 @pytest.fixture
 def window(app, tmp_path):
     s, w = modules()
@@ -45,7 +60,7 @@ def test_store_defaults_independent_and_only_configuration(app, tmp_path):
     assert state["treasure"] == {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30}
     assert state["damage"] == {"enabled": False, "auto_csv": True}
     assert not state["daily"]["enabled"]
-    assert len(state["daily"]["tasks"]) == 9
+    assert len(state["daily"]["tasks"]) == 12
     assert not any(t["enabled"] for t in state["daily"]["tasks"].values())
     assert not state["player"]["enabled"]
     assert not store.path.exists()
@@ -64,7 +79,7 @@ def test_new_gui_defaults_do_not_depend_on_editable_cli_configuration(app, tmp_p
             raise ValueError("旧CLI配置损坏")
         monkeypatch.setattr(s, "load_config", invalid_legacy)
     store = s.PluginConfigStore(tmp_path / "plugins.json")
-    assert len(store.snapshot()["daily"]["tasks"]) == 9
+    assert len(store.snapshot()["daily"]["tasks"]) == 12
     assert store.snapshot()["daily"]["tasks"]["energy"]["params"]["trigger_ratio"] == 0.9
     assert not store.snapshot()["daily"]["enabled"]
 
@@ -100,10 +115,10 @@ def test_invalid_saved_config_is_not_overwritten(app, tmp_path):
 
 def test_tree_navigation_and_truthful_unconnected_state(window):
     tree = window.tree
-    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "PVE辅助", "血月战场", "玩家信息透视", "摸金地图", "PVP伤害分析", "三尸合成", "调试信息"]
+    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "PVE辅助", "血月战场", "玩家信息透视", "摸金地图", "阴司透视", "拍卖助手", "PVP伤害分析", "三尸合成", "调试信息"]
     root = tree.topLevelItem(1)
-    assert [root.child(i).text(0) for i in range(root.childCount())] == ["体力扫荡", "阴墟墓葬", "定时斗法"]
-    assert set(window.pages) == {"global", "daily", "energy", "mines", "arena", "battle_assist", "control_chain", "zhongkui", "bloodmoon", "player", "treasure", "damage", "desire", "debug"}
+    assert [root.child(i).text(0) for i in range(root.childCount())] == ["日常扫荡", "鬼仆", "阴墟墓葬", "定时斗法"]
+    assert set(window.pages) == {"global", "daily", "energy", "pet_hatch", "mines", "arena", "battle_assist", "control_chain", "zhongkui", "bloodmoon", "player", "treasure", "legion", "auction", "damage", "desire", "debug"}
     assert "未接入" in window.connection_label.text()
     assert not window.game_connected
     # 血月页已接入：有开关，但游戏与插件未就绪时按钮一律不可用。
@@ -112,13 +127,13 @@ def test_tree_navigation_and_truthful_unconnected_state(window):
     assert not bloodmoon.probe_start.isEnabled()
     assert not bloodmoon.diagnose_button.isEnabled()
     assert not hasattr(window, "bridge")
-    tree.setCurrentItem(root.child(1))
+    tree.setCurrentItem(window.items['mines'])
     assert window.stack.currentWidget() is window.pages["mines"]
 
 
 def test_root_only_switches_and_child_switch_sync(window):
     root = window.pages["daily"]
-    assert len(root.findChildren(QCheckBox)) == 10
+    assert len(root.findChildren(QCheckBox)) == 13
     assert not root.findChildren(QSpinBox)
     root.toggles["energy"].setChecked(True)
     child = window.task_panels["energy"]

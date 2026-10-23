@@ -104,6 +104,104 @@ function fixture() {
   return {runtime:sandbox.createEnergyRuntime(g,{timeoutMs:50,pauseMs:1}),sandbox,g,role,requests,manager,roleService,petService,windows,cfg,inputs,petUI,uiNode,inputButton,setMode:v=>mode=v};
 }
 
+test('selected scan player uses public preview API without changing game UI',async()=>{
+  const f=fixture(),original=f.g.System.import;
+  let response={code:0,getData:()=>({preview:{id:12300123,name:'扫描玩家',previewHide:0,attribute:new Map()}})};
+  f.g.System.import=async name=>{
+    const module=await original(name);
+    return name.includes('define-index')?{...module,GameService:{getRolePreviewInfo:async args=>{
+      assert.equal(args.targetId,12300123);return response;
+    }}}:module;
+  };
+  const result=await f.runtime.dispatch('player_information',{target_id:'12300123'});
+  assert.equal(result.status,'ok');assert.match(result.value.subject,/扫描玩家.*12300123/);
+  assert.equal(f.inputs.length,0);
+  response={code:330015,error:'未找到对方数据'};
+  const failed=await f.runtime.dispatch('player_information',{target_id:'12300123'});
+  assert.notEqual(failed.status,'ok');assert.match(failed.message,/未找到对方数据.*330015/);
+});
+
+test('PVP inputs use raw permanent attributes, plan differences and complete Erlang gear',async()=>{
+  const f=fixture(),original=f.g.System.import;
+  const snapshot={id:12324803,name:'测试',attribute:new Map([[117,10000],[118,5000]]),
+    desirePlan:new Map([[65536,1]]),allDesirePlan:new Map([[0,new Map([[65536,1]])],[1,new Map([[65536,2]])]]),
+    magic:{onUsePlan:0,plan:new Map([[0,{name:'日常',entry:new Map([[1,{cfgId:1,value:2000}]])}],
+      [1,{name:'PVP',entry:new Map([[1,{cfgId:2,value:5000}]])}]])},
+    equipment:new Map(Array.from({length:8},(_,i)=>[i+1,{id:100+i,configId:6000+i,level:40,entry:[{id:1,value:100,unlock:false}]}])),
+    equipmentLevel:new Map(Array.from({length:8},(_,i)=>[i+1,40])),equipmentSuit:new Map([[6001,8]])};
+  const configs=await original('chunks:///_virtual/configs.ts');
+  configs.DesireCfg={getById:id=>({name:'三尸',attr:new Map([[id===1?'117':'118',id===1?1000:3000]]),desc:'触发后PVP增伤999%'})};
+  configs.MagicArtifactEntryCfg={getById:id=>({attrType:id===1?117:118,des:'PVP'})};
+  configs.EquipmentCfg={getById:()=>({name:'二郎',quality:6,star:1,LevelGrowthAttr:Array.from({length:41},()=>new Map([['117',400],['118',100]]))})};
+  configs.EquipmentEntryCfg={getById:()=>({group:117,name:'PVP增伤'})};
+  configs.AttrCfg={getById:id=>({note:id===117?'PVP增伤':'PVP减免',style:2})};
+  f.g.System.import=async name=>{
+    const module=await original(name);
+    return name.includes('define-index')?{...module,GameService:{getRolePreviewInfo:async()=>({code:0,getData:()=>({preview:snapshot})})}}:module;
+  };
+  let result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.equal(result.status,'ok');
+  let p=result.value.pvp_estimate;
+  assert.equal(p.face_kind,'erlang');assert.equal(p.face_pvp,48);assert.equal(p.face_complete,true);
+  assert.equal(p.desire.extra,20);assert.equal(p.magic.extra,30);assert.equal(p.base_up+p.base_down,150);
+  assert.equal(p.desire.plans[0].total,10);assert.equal(p.desire.plans[1].total,30);
+  assert.match(result.value.text,/\[方案0\]\[当前使用\].*PVP合计 10%/);
+  assert.match(result.value.text,/\[方案1\].*PVP合计 30%/);
+  assert.match(result.value.text,/三尸补差：最高 30%.*当前 10% = \+20%/);
+  assert.deepEqual(Array.from(p.missing),[]);
+  assert.equal(p.erlang_snapshot.equipment.__map__.length,8);
+  assert.equal(p.erlang_snapshot.equipment.__map__[0][1].entry[0].unlock,false);
+  assert.match(result.value.text,/当前法器方案 0「日常」/);
+  snapshot.desirePlan=snapshot.allDesirePlan.get(1);snapshot.magic.onUsePlan=1;
+  result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.equal(result.value.pvp_estimate.desire.extra,0);assert.equal(result.value.pvp_estimate.magic.extra,0);
+  assert.match(result.value.text,/三尸补差：最高 30%.*当前 30% = \+0%/);
+});
+
+test('desire details resolve real nested item configs and never silently omit unknown IDs',async()=>{
+  const f=fixture(),original=f.g.System.import,configs=await original('chunks:///_virtual/configs.ts');
+  configs.DesireCfg={getById:id=>id===601?{itemId:{name:'贪尸核心',desc:'概率触发PVP增伤99%'},attr:new Map([[117,1000]])}:
+    id===602?{itemId:9002,attr:new Map([[118,2000]])}:null};
+  configs.ItemCfg={getById:id=>id===9002?{name:'嗔尸舍利',desc:'PVP减免20%'}:null};
+  const snapshot={id:12324803,name:'测试',desirePlan:new Map([[65536,601]]),
+    allDesirePlan:new Map([[1,new Map([[65536,602],[131072,999]])]])};
+  f.g.System.import=async name=>{
+    const module=await original(name);
+    return name.includes('define-index')?{...module,GameService:{getRolePreviewInfo:async()=>({code:0,getData:()=>({preview:snapshot})})}}:module;
+  };
+  const result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.equal(result.status,'ok');
+  assert.match(result.value.text,/── 三尸 ──/);assert.match(result.value.text,/\[当前\].*贪尸核心.*概率触发PVP增伤99%/);
+  assert.match(result.value.text,/\[方案1\].*嗔尸舍利/);
+  assert.match(result.value.text,/三尸ID999（名称未识别）/);
+  assert.match(result.value.text,/常驻属性汇总：PVP增伤 10%/);
+  assert.doesNotMatch(result.value.text,/汇总：PVP增伤 99%/);
+});
+
+test('12324803 magic fixture distinguishes equipped Greed from named Bloodmoon alternatives',async()=>{
+  const f=fixture(),original=f.g.System.import,configs=await original('chunks:///_virtual/configs.ts');
+  configs.MagicArtifactEntryCfg={getById:id=>({attrType:id===19?'117':21,des:id===19?'PVP增伤':'PVP生命'})};
+  const plan=(name,values)=>({name,entry:new Map(values.map((value,i)=>[i+1,{cfgId:19,value}]))});
+  const snapshot={id:12324803,name:'屿澈',magic:{onUsePlan:5,plan:new Map([
+    ['3',plan('血月最佳',[720,780,720,630,580])],['4',plan('无敌血月',[600,690,610,750,600,460])],['5',plan('贪财',[])]])}};
+  snapshot.magic.plan.get('3').entry.set(6,{cfgId:22,value:1372});
+  f.g.System.import=async name=>{
+    const module=await original(name);
+    return name.includes('define-index')?{...module,GameService:{getRolePreviewInfo:async()=>({code:0,getData:()=>({preview:snapshot})})}}:module;
+  };
+  let result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  const p=result.value.pvp_estimate.magic;
+  assert.equal(p.current_id,5);assert.equal(p.current_name,'贪财');assert.equal(p.current,0);
+  assert.equal(p.best_id,'4');assert.equal(p.best_name,'无敌血月');assert.equal(p.extra,37.1);
+  assert.match(result.value.text,/当前实际装备：方案5「贪财」/);
+  assert.match(result.value.text,/\[备用，未装备\] 方案3「血月最佳」/);
+  assert.match(result.value.text,/最高PVP候选：方案4「无敌血月」（未装备，仅用于补差预估）/);
+  snapshot.magic.onUsePlan=4;
+  result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.equal(result.value.pvp_estimate.magic.extra,0);
+  assert.match(result.value.text,/当前实际装备：方案4「无敌血月」/);
+});
+
 test('identity reads the game role name instead of the platform nickname without opening any UI or sending requests',async()=>{
   const f=fixture();
   f.g.USER={userName:'微信昵称'};

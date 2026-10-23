@@ -260,3 +260,34 @@ def test_poll_refreshes_again_after_the_session_drops(feature):
     f.state.installed = True
     asyncio.run(f.poll({}))
     assert sum(1 for op, _ in t.calls if op == 'desire_bag_stats') == 2, '新会话要重新拉一次'
+
+
+def test_cross_quality_failure_pause_after_success(feature):
+    f,t=feature({(4,1):80,(4,2):80,(4,3):80},[False]*22+[True,False],success_after_failures=20,max_attempts=50)
+    pauses=[];f.panel.show_success_pause=pauses.append
+    statuses=[];original=f.panel.set_status
+    f.panel.set_status=lambda text:(statuses.append(text),original(text))
+    asyncio.run(f.run_batch())
+    assert len(t.composed())==23
+    assert pauses==[22]
+    assert '距上次成功连续失败 0 次' in f.panel.status
+    assert any('连续失败 22 次' in text for text in statuses)
+    assert any('连续失败 0/2' in text for text in statuses)
+    logged=rows(mod.LOG_PATH)
+    assert len(logged)==23 and logged[-1]['success']=='1'
+    assert not any(op=='desire_compose_close' for op,_ in t.calls)
+
+
+def test_failure_counter_resets_on_success(feature):
+    f,t=feature({(4,1):30},[False,True,False,False,True,False],success_after_failures=3,max_attempts=6)
+    pauses=[];f.panel.show_success_pause=pauses.append
+    asyncio.run(f.run_batch())
+    assert not pauses
+    assert '距上次成功连续失败 1 次' in f.panel.status
+
+
+def test_failure_pause_threshold_inclusive(feature):
+    f,t=feature({(4,1):30},[False,False,True,False],success_after_failures=2)
+    pauses=[];f.panel.show_success_pause=pauses.append
+    asyncio.run(f.run_batch())
+    assert pauses==[2] and len(t.composed())==3

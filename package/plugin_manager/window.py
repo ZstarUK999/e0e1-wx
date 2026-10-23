@@ -21,10 +21,13 @@ from .gate import PHASE_INIT, StartupGate
 from .feature_flags import panel_enabled, task_enabled
 from .panels import BloodmoonPanel, DailyPanel, DamagePanel, DebugPanel, DesirePanel, GlobalPanel, PlayerPanel, TaskPanel, TreasurePanel
 from .store import PluginConfigStore
+from .legion import LegionPanel
+from .auction import AuctionPanel
 from .battle_assist import create_battle_assist_panel, create_zhongkui_panel
 
 PAGE_TASKS = {
-    "energy": ("energy", "offline_reward"),
+    "energy": ("energy", "offline_reward", "free_summon"),
+    "pet_hatch": ("pet_hatch", "pet_fodder"),
     "mines": ("sanshi_tombs", "artifact_tombs", "sanshi_raid", "artifact_raid", "sanshi_fill", "artifact_fill"),
     "arena": ("arena",),
 }
@@ -55,6 +58,7 @@ class _ShutdownDialog(QDialog):
 
 
 class PluginWindow(QMainWindow):
+    player_requested=Signal(str)
     TARGET_APPID = "wx6d5e82c174635a48"
     configuration_changed = Signal(dict)
     test_requested = Signal(str, dict)
@@ -117,20 +121,25 @@ class PluginWindow(QMainWindow):
         self._test_actions = {}
         self._add_page("global", GlobalPanel(self.store))
         self._add_page("daily", DailyPanel(self.store))
-        for key, title in (("energy", "体力扫荡与挂机收益"), ("mines", "阴墟墓葬"), ("arena", "定时斗法")):
+        for key, title in (("energy", "日常扫荡与领取"), ("pet_hatch", "鬼仆：阴契解封与狗粮合成"), ("mines", "阴墟墓葬"), ("arena", "定时斗法")):
             if not panel_enabled(key) or not visible_tasks(key):
                 continue
             self._add_page(key, self._task_page(key, title))
-        self._add_page("battle_assist", create_battle_assist_panel(self.store))
+        self._add_page("battle_assist", create_battle_assist_panel(self.store, root=True))
         self._add_page("control_chain", create_battle_assist_panel(self.store))
         self._add_page("zhongkui", create_zhongkui_panel(self.store))
         self._add_page("bloodmoon", BloodmoonPanel(self.store))
         self._add_page("player", PlayerPanel(self.store))
         self._add_page("treasure", TreasurePanel(self.store))
+        self._add_page("legion", LegionPanel(self.store))
+        if not build_info().is_release:
+            self._add_page("auction", AuctionPanel(self.store))
         self._add_page("damage", DamagePanel(self.store))
         self._add_page("desire", DesirePanel(self.store))
         self._add_page("debug", DebugPanel())
-        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("battle_assist", "PVE辅助"), ("bloodmoon", "血月战场"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
+        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("battle_assist", "PVE辅助"), ("bloodmoon", "血月战场"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("legion", "阴司透视"), ("auction", "拍卖助手"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
+            if key == "auction" and build_info().is_release:
+                continue
             if not panel_enabled(key):
                 continue
             item = QTreeWidgetItem([title])
@@ -147,7 +156,7 @@ class PluginWindow(QMainWindow):
             self.items["zhongkui"] = zhongkui_item
             assist_item.setExpanded(True)
         daily_item = self.items.get("daily")
-        for key, title in (("energy", "体力扫荡"), ("mines", "阴墟墓葬"), ("arena", "定时斗法")):
+        for key, title in (("energy", "日常扫荡"), ("pet_hatch", "鬼仆"), ("mines", "阴墟墓葬"), ("arena", "定时斗法")):
             if daily_item is None or not panel_enabled(key) or not visible_tasks(key):
                 continue
             item = QTreeWidgetItem(daily_item, [title])
@@ -196,6 +205,16 @@ class PluginWindow(QMainWindow):
         player = self.pages["player"]
         player.copy_button.clicked.connect(self._copy_information)
         player.export_button.clicked.connect(self._export_information)
+        self.pages['legion'].scan.player_requested.connect(self._open_scanned_player)
+        player.current_player_button.clicked.connect(lambda:self.player_requested.emit(''))
+
+    def _open_scanned_player(self, player_id):
+        item=self.items.get('player')
+        if item is None:return
+        self.tree.setCurrentItem(item)
+        self.set_player_information('',f'正在查询玩家 {player_id}…')
+        self.pages['player'].message.setText('正在读取所选玩家公开资料')
+        self.player_requested.emit(str(player_id))
 
     def select_platform(self, callback):
         """Choose the host before constructing any debug service or patching files."""

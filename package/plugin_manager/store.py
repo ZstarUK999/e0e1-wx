@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from package.daily_tasks.config import parse_config
+from package.daily_tasks.pet_hatch import PET_EGGS
 
 from .feature_flags import task_enabled
 from .battle_assist import default_battle_assist, validate_battle_assist
@@ -23,7 +24,7 @@ RATIO_MIN = 0.01
 
 # 九个已定义任务；构建期开关关掉的那些不进配置（见 default_config）。
 TASK_IDS = ("energy", "offline_reward", "sanshi_tombs", "artifact_tombs",
-            "sanshi_raid", "artifact_raid", "sanshi_fill", "artifact_fill", "arena")
+            "sanshi_raid", "artifact_raid", "sanshi_fill", "artifact_fill", "arena", "free_summon", "pet_hatch", "pet_fodder")
 
 
 def _check_seconds(value, label):
@@ -63,18 +64,30 @@ def default_config() -> dict:
         "schedule": {"kind": "daily_window", "start": "10:28", "end": "10:30", "interval_seconds": 1},
         "params": {"excluded_player_ids": [], "continuous": True, "skip_battle": True},
     }
+    tasks['free_summon'] = {
+        'name': '8小时免费召唤', 'enabled': False, 'priority': 35, 'timeout_seconds': 180, 'retry_seconds': 300,
+        'schedule': {'kind': 'interval', 'interval_seconds': 60}, 'params': {},
+    }
+    tasks['pet_hatch'] = {
+        'name': '阴契自动解封', 'enabled': False, 'priority': 36, 'timeout_seconds': 120, 'retry_seconds': 60,
+        'schedule': {'kind': 'interval', 'interval_seconds': 60}, 'params': {'item_ids': []},
+    }
+    tasks['pet_fodder'] = {
+        'name': '狗粮自动合成', 'enabled': False, 'priority': 37, 'timeout_seconds': 3600, 'retry_seconds': 60,
+        'schedule': {'kind': 'interval', 'interval_seconds': 300}, 'params': {},
+    }
     # 构建期关掉的任务不进默认配置，玩家也就无从打开。
     tasks = {key: value for key, value in tasks.items() if task_enabled(key)}
     daily = {"version": 1, "enabled": False, "timezone": "Asia/Shanghai", "poll_seconds": 1,
              "summary_interval_seconds": 3600, "tasks": tasks}
     return {"version": 1, "daily": daily, "player": {"enabled": False},
-            "ui": {"delay_ms": 500, "game_overlays": True},
+            "ui": {"delay_ms": 500, "game_overlays": True, "wechat_reconnect": False, "reconnect_seconds": 300, "wechat_sidebar": None},
             "treasure": {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30},
             "damage": {"enabled": False, "auto_csv": True},
             # 三尸自动合成：kind 1贪 2嗔 3痴；expected_rate 是报告里理论曲线的默认成功率（百分数）。
             "desire": {"kind": 1, "start_quality": 1, "max_material_quality": 4,
                        "fail_limits": {"1": 4, "2": 4, "3": 4, "4": 4},
-                       "max_attempts": 200, "expected_rate": 30.0},
+                       "max_attempts": 200, "success_after_failures": 20, "expected_rate": 30.0},
             "battle_assist": default_battle_assist(),
             "bloodmoon": {"enabled": False,
                           "flag_probe": {"refresh_seconds": 5, "top_members": 3},
@@ -125,6 +138,15 @@ def validate_config(raw: dict) -> dict:
         raw_daily["tasks"] = _build_daily_tasks(raw_daily.get("tasks"))
     daily = parse_config(raw_daily)
     for task_id, task in daily.tasks.items():
+        if task_id == 'pet_hatch':
+            ids = task.params.get('item_ids', [])
+            if (set(task.params) - {'item_ids'} or not isinstance(ids, list) or
+                    any(type(x) is not int or x not in dict(PET_EGGS) for x in ids) or len(ids) != len(set(ids))):
+                raise ValueError('阴契请选择有效种类，可多选且不可重复')
+        if task_id == 'free_summon' and task.params:
+            raise ValueError('免费召唤不接受付费或额外参数')
+        if task_id == 'pet_fodder' and task.params:
+            raise ValueError('狗粮合成仅处理畜生道、饿鬼道和人道，不接受额外参数')
         kind = "daily_window" if task_id == "arena" else "interval"
         if task.schedule.kind != kind:
             raise ValueError(f"{task_id} 必须使用{kind}调度")
@@ -149,11 +171,25 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(player, dict) or set(player) != {"enabled"} or type(player["enabled"]) is not bool:
         raise ValueError("player配置只接受enabled布尔开关")
     ui = raw.get("ui", {"delay_ms": 500})
-    if not isinstance(ui, dict) or set(ui) - {"delay_ms", "auto_open_game", "game_overlays"}:
+    if not isinstance(ui, dict) or set(ui) - {"delay_ms", "auto_open_game", "game_overlays", "wechat_reconnect", "reconnect_seconds", "wechat_sidebar"}:
         # auto_open_game 已废弃（不再自动打开游戏），老配置里遇到就忽略。
         raise ValueError("ui配置只接受delay_ms/game_overlays")
     ui=dict(ui)
     ui.pop("auto_open_game", None)
+    ui.setdefault('wechat_reconnect', False)
+    ui.setdefault('reconnect_seconds', 300)
+    ui.setdefault('wechat_sidebar', None)
+    sidebar=ui['wechat_sidebar']
+    if sidebar is not None:
+        if not isinstance(sidebar,dict) or set(sidebar)!={'x','y','width','height','window_class'}:
+            raise ValueError('微信侧栏校准数据无效')
+        if any(type(sidebar[k]) is not int for k in ('x','y','width','height')) or not (
+            0<=sidebar['x']<sidebar['width']<=20000 and 0<=sidebar['y']<sidebar['height']<=20000):
+            raise ValueError('微信侧栏校准位置超出窗口')
+        if not isinstance(sidebar['window_class'],str) or not 1<=len(sidebar['window_class'])<=120:
+            raise ValueError('微信侧栏校准窗口类型无效')
+    if type(ui['wechat_reconnect']) is not bool or type(ui['reconnect_seconds']) is not int or not 1 <= ui['reconnect_seconds'] <= 86400:
+        raise ValueError('微信顶号重连须为布尔开关，等待时间须为1至86400秒整数')
     # Existing configurations enter the no-custom-overlay diagnostic mode on first upgrade.
     ui.setdefault("game_overlays", False)
     if type(ui["game_overlays"]) is not bool:
@@ -188,7 +224,7 @@ def _validate_desire(raw) -> dict:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict) or set(raw) - set(default):
-        raise ValueError("desire配置只接受 kind/start_quality/max_material_quality/fail_limits/max_attempts/expected_rate")
+        raise ValueError("desire配置只接受 kind/start_quality/max_material_quality/fail_limits/max_attempts/success_after_failures/expected_rate")
     merged = copy.deepcopy(default)
     merged.update(copy.deepcopy(raw))
     if type(merged["kind"]) is not int or merged["kind"] not in (1, 2, 3):
@@ -213,6 +249,9 @@ def _validate_desire(raw) -> dict:
     merged["fail_limits"] = cleaned
     if type(merged["max_attempts"]) is not int or not 1 <= merged["max_attempts"] <= 5000:
         raise ValueError("desire.max_attempts 必须是1至5000的整数（单批次保险丝）")
+    threshold = merged["success_after_failures"]
+    if type(threshold) is not int or not 0 <= threshold <= 5000:
+        raise ValueError("desire.success_after_failures 必须是0至5000的整数，0关闭检测")
     rate = merged["expected_rate"]
     if type(rate) not in (int, float) or isinstance(rate, bool) or not 0.1 <= float(rate) <= 100:
         raise ValueError("desire.expected_rate 必须是0.1至100的百分数")
@@ -322,6 +361,16 @@ class PluginConfigStore(QObject):
     def set_ui_delay(self, delay_ms: int) -> None:
         raw = self.snapshot()
         raw["ui"]["delay_ms"] = delay_ms
+        self._commit(raw)
+
+    def set_wechat_sidebar(self, value):
+        raw=self.snapshot()
+        raw['ui']['wechat_sidebar']=value
+        self._commit(raw)
+
+    def set_wechat_reconnect(self, enabled: bool, seconds: int) -> None:
+        raw = self.snapshot()
+        raw['ui'].update(wechat_reconnect=enabled, reconnect_seconds=seconds)
         self._commit(raw)
 
 

@@ -108,6 +108,35 @@ class GameSession:
         LOG.info('仍未拿到CDP连接，重发调试会话请求（第%d/%d次）', self._debug_retries, DEBUG_MAX_RETRIES)
         self.service.start_debug(self.record)
 
+    async def prepare_reopen(self, timeout=20):
+        """Re-arm hooks before opening a new game, then leave them intact during startup."""
+        ready=asyncio.Event()
+        reset_seen=False
+        failure=None
+        def changed(state):
+            nonlocal reset_seen, failure
+            if not state.get('frida'):reset_seen=True
+            if state.get('status')=='failed':
+                failure=state.get('error') or state.get('message') or '调试监听启动失败'
+                ready.set()
+            elif reset_seen and state.get('frida'):
+                ready.set()
+        self.service.state_changed.connect(changed)
+        try:
+            self._started=True
+            self._debug_retries=0
+            self._next_debug_retry=time.monotonic()+60
+            self.service.start_debug(self.record)
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+            if failure:raise RuntimeError(failure)
+            if self.state.closing:raise RuntimeError('插件正在退出，已取消打开游戏')
+            self._next_debug_retry=time.monotonic()+60
+            LOG.info('微信重开调试监听已就绪，接下来60秒保持监听等待游戏回连')
+        except TimeoutError:
+            raise RuntimeError('调试监听未在20秒内就绪，已停止打开游戏') from None
+        finally:
+            self.service.state_changed.disconnect(changed)
+
     # ── CDP 连接与注入 ──
 
     async def connect(self, port: int, epoch=None) -> None:

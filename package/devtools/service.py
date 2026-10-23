@@ -590,12 +590,19 @@ class DevtoolsService(QObject):
         self.event_timer.stop()
         if self.command_queue is not None:
             self.command_queue.put({"type": "shutdown"})
-        if wait:
-            if self.process is not None and self.process.is_alive():
-                self.process.join(timeout=1.0)
-            if self.process is not None and self.process.is_alive():
+        # 不能只投递消息后丢弃句柄；worker 可能卡在调试会话清理中。
+        if self.process is not None:
+            if self.process.is_alive():
+                self.process.join(timeout=1.0 if wait else 0.0)
+            if self.process.is_alive():
                 self.process.terminate()
                 self.process.join(timeout=1.0)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=1.0)
+            if self.process.is_alive():
+                raise RuntimeError('DevTools worker 无法退出，保留进程句柄供再次清理')
+            self.process.close()
         self.process = None
         self.event_queue = None
         self.command_queue = None

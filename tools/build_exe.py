@@ -45,11 +45,11 @@ MODE_DEBUG = "debug"
 # 没写到的项在运行时一律视为开启，所以老产物和源码运行不受影响。
 KNOWN_TASKS: tuple[str, ...] = (
     "sanshi_tombs", "artifact_tombs", "sanshi_raid", "artifact_raid",
-    "sanshi_fill", "artifact_fill", "energy", "offline_reward", "arena",
+    "sanshi_fill", "artifact_fill", "energy", "offline_reward", "arena", "free_summon", "pet_hatch", "pet_fodder",
 )
 KNOWN_PANELS: tuple[str, ...] = (
     "global", "daily", "bloodmoon", "player", "treasure", "damage", "debug",
-    "energy", "mines", "arena",
+    "energy", "mines", "arena", "pet_hatch",
 )
 
 # 运行时按 __file__ 相对定位读取的资源：源码在 package/ 下，冻结后落在
@@ -61,6 +61,13 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/plugin_manager/automation_overlay.js", "package/plugin_manager"),
     ("package/plugin_manager/pve_assist_overlay.js", "package/plugin_manager"),
     ("package/plugin_manager/battle_assist_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/auction_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/legion_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/wechat_reconnect.js", "package/plugin_manager"),
+    ("package/plugin_manager/startup_cleanup.js", "package/plugin_manager"),
+    ("package/plugin_manager/wechat_recent.ps1", "package/plugin_manager"),
+    ("package/plugin_manager/wechat_images", "package/plugin_manager/wechat_images"),
+    ("package/plugin_manager/douyin_images", "package/plugin_manager/douyin_images"),
     ("package/plugin_manager/douyin_bridge.js", "package/plugin_manager"),
     ("tools/config/daily_tasks.json", "tools/config"),
     ("tools/js", "tools/js"),
@@ -313,7 +320,13 @@ def build_command(
         command += ["--collect-all", "grpc", "--collect-submodules", "google.protobuf",
                     "--hidden-import", "package.plugin_manager.grpc_stub.plugin_pb2",
                     "--hidden-import", "package.plugin_manager.grpc_stub.plugin_pb2_grpc"]
+    # Actual builds have metadata; command-only callers may use a placeholder.
+    release_build = not exclude_grpc
+    if build_file.is_file():
+        release_build = json.loads(build_file.read_text(encoding="utf-8")).get("mode") == MODE_RELEASE
     for source, destination in RESOURCES:
+        if release_build and source == "package/plugin_manager/auction_runtime.js":
+            continue
         if not (ROOT / source).exists():
             print(f"[warn] 资源缺失，跳过：{source}")
             continue
@@ -348,6 +361,8 @@ def verify_release_bundle(target: Path, onefile: bool = False) -> None:
         if entry[-1] == "z":
             names.update(archive.open_embedded_archive(name).toc)
     required = {"grpc", "google.protobuf", "package.plugin_manager.grpc_stub.plugin_pb2", "package.plugin_manager.grpc_stub.plugin_pb2_grpc"}
+    if not onefile and (target / "_internal/package/plugin_manager/auction_runtime.js").exists():
+        raise RuntimeError("发行包包含开发专用拍卖助手脚本，请完整重建")
     missing = required - names
     if missing:
         raise RuntimeError("发行包缺少后台模块：" + ", ".join(sorted(missing)) + "；请完整重建，不能使用 --skip-build")

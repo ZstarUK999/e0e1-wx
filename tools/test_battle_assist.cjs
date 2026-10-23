@@ -9,7 +9,7 @@ class Signal {
   dispatch(...args){this.emit(...args);}
 }
 async function setup({cd=0,period=20,positionless=false,overlay=false,awakened=false,fixtureCase=null,fixture=null}={}) {
-  let energy=true,interval=null,worlds=[],casts=[],countdowns=[],spawned=[];
+  let energy=true,interval=null,worlds=[],casts=[],countdowns=[],spawned=[],diagnostics=[];
   const id=fixtureCase?fixtureCase.book:positionless?111200:110300;
   const rootSkill=fixtureCase?fixtureCase.root:awakened?111220:id;
   const cfg={SkillBookCfg:{getById:k=>({id:k,skill:[k],cdProperties1:[period]})},
@@ -63,18 +63,87 @@ async function setup({cd=0,period=20,positionless=false,overlay=false,awakened=f
   const modules={'battle-manager.ts':{BattleManager:{ins:{getBattles:()=>worlds}}},'system-card-logic.ts':{SystemCardLogic:class {}},
     'configs.ts':cfg,'battle-helper.ts':{battleHelper:helper},'types-battle.ts':{BattleState:{Running:1}},'vector2.ts':{Vector2:class {constructor(x,y){this.x=x;this.y=y;}}},
     'battle-const.ts':{BattleConst:{HERO_INIT_POS:{clone:()=>({x:0,y:168})}}}};
-  const g={System:{import:async name=>name==='cc'?cc:modules[name.split('/').pop()]},UIManager:{ins:{system:host}}};
+  const g={console:{info:(tag,value)=>diagnostics.push({tag,...JSON.parse(value)})},System:{import:async name=>name==='cc'?cc:modules[name.split('/').pop()]},UIManager:{ins:{system:host}}};
   let clock=0;
   const ctx={console,Date:{now:()=>clock},setInterval:f=>(interval=f,1),clearInterval:()=>{interval=null;}};
   vm.createContext(ctx);vm.runInContext(source+'\nthis.create=createBattleAssistRuntime;',ctx);
   const api=ctx.create(g),config={enabled:true,shijue:overlay,books:{[id]:{enabled:true,count:5}}};
   await api.configure(config);
-  return {api,config,id,logic,world,casts,host,countdowns,spawned,
+  return {api,config,id,logic,world,casts,host,countdowns,spawned,diagnostics,
     manual(){world.battleSignal.useSkill.emit(rootSkill,{x:0,y:0},{x:432,y:10},true,id);},
     tick(t){const dt=t-world.battleTime.battleTime;world.battleTime.battleTime=t;logic.onTick(dt);},
     clock(t){clock=t;},discover(){interval && interval();},energy(v){energy=v;},clearWorlds(){worlds=[];}};
 }
 (async()=>{
+  if(process.env.BATTLE_ASSIST_CASE==='diagnostics') {
+    const x=await setup({overlay:true});
+    assert.deepEqual(x.diagnostics.map(d=>d.stage),['battle-bound','overlay-before-first-render','overlay-after-first-render','heartbeat']);
+    const n=x.diagnostics.length;for(let i=0;i<20;i++)x.discover();assert.equal(x.diagnostics.length,n);
+    x.clock(5000);x.tick(13);x.discover();assert.equal(x.diagnostics.at(-1).stage,'heartbeat');assert.equal(x.diagnostics.at(-1).time,13);
+    x.world.battleSignal.useSkill.emit(111108,{x:0,y:0},{x:100,y:0},true,111100);
+    assert.equal(x.diagnostics.at(-1).stage,'shijue-success');assert.equal(x.diagnostics.at(-1).shijue.first,13);
+    x.clearWorlds();x.discover();assert.equal(x.diagnostics.at(-1).stage,'battle-unbind');x.api.destroy();
+    console.log('PASS durable diagnostic breadcrumbs, first-render boundaries, 5s throttle, casts and cleanup');return;
+  }
+  if(process.env.BATTLE_ASSIST_CASE==='shijue-phase') {
+    let x=await setup({overlay:true,cd:45});
+    await x.api.configure({...x.config,shijue_settings:{count:0,interval:20}});
+    const toggle=()=>{const panel=x.host.children.find(n=>n.name==='e0e1_battle_assist');panel.handlers.start();panel.handlers.end({});};
+    toggle();x.tick(1);assert.equal(x.casts.length,1,'first release establishes a nonzero anchor immediately');
+    assert.equal(x.api.snapshot()[0].shijueFirst,1);
+    x.tick(21);x.tick(41);x.tick(46);assert.equal(x.casts.length,1,'CD readiness between anchored rounds must not cast');
+    x.energy(false);x.tick(61);x.energy(true);x.tick(62);assert.equal(x.casts.length,1,'energy recovery must not fill a missed round');
+    x.tick(81);assert.deepEqual(x.casts.map(c=>c.time),[1,81]);
+    assert.equal(x.api.snapshot()[0].shijueFirst,1);x.api.destroy();
+    x=await setup({overlay:true,cd:10});
+    await x.api.configure({...x.config,shijue_settings:{count:0,interval:20}});
+    x.tick(3);x.world.battleSignal.useSkill.emit(111108,{x:0,y:0},{x:100,y:0},true,111100);toggle();
+    x.tick(13);x.tick(20);assert.equal(x.casts.length,1);x.tick(23);assert.equal(x.casts.length,2,'manual first release anchors rounds at 23,43,63');
+    x.tick(34);x.world.battleSignal.useSkill.emit(111108,{x:0,y:0},{x:100,y:0},true,111100);
+    assert.equal(x.api.snapshot()[0].shijueFirst,3,'later manual release preserves first anchor');
+    x.tick(43);x.tick(54);assert.equal(x.casts.length,3,'manual cooldown skips 43 and must not move the grid to 54');
+    x.tick(63);assert.equal(x.casts.length,4);
+    x.tick(90);assert.equal(x.casts.length,4,'late callbacks skip missed grid nodes');
+    x.tick(103.03);assert.equal(x.casts.length,5,'fixed tick rounding remains valid');
+    assert.equal(x.api.snapshot()[0].shijueDue,123);
+    toggle();toggle();x.tick(113.03);assert.equal(x.casts.length,5);
+    x.energy(false);x.tick(123);x.energy(true);x.tick(124);assert.equal(x.casts.length,5);x.tick(143);assert.equal(x.casts.length,6);
+    assert.equal(x.api.snapshot()[0].shijueFirst,3);
+    x.api.destroy();console.log('PASS first-success anchored rounds, energy/CD skips, manual casts, toggle, missed rounds and fixed-tick rounding');return;
+  }
+  if(process.env.BATTLE_ASSIST_CASE==='shijue-interval-baseline') {
+    const x=await setup({overlay:true,cd:10});
+    await x.api.configure({...x.config,shijue_settings:{count:0,interval:20}});
+    const panel=x.host.children.find(n=>n.name==='e0e1_battle_assist');
+    const toggle=()=>{panel.handlers.start();panel.handlers.end({});};
+    // The player casts first, then enables the helper. Native cooldown is 10s.
+    x.world.battleSignal.useSkill.emit(111108,{x:0,y:0},{x:100,y:0},true,111100);
+    assert.equal(x.api.snapshot()[0].shijueLast,0);toggle();
+    x.tick(10);assert.equal(x.casts.length,1,'CD ready must not bypass 20-second interval after manual cast');
+    x.tick(19.99);assert.equal(x.casts.length,1);x.tick(20);assert.equal(x.casts.length,2);
+    assert.equal(x.api.snapshot()[0].shijueCount,1,'success event must not double-count helper casts');
+    x.tick(30);assert.equal(x.casts.length,2);x.tick(40);assert.equal(x.casts.length,3);
+    // Reopening the switch resets batch count, not the last successful cast.
+    toggle();toggle();x.tick(50);assert.equal(x.casts.length,3);
+    x.tick(60);assert.equal(x.casts.length,4);assert.equal(x.api.snapshot()[0].shijueCount,1);
+    await x.api.configure({...x.config,shijue_settings:{count:0,interval:0}});
+    x.tick(70);assert.equal(x.casts.length,5,'zero interval still follows native CD');
+    x.api.destroy();console.log('PASS 20s interval with 10s CD, manual baseline, preserved baseline after toggling, count and zero interval');return;
+  }
+  if(process.env.BATTLE_ASSIST_CASE==='shijue-settings') {
+    const x=await setup({overlay:true});
+    await x.api.configure({...x.config,shijue_settings:{count:2,interval:5}});
+    const panel=x.host.children.find(n=>n.name==='e0e1_battle_assist');
+    const toggle=()=>{panel.handlers.start();panel.handlers.end({});};
+    toggle();x.tick(5);assert.equal(x.casts.length,1);assert.equal(x.api.snapshot()[0].shijueCount,1);
+    x.tick(9.99);assert.equal(x.casts.length,1);
+    x.energy(false);x.tick(10);assert.equal(x.casts.length,1);x.energy(true);x.tick(11);assert.equal(x.casts.length,1);x.tick(15);
+    assert.equal(x.casts.length,2);assert.equal(x.api.snapshot()[0].shijue,false);
+    x.tick(20);assert.equal(x.casts.length,2);toggle();x.tick(25);assert.equal(x.api.snapshot()[0].shijueCount,1);
+    x.world.battleState.curState=0;x.tick(40);assert.equal(x.casts.length,3);
+    x.world.battleState.curState=1;x.tick(40);assert.equal(x.casts.length,4);
+    x.api.destroy();console.log('PASS Shijue count/interval, energy wait, pause, re-enable resets count');return;
+  }
   if(process.env.BATTLE_ASSIST_CASE==='pve-integration') {
     const x=await setup({overlay:true});
     function find(name,n=x.host){if(!n.isValid)return null;if(n.name===name)return n;for(const c of n.children){const r=find(name,c);if(r)return r;}return null;}

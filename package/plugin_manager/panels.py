@@ -8,11 +8,11 @@ from datetime import datetime
 
 LOG = logging.getLogger('plugin_manager.configuration')
 
-from PySide6.QtCore import QSignalBlocker, QTime, Qt, Signal
+from PySide6.QtCore import QSignalBlocker, QTime, Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTimeEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTimeEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
 )
 
 from .feature_flags import task_enabled
@@ -48,7 +48,7 @@ class DailyPanel(QWidget):
         self.automation_state.setWordWrap(True)
         layout.addWidget(self.automation_state)
         self.automation_running = False
-        labels = {"energy": "体力扫荡", "offline_reward": "每小时挂机收益", "sanshi_tombs": "三尸墓藏收取／重开", "artifact_tombs": "法器墓藏收取／重开", "sanshi_raid": "三尸盗掠", "artifact_raid": "法器盗掠", "sanshi_fill": "三尸填土", "artifact_fill": "法器填土", "arena": "定时斗法"}
+        labels = {"energy": "体力扫荡", "offline_reward": "每小时挂机收益", "free_summon": "8小时免费召唤", "pet_hatch": "阴契自动解封", "pet_fodder": "狗粮自动合成", "sanshi_tombs": "三尸墓藏收取／重开", "artifact_tombs": "法器墓藏收取／重开", "sanshi_raid": "三尸盗掠", "artifact_raid": "法器盗掠", "sanshi_fill": "三尸填土", "artifact_fill": "法器填土", "arena": "定时斗法"}
         for task_id, label in labels.items():
             if not task_enabled(task_id):
                 continue
@@ -148,6 +148,29 @@ class TaskPanel(QGroupBox):
             layout.addWidget(note)
         elif task_id == "offline_reward":
             self._number("params.claim_interval_seconds", "领取间隔（秒）", params.get("claim_interval_seconds", 3600))
+        elif task_id == 'free_summon':
+            note = QLabel('冷却到期后点击正常免费召唤入口；按游戏的8小时冷却安排下次检查。若出现广告，等待正常广告流程完成。')
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        elif task_id == 'pet_hatch':
+            from package.daily_tasks.pet_hatch import PET_EGGS
+            choices = QListWidget()
+            choices.setMinimumHeight(240)
+            for id, name in reversed(PET_EGGS):
+                item = QListWidgetItem(name, choices)
+                item.setData(Qt.ItemDataRole.UserRole, id)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if id in params.get('item_ids', []) else Qt.CheckState.Unchecked)
+            self._field('params.item_ids', '自动解封种类（可多选）', choices)
+            note = QLabel('按实际品质从高到低解封；同品质按道具排序。先一键领取已完成阴契、点击空白关闭结果，再填满可用解封槽和已解锁的等待队列。不购买槽位或使用黄金加速。')
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        elif task_id == 'pet_fodder':
+            note = QLabel('从畜生道开始，依次处理饿鬼道和人道；进阶到地狱道后不再使用。\n'
+                          '依次合成进度0+0、1+1、3+3；3+3未进阶时继续投入进度3材料。\n'
+                          '自动关闭进阶弹窗。不使用锁定、出战或编队中的鬼仆，不使用献祭道具。')
+            note.setWordWrap(True)
+            layout.addWidget(note)
         elif task_id.endswith("_tombs"):
             self._bool("params.recruit", "重开后发布正常招募", params.get("recruit", True))
         elif task_id.endswith("_raid"):
@@ -228,7 +251,10 @@ class TaskPanel(QGroupBox):
     def save(self):
         patch = {}
         for key, widget in self.fields.items():
-            if isinstance(widget, QTimeEdit):
+            if isinstance(widget, QListWidget):
+                value = [widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(widget.count())
+                         if widget.item(i).checkState() == Qt.CheckState.Checked]
+            elif isinstance(widget, QTimeEdit):
                 value = widget.time().toString("HH:mm")
             elif isinstance(widget, QPlainTextEdit):
                 value = [line.strip() for line in widget.toPlainText().splitlines() if line.strip()]
@@ -278,8 +304,29 @@ class GlobalPanel(QWidget):
         self.game_overlays.setToolTip("关闭后移除日常和PVE的自定义悬浮窗，用于白屏对照排查；日常、控制链和3倍按钮功能仍保留。")
         self.form.addRow("游戏悬浮窗", self.game_overlays)
         self.game_overlays.toggled.connect(store.set_game_overlays)
+        self.wechat_reconnect = QCheckBox('顶号后自动重新打开游戏（仅微信）')
+        self.wechat_reconnect.setObjectName('ui.wechat_reconnect')
+        self.reconnect_seconds = QSpinBox()
+        self.reconnect_seconds.setObjectName('ui.reconnect_seconds')
+        self.reconnect_seconds.setRange(1, 86400)
+        self.reconnect_seconds.setSuffix(' 秒')
+        self.form.addRow('微信顶号重连', self.wechat_reconnect)
+        self.form.addRow('顶号后等待时间', self.reconnect_seconds)
+        self.sidebar_calibrate=QPushButton('旧入口坐标校准（图像模式无需校准）')
+        self.sidebar_calibrate.setObjectName('ui.wechat_sidebar.calibrate')
+        self.sidebar_status=QLabel('');self.sidebar_status.setWordWrap(True)
+        self.sidebar_timer=QTimer(self);self.sidebar_timer.setSingleShot(True)
+        self.sidebar_timer.timeout.connect(self._capture_wechat_sidebar)
+        self.sidebar_calibrate.clicked.connect(self._begin_wechat_sidebar)
+        self.form.addRow('微信侧栏入口',self.sidebar_calibrate)
+        self.form.addRow('',self.sidebar_status)
+        self.sidebar_status.setText('当前使用图片识别入口，自动确认绿色选中状态')
+        self.wechat_reconnect.setChecked(store.snapshot()['ui']['wechat_reconnect'])
+        self.reconnect_seconds.setValue(store.snapshot()['ui']['reconnect_seconds'])
+        self.wechat_reconnect.toggled.connect(lambda enabled: store.set_wechat_reconnect(enabled, self.reconnect_seconds.value()))
         note = QLabel("每一步 UI 操作之间等待的时间，方便观察执行过程；只影响节奏，不改变任何安全检查。\n"
-                      "目标游戏需要你自己在微信里打开：插件不会主动打开微信或小游戏。")
+                      "首次需要手动打开游戏；微信顶号后按倒计时重开。长期任务断线后，持续15秒确认游戏客户区纯白／纯黑才自动重开。"
+                      "重开通过图片确认微信入口和“小程序”页的绿色选中状态，再点击《遗弃之地》。请保持微信已登录、主窗口完整位于主屏幕内。")
         note.setWordWrap(True)
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -292,8 +339,25 @@ class GlobalPanel(QWidget):
         layout.addStretch()
         store.changed.connect(lambda state: self.sync(state))
 
+    def _begin_wechat_sidebar(self):
+        self.sidebar_calibrate.setEnabled(False)
+        self.sidebar_status.setText('3秒后记录：请将鼠标移到微信侧栏“小程序”图标上，无需点击')
+        self.sidebar_timer.start(3000)
+
+    def _capture_wechat_sidebar(self):
+        try:
+            from .wechat_launch import capture_wechat_sidebar
+            value=capture_wechat_sidebar()
+            self.store.set_wechat_sidebar(value)
+            self.sidebar_status.setText(f"已校准（微信窗口 {value['width']}×{value['height']}）；改变窗口尺寸后请重新校准")
+        except Exception as exc:
+            self.sidebar_status.setText('校准失败：'+str(exc))
+        finally:
+            self.sidebar_calibrate.setEnabled(True)
+
     def sync(self, state):
         set_checked(self.game_overlays,state["ui"]["game_overlays"])
+        set_checked(self.wechat_reconnect, state['ui']['wechat_reconnect'])
         value = state["ui"]["delay_ms"]
         if self.delay.value() != value:
             self.delay.setValue(value)
@@ -301,6 +365,7 @@ class GlobalPanel(QWidget):
     def save(self):
         try:
             self.store.set_ui_delay(self.delay.value())
+            self.store.set_wechat_reconnect(self.wechat_reconnect.isChecked(), self.reconnect_seconds.value())
             self.message.setText("全局设置已保存，下一次操作生效")
         except (OSError, ValueError) as exc:
             LOG.exception('插件配置保存失败')
@@ -429,6 +494,8 @@ class PlayerPanel(QWidget):
         layout.addWidget(self.text, 1)
         buttons = QHBoxLayout()
         self.copy_button, self.export_button = QPushButton("复制"), QPushButton("导出文本")
+        self.current_player_button=QPushButton('显示当前游戏页面')
+        buttons.addWidget(self.current_player_button)
         buttons.addWidget(self.copy_button)
         buttons.addWidget(self.export_button)
         layout.addLayout(buttons)
@@ -962,6 +1029,12 @@ class DesirePanel(QWidget):
         self.max_attempts.setRange(1, 5000)
         self.max_attempts.setObjectName("desire.max_attempts")
         bottom.addRow("单批次最多合成次数", self.max_attempts)
+        self.success_after_failures = QSpinBox()
+        self.success_after_failures.setRange(0, 5000)
+        self.success_after_failures.setSpecialValueText("关闭")
+        self.success_after_failures.setObjectName("desire.success_after_failures")
+        self.success_after_failures.setToolTip("跨等阶累计距上次成功的连续失败；达到阈值后首次成功立即停止并提示。0关闭。")
+        bottom.addRow("累计连败达到阈值后，成功即停", self.success_after_failures)
         self.expected_rate = QDoubleSpinBox()
         self.expected_rate.setRange(0.1, 100.0)
         self.expected_rate.setDecimals(1)
@@ -994,7 +1067,7 @@ class DesirePanel(QWidget):
         layout.addWidget(self.message)
 
         self.kind.currentIndexChanged.connect(lambda _: self._save())
-        for widget in (self.start_quality, self.max_quality, self.max_attempts):
+        for widget in (self.start_quality, self.max_quality, self.max_attempts, self.success_after_failures):
             widget.valueChanged.connect(lambda _: self._save())
         self.expected_rate.valueChanged.connect(lambda _: self._save())
         for box in self.limits.values():
@@ -1029,6 +1102,7 @@ class DesirePanel(QWidget):
                 "max_material_quality": self.max_quality.value(),
                 "fail_limits": {str(q): box.value() for q, box in self.limits.items()},
                 "max_attempts": self.max_attempts.value(),
+                "success_after_failures": self.success_after_failures.value(),
                 "expected_rate": self.expected_rate.value(),
             })
             self.message.setText("参数已保存")
@@ -1049,6 +1123,9 @@ class DesirePanel(QWidget):
             widget.blockSignals(True)
             widget.setValue(int(config.get(key) or default))
             widget.blockSignals(False)
+        self.success_after_failures.blockSignals(True)
+        self.success_after_failures.setValue(int(config.get("success_after_failures", 20)))
+        self.success_after_failures.blockSignals(False)
         self.expected_rate.blockSignals(True)
         self.expected_rate.setValue(float(config.get("expected_rate") or 30.0))
         self.expected_rate.blockSignals(False)
@@ -1065,6 +1142,14 @@ class DesirePanel(QWidget):
     def set_running(self, running: bool):
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(bool(running))
+
+    def show_success_pause(self, failures):
+        dialog = QMessageBox(QMessageBox.Information, "三尸合成已暂停",
+                             f"距离上次成功连续失败 {failures} 次后，本次合成成功，自动合成已停止。\n可以考虑手工进行高阶三尸合成。", parent=self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.setModal(True)
+        self._success_pause_dialog = dialog
+        dialog.open()
 
     def set_status(self, text: str):
         self.status.setText(text)

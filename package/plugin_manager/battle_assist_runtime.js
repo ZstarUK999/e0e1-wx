@@ -7,11 +7,118 @@ function createBattleAssistRuntime(g) {
   let pveOverlay=null;
   let destroyed=false, panel=null, label=null, cc=null, overlayWorld=null, dragPos=null, panelGraph=null, panelTransform=null, textTransform=null, buttonPressed=false, buttonBounds=null;
   const bindings=new Map();
+  // EBattleType: main/challenge/novice, legionWar, battlefield (not duel),
+  // rougeLike, walkIn, seasonStage (诡道深渊). Independent of card-chain support.
+  const speedTypes=new Set([1,2,3,6,13,21,23,27]),speedViews=new Map();
   const valid=n=>!!n && n.isValid!==false;
   const number=x=>typeof x==='number'?x:Number(x && x.toNumber?x.toNumber():x);
   const row=(table,id)=>table && table.getById(Number(id));
   const now=w=>number(w.battleTime.battleTime);
   const enabled=id=>config.enabled && !!(config.books[String(id)] || {}).enabled;
+
+  // Send breadcrumbs to the external plugin log before a stalled VM becomes unreadable.
+  // No game services, player data, or extra CDP evaluations are involved.
+  let diagnosticAt=null;
+  function diagnostic(stage,b) {
+    if(!g.console || typeof g.console.info!=='function')return;
+    try {
+      const w=b && b.world,t=w && w.battleTime,o=pveOverlay && pveOverlay.snapshot();
+      g.console.info('[plugin.diagnostic]',JSON.stringify({version:1,stage,wallTime:Date.now(),
+        type:w && w.options.battleData.type,time:t && now(w),state:w && w.battleState.curState,
+        scale:t && number(t.timeScale),baseScale:t && number(t.baseTimeScale),
+        overlays:g.__e0e1GameOverlaysEnabled!==false,autoSpeed:!!config.auto_speed,
+        shijue:b && {enabled:b.shijue,count:b.shijueCount,first:b.shijueFirst,last:b.shijueLast,due:b.shijueDue},
+        chains:b && [...b.chains].map(([id,s])=>({id,active:s.active,count:s.count,due:s.due})),
+        overlay:o && {tab:o.tab,expanded:o.expanded,nodeCount:o.nodeCount,visibleNodeCount:o.visibleNodeCount,monsterCount:o.monsters.length}}));
+    }catch(e){console.error('[对战诊断]',e);}
+  }
+
+  function speedEligible(world) {
+    const options=world && world.options,type=options && options.battleData && options.battleData.type;
+    return !!(options && !options.isReplay && world.battleTime && speedTypes.has(type) &&
+      !modules.helper.isFrameSyncType(type) && !modules.helper.isServerResultPvpType(type));
+  }
+  function speedUnlocked(view) {
+    return config.enabled && config.auto_speed && speedEligible(view.battleWorld);
+  }
+  function restoreSpeed(view) {
+    const saved=speedViews.get(view);if(!saved)return;
+    speedViews.delete(view);
+    if(saved.caption && valid(saved.caption))saved.caption.destroy();
+    if(saved.highest && valid(saved.highest))saved.highest.active=saved.highestActive;
+    for(const {button,callback,target} of saved.buttons)if(valid(button.node))button.addClick(callback,target);
+    for(const {label,text} of saved.labels)if(valid(label.node))label.string=text;
+    for(const key of ['setSpeed','refreshSpeedNode'])if(view[key]===saved[key].wrapper){
+      if(saved[key].own)view[key]=saved[key].original;else delete view[key];
+    }
+    const node=view.view && view.view.node_gameScale;
+    if(node && valid(node))node.active=saved.visible;
+    if(valid(view.node))view.refreshSpeedNode();
+  }
+  function syncSpeed(worlds) {
+    for(const view of speedViews.keys())if(!valid(view.node) || !worlds.includes(view.battleWorld) || !speedUnlocked(view))restoreSpeed(view);
+    if(!config.enabled || !config.auto_speed)return;
+    const ui=g.UIManager && g.UIManager.ins;
+    if(!ui)return;
+    const root=ui.root,type=modules.speedUi && modules.speedUi.UIBattleBase;
+    const views=new Set(Object.values(ui.viewParams || {}).map(p=>p.ui).filter(Boolean));
+    if(root && root.getComponentsInChildren && type)for(const view of root.getComponentsInChildren(type))views.add(view);
+    for(const view of views){
+      const node=view.view && view.view.node_gameScale;
+      if(!node || typeof view.setSpeed!=='function' || typeof view.refreshSpeedNode!=='function' || !worlds.includes(view.battleWorld) || !speedUnlocked(view))continue;
+      if(!speedViews.has(view)){
+        const saved={visible:node.active,buttons:[],labels:[]};
+        for(const [index,value] of [[0,1],[1,1.3],[2,1.6]]){
+          const child=node.children[index];
+          const button=child && child.getComponents(cc.Component).find(c=>typeof c.addClick==='function' && 'clickCallback' in c);
+          if(button){saved.buttons.push({button,callback:button.clickCallback,target:button.cbTarget});button.addClick((...args)=>view.setSpeed(value),view);}
+        }
+        const highest=node.children[2];
+        if(highest && cc.Label){
+          saved.highest=highest;saved.highestActive=highest.active;
+          const labels=highest.getComponentsInChildren(cc.Label);
+          for(const label of labels){saved.labels.push({label,text:label.string});label.string='3倍速';}
+          // Some prefabs render speed captions as sprites and contain no Label.
+          if(!labels.length){
+            const caption=new cc.Node('e0e1-speed-caption');caption.layer=highest.layer;
+            highest.addChild(caption);caption.addComponent(cc.UITransform).setContentSize(100,30);
+            const label=caption.addComponent(cc.Label);label.string='3倍速';label.fontSize=22;label.lineHeight=28;
+            label.color=new cc.Color(255,230,130,255);
+            const transform=highest.getComponent(cc.UITransform);
+            caption.setPosition(0,-((transform && transform.height) || 50)/2-12,0);
+            saved.caption=caption;
+          }
+          highest.active=true;
+        }
+        for(const key of ['setSpeed','refreshSpeedNode'])saved[key]={original:view[key],own:Object.prototype.hasOwnProperty.call(view,key)};
+        saved.setSpeed.wrapper=function(value,initial=false){
+          if(!speedUnlocked(this) || initial)return saved.setSpeed.original.call(this,value,initial);
+          const world=this.battleWorld;
+          if(world.isPaused || world.battleTime.isSkipping || world.battleState.curState!==modules.types.BattleState.Running)return;
+          // The native highest-speed button passes 1.6; expose it as manual 3x.
+          const scale=value===1.6?3:value;
+          world.battleTime.timeScale=scale;world.battleTime.baseTimeScale=scale;
+          this.refreshSpeedNode();
+        };
+        saved.refreshSpeedNode.wrapper=function(...args){
+          const result=saved.refreshSpeedNode.original.apply(this,args);
+          if(speedUnlocked(this)){
+            const buttons=this.view.node_gameScale.children;
+            this.view.node_gameScale.active=true;
+            for(const index of [1,2]){
+              const lock=buttons[index] && buttons[index].getChildByName('lock');if(lock)lock.active=false;
+            }
+            const selected=buttons[2] && buttons[2].getChildByName('inSelect');
+            if(selected)selected.active=number(this.battleWorld.battleTime.timeScale)===3;
+          }
+          return result;
+        };
+        speedViews.set(view,saved);
+        view.setSpeed=saved.setSpeed.wrapper;view.refreshSpeedNode=saved.refreshSpeedNode.wrapper;
+      }
+      view.refreshSpeedNode();
+    }
+  }
 
   // n + min(l, m/count) + m*k. Skip unavailable cycles instead of shifting the chain's phase.
   function phaseAtOrAfter(base,period,threshold) {
@@ -134,7 +241,11 @@ function createBattleAssistRuntime(g) {
     return '';
   }
   function success(b,skillId,start,end,manual,bookId) {
-    bookId=Number(bookId);if(b.sending || manual!==true || !supported.has(bookId) || !enabled(bookId))return;
+    bookId=Number(bookId);
+    // All successful casts establish the interval baseline, including the
+    // player's first cast before enabling the helper and other native inputs.
+    if(bookId===SHIJUE){recordShijue(b,now(b.world));return;}
+    if(b.sending || manual!==true || !supported.has(bookId) || !enabled(bookId))return;
     const existing=b.chains.get(bookId);
     if(existing && existing.active){finish(existing,'玩家手动释放，控制链已停止');renderOverlay();return;}
     const timing=metrics(bookId,skillId,b.world);
@@ -168,6 +279,23 @@ function createBattleAssistRuntime(g) {
     if(accepted)b.world.battleSignal.playerAutoUseCard.dispatch(state.bookId,undefined,end);
     return accepted;
   }
+  function toggleShijue(b,value) {
+    b.shijue=value;
+    if(value)b.shijueCount=0;
+  }
+  function recordShijue(b,time) {
+    b.shijueLast=time;
+    if(b.shijueFirst===null)b.shijueFirst=time;
+    const period=Number((config.shijue_settings || {}).interval)||0;
+    b.shijueDue=period>0?phaseAtOrAfter(b.shijueFirst+period,period,time+1e-5):null;
+    b.shijuePeriod=period;
+    if(b.shijue && config.shijue){
+      b.shijueCount++;
+      const limit=Number((config.shijue_settings || {}).count)||0;
+      if(limit>0 && b.shijueCount>=limit)b.shijue=false;
+    }
+    diagnostic('shijue-success',b);
+  }
   function tick(b) {
     if(destroyed || !config.enabled || !running(b))return;
     const time=now(b.world);
@@ -196,26 +324,43 @@ function createBattleAssistRuntime(g) {
       s.due=phaseAtOrAfter(s.due+s.period,s.period,time);
     }
     if(b.shijue && config.shijue) {
+      const setting=config.shijue_settings || {},limit=Number(setting.count)||0,interval=Number(setting.interval)||0;
+      if(limit>0 && b.shijueCount>=limit){b.shijue=false;return;}
+      if(interval>0 && b.shijueFirst!==null){
+        if(b.shijuePeriod!==interval || b.shijueDue===null){
+          b.shijuePeriod=interval;
+          b.shijueDue=phaseAtOrAfter(b.shijueFirst+interval,interval,time);
+        }
+        // Stay on first-success + n*interval nodes. A delayed callback must not
+        // replay a missed round; allow only fixed-tick rounding at the boundary.
+        if(time>b.shijueDue+0.125)b.shijueDue=phaseAtOrAfter(b.shijueFirst+interval,interval,time);
+        if(time+1e-7<b.shijueDue)return;
+        b.shijueDue+=interval;
+      }else {b.shijueDue=null;b.shijuePeriod=0;}
       const book=row(modules.cfg.SkillBookCfg,SHIJUE);
       const levels=modules.helper.getAllRequireSkillLevels(b.world);
       const level=levels.get(SHIJUE);
       if(!book || !(level>0) || !book.skill[level-1])return;
       const skillId=modules.helper.getEvolutionSkillId(SHIJUE,level,b.world);
-      cast(b,{bookId:SHIJUE,skillId,end:{x:100,y:0}});
+      const previousCount=b.shijueCount;
+      if(cast(b,{bookId:SHIJUE,skillId,end:{x:100,y:0}}) && b.shijueCount===previousCount)
+        recordShijue(b,time); // Fallback for clients without the success signal.
     }
   }
   function bind(world) {
     if(bindings.has(world) || !acceptable(world))return;
     const logic=world.systemManager.getSystem(modules.card.SystemCardLogic);
     if(!logic || typeof logic.canUseSpecialCard!=='function')return;
-    const b={world,logic,chains:new Map(),sending:false,shijue:false,original:logic.onTick,wrapper:null};
+    const b={world,logic,chains:new Map(),sending:false,shijue:false,shijueCount:0,shijueLast:null,shijueFirst:null,shijueDue:null,shijuePeriod:0,original:logic.onTick,wrapper:null};
     b.onSuccess=(...args)=>success(b,...args);
     b.wrapper=function(dt){b.original.call(this,dt);try{tick(b);}catch(e){b.shijue=false;for(const s of b.chains.values())s.active=false;console.error('[对战辅助]',e);}};
     logic.onTick=b.wrapper;
     world.battleSignal.battleUseSkill.on(b.onSuccess,b);
     bindings.set(world,b);
+    diagnostic('battle-bound',b);
   }
   function unbind(b) {
+    diagnostic('battle-unbind',b);
     if(b.logic.onTick===b.wrapper)b.logic.onTick=b.original;
     try{b.world.battleSignal.battleUseSkill.off(b.onSuccess,b);}catch(_){}
     b.chains.clear();b.shijue=false;bindings.delete(b.world);
@@ -225,7 +370,7 @@ function createBattleAssistRuntime(g) {
     if(typeof createPveAssistOverlay==='function' && cc && modules) {
       if(!pveOverlay)pveOverlay=createPveAssistOverlay(g,cc,modules);
       const b=[...bindings.values()].find(b=>acceptable(b.world) && b.world.getFightHero && b.world.getFightHero());
-      pveOverlay.update(b,config,{running,now,blockedReason,render:renderOverlay});return;
+      pveOverlay.update(b,config,{running,now,blockedReason,toggleShijue,render:renderOverlay});return;
     }
     const candidates=[...bindings.values()].filter(b=>acceptable(b.world));
     const b=candidates.find(b=>b.world.getFightHero && b.world.getFightHero());
@@ -277,7 +422,7 @@ function createBattleAssistRuntime(g) {
       panel.on(cc.Node.EventType.TOUCH_END,event=>{
         const clicked=buttonPressed && !moved && inButton(event);
         buttonPressed=false;
-        if(clicked)b.shijue=!b.shijue;
+        if(clicked)toggleShijue(b,!b.shijue);
         renderOverlay();
         event.propagationStopped=true;
       });
@@ -319,16 +464,25 @@ function createBattleAssistRuntime(g) {
   function discover() {
     if(!modules || destroyed)return;
     const worlds=modules.manager.BattleManager.ins.getBattles();
+    syncSpeed(worlds);
     for(const [w,b] of bindings)if(!worlds.includes(w) || !acceptable(w))unbind(b);
     if(config.enabled)for(const w of worlds)bind(w);
+    const first=[...bindings.values()].find(b=>!b.diagnosticRendered);
+    if(first)diagnostic('overlay-before-first-render',first);
     renderOverlay();
+    if(first){first.diagnosticRendered=true;diagnostic('overlay-after-first-render',first);}
+    const wall=Date.now();
+    if(bindings.size && (diagnosticAt===null || wall-diagnosticAt>=5000)){
+      diagnosticAt=wall;for(const b of bindings.values())diagnostic('heartbeat',b);
+    }
   }
   const api={
     async configure(value) {
       config=value || {enabled:false,shijue:false,books:{}};
-      if(!config.enabled){for(const b of [...bindings.values()])unbind(b);removePanel();if(pveOverlay){pveOverlay.destroy();pveOverlay=null;}if(timer!==null){clearInterval(timer);timer=null;}return;}
+      if(!config.enabled){syncSpeed([]);for(const b of [...bindings.values()])unbind(b);removePanel();if(pveOverlay){pveOverlay.destroy();pveOverlay=null;}if(timer!==null){clearInterval(timer);timer=null;}return;}
       await load();if(destroyed)return;
       if(!cc)cc=await g.System.import('cc');
+      if(config.auto_speed && !modules.speedUi)modules.speedUi=await g.System.import('chunks:///_virtual/ui-battle-base.ts');
       if(typeof createPveAssistOverlay==='function' && !modules.context) {
         const [context,subdue]=await Promise.all(['comp-battle-context.ts','ui-subdue-battle.ts'].map(n=>g.System.import('chunks:///_virtual/'+n)));
         modules.context=context;modules.subdue=subdue;
@@ -339,6 +493,8 @@ function createBattleAssistRuntime(g) {
       }
       discover();if(timer===null)timer=setInterval(()=>{try{discover();}catch(e){console.error('[对战辅助]',e);}},250);
     },
+    resourceStatus(){const o=pveOverlay && pveOverlay.snapshot();return {worlds:bindings.size,chains:[...bindings.values()].reduce((n,b)=>n+b.chains.size,0),timer:timer!==null,speedWorlds:speedWorlds.size,overlayNodes:o?o.nodeCount:0};},
+    pveStatus(){return pveOverlay?pveOverlay.snapshot():null;},
     timingPreview(){
       if(!modules || destroyed)return [];
       const result=[];
@@ -358,9 +514,9 @@ function createBattleAssistRuntime(g) {
       }
       return result;
     },
-    snapshot(){return [...bindings.values()].map(b=>({battleId:b.world.options.battleData.id,shijue:b.shijue,
+    snapshot(){return [...bindings.values()].map(b=>({battleId:b.world.options.battleData.id,shijue:b.shijue,shijueCount:b.shijueCount,shijueLast:b.shijueLast,shijueFirst:b.shijueFirst,shijueDue:b.shijueDue,
       chains:[...b.chains].map(([id,s])=>({id,skillId:s.skillId,attackSkillId:s.attackSkillId,level:s.level,period:s.period,duration:s.duration,interval:s.interval,mode:s.mode,recommendedCount:s.recommendedCount,active:s.active,count:s.count,target:s.target,due:s.due,status:s.status}))}));},
-    destroy(){destroyed=true;config={enabled:false,shijue:false,books:{}};if(timer!==null)clearInterval(timer);timer=null;for(const b of [...bindings.values()])unbind(b);removePanel();if(pveOverlay){pveOverlay.destroy();pveOverlay=null;}}
+    destroy(){destroyed=true;config={enabled:false,shijue:false,books:{}};syncSpeed([]);if(timer!==null)clearInterval(timer);timer=null;for(const b of [...bindings.values()])unbind(b);removePanel();if(pveOverlay){pveOverlay.destroy();pveOverlay=null;}}
   };
   return api;
 }

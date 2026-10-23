@@ -121,8 +121,10 @@ return {resident_id:id,capabilities:['energy']};
                 (scripts/name).read_text(encoding='utf-8-sig') + '\n})();' for name in names) + '\nreturn true;}'
         bundle = '{resident:function(id){\n'+resident+'\n},damageEnable:function(){return '+damage+'\n;},'+ \
                  'damageStop:function(){return '+stop+'\n;},perf:'+once(('runtime_perf_probe.js',))+',treasure:'+once(('treasure_map_dump.js','treasure_map_overlay.js'))+ \
-                 ',season:'+once(('season_bloodmoon.js',))+'}'
+                 ',season:'+once(('season_bloodmoon.js',))+',dismissStartup:function(){\n'+manager.joinpath('startup_cleanup.js').read_text(encoding='utf-8-sig')+'\nreturn dismissStartupPage(g);}}'
         template = manager.joinpath('douyin_bridge.js').read_text(encoding='utf-8')
+        legion_source=manager.joinpath('legion_runtime.js').read_text(encoding='utf-8-sig')
+        bundle=bundle[:-1]+',legionRead:async function(id){\n'+legion_source+'\nreturn readLegionPerspective(g,id);},legionScan:async function(op,value){\n'+legion_source+'\nif(op==="player")return scanLegionPlayer(g,value);if(op==="players")return scanLegionPlayers(g,value);if(op==="search")return searchScanLegion(g,value);throw Error("未知阴司扫描操作");}}'
         material = template.replace('__BRIDGE_STATIC_SCRIPTS__',bundle)
         self.build = sha((self.token+material).encode())
         return material.replace('__BRIDGE_TOKEN__',json.dumps(self.token)).replace('__BRIDGE_BUILD__',json.dumps(self.build))
@@ -479,7 +481,7 @@ class DouyinTransport(PluginTransport):
                 raise RuntimeError('当前抖音游戏会话尚未注入或已失效')
             generation=self._generation
             self._inflight={'id':self.session_id,'context':self.runtime}
-            timeout=150000 if op in ('tomb_raid','tomb_targets','arena_challenge') else (60000 if op.startswith('desire_compose_') else 30000)
+            timeout=150000 if op in ('tomb_raid','tomb_targets','arena_challenge','free_summon') else (60000 if op.startswith('desire_compose_') or op=='pet_fodder_merge' else 30000)
             job=asyncio.create_task(self._rpc('call',{'id':self.session_id,'op':op,'payload':payload or {}},timeout))
             cancelled=False
             try:
@@ -537,6 +539,12 @@ class DouyinTransport(PluginTransport):
     async def perf_snapshot(self): return await self._rpc('perf-status')
     async def perf_stop(self): return await self._rpc('perf-stop')
     async def battle_assist_timing(self): return await self._rpc('battle-assist-timing', timeout_ms=2000)
+    async def dismiss_startup(self): return await self._rpc('dismiss-startup', timeout_ms=2000)
+    async def legion_read(self, legion_id=None):
+        return await self._rpc('legion-read', {'id':legion_id}, timeout_ms=8000)
+    async def legion_scan_call(self, op, value=None):
+        if op not in ('player','players','search'):raise ValueError('未知阴司扫描操作')
+        return await self._rpc('legion-scan', {'op':op,'value':value}, timeout_ms=8000)
 
     async def damage_status(self): return await self._rpc('damage-status')
     async def damage_snapshot(self): return await self._rpc('damage-snapshot',timeout_ms=30000)

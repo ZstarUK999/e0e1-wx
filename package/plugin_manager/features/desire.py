@@ -215,6 +215,9 @@ class DesireFeature:
         limits = {int(k): int(v) for k, v in (config.get('fail_limits') or {}).items()}
         fuse = int(config.get('max_attempts') or 200)
         done = success = 0
+        total_streak = 0
+        threshold = int(config.get("success_after_failures", 20))
+        pause_failures = None
         soft_errors = 0
         halt_reason = ''
         try:
@@ -267,7 +270,7 @@ class DesireFeature:
                         streak = 0
                         continue
                     used = quality          # 升档发生在记日志之前，先把本次真正用的品质存下来
-                    self.panel.set_status(self._progress_text(type_id, quality, streak, limit, done, success))
+                    self.panel.set_status(self._progress_text(type_id, quality, streak, limit, done, success) + f" · 距上次成功连续失败 {total_streak} 次")
                     try:
                         # 不走 ResidentGame._call：它失败后会自动 home()，把整批打断。
                         result = _receipt(await self.transport.call(
@@ -300,20 +303,25 @@ class DesireFeature:
                     soft_errors = 0
                     done += 1
                     won = bool(result.get('success'))
+                    previous_failures = total_streak
+                    total_streak = 0 if won else total_streak + 1
+                    break_round = False
                     if won:
                         success += 1
                         streak = 0
-                        if escalated:
-                            break       # 升档之后成功一次，就回到最低档重新开始
+                        break_round = escalated
+                        if threshold > 0 and previous_failures >= threshold:
+                            pause_failures = previous_failures
+                            self._stop = True
+                            halt_reason = f'连败 {previous_failures} 次后成功，已停止；距上次成功连续失败 0 次，可考虑手工进行高阶三尸合成'
+                            LOG.info('三尸合成连败检测触发：批次=%s，连败=%s，阈值=%s',self._batch,previous_failures,threshold)
                     else:
                         streak += 1
                         if streak >= limit:
                             quality += 1
                             streak = 0
                             escalated = True
-                            # 顶到品质上限了还失败：跳出本轮，回到最低档再来
-                            if quality > ceiling:
-                                break
+                            break_round = quality > ceiling
                     self._append({'seq': self._seq, 'batch': self._batch,
                                   'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                   'type': type_id, 'quality': used,
@@ -322,11 +330,17 @@ class DesireFeature:
                                   'ratio': result.get('ratio') if result.get('ratio') is not None else '',
                                   'same_uuid': 1 if result.get('sameUuid') else 0})
                     self._seq += 1
+                    self.panel.set_status(self._progress_text(type_id, used, streak, limit, done, success) + f" · 距上次成功连续失败 {total_streak} 次")
+                    if pause_failures is not None:
+                        break
                     groups = list(result.get('groups') or []) or await self._regroup()
+                    if break_round:
+                        break
                 if done == before_round:
                     break               # 一整轮一次都没合成，说明没有可合的材料了
             # 异常终止的原因要留在面板上，不能被"本批结束"这句盖掉。
             self.panel.set_status(halt_reason or (f'本批结束：合成 {done} 次，成功 {success} 次'
+                                                  + f' · 距上次成功连续失败 {total_streak} 次'
                                                   + ('（已请求停止）' if self._stop else '')))
             if halt_reason:
                 # 出错时别把界面关回去：留着现场，用户可以直接点「诊断现场」或自己看一眼。
@@ -337,6 +351,8 @@ class DesireFeature:
                 except Exception as exc:
                     LOG.warning('三尸合成结束后返回主界面未成功：%s', exc)
             await self.refresh_stats()
+            if pause_failures is not None:
+                self.panel.show_success_pause(pause_failures)
         finally:
             self._running = False
             self.panel.set_running(False)

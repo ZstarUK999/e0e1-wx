@@ -21,6 +21,9 @@ from .features import DamageFeature, DesireFeature, SeasonFeature, TreasureFeatu
 from .gate import PHASE_DENIED, PHASE_INIT, PHASE_MOUNTING, PHASE_WAIT_GAME
 from .session import GameSession, wechat_ready
 from .state import RuntimeState
+from .reconnect import WechatReconnect
+from .legion import LegionFeature
+from .auction import AuctionFeature
 from .transport import PluginTransport, TARGET_APPID, CdpConnectionPending
 
 LOG = logging.getLogger('plugin_manager')
@@ -36,15 +39,29 @@ class PluginRuntime(QObject):
         self.transport = transport or PluginTransport()
         self.target_appid = getattr(self.transport, 'TARGET_APPID', TARGET_APPID)
         self.platform_name = getattr(self.transport, 'platform_name', '微信')
+        self.wechat_reconnect = (WechatReconnect(self.transport) if self.platform_name == '微信' and hasattr(self.transport, 'wechat_reconnect_status') else None)
+        self._reconnect_message = None
+        if self.platform_name != '微信':
+            for name in ('wechat_reconnect', 'reconnect_seconds'):
+                widget = getattr(window.pages['global'], name, None)
+                if widget is not None:
+                    widget.setEnabled(False)
         self.window.TARGET_APPID = self.target_appid
         self.record = {'id': 1, 'name': '遗弃之地插件管理器'}
         self.state = RuntimeState()
         self.session = GameSession(service, self.transport, self.state, record=self.record, process_ready=process_ready)
+        if self.platform_name == '微信':
+            self.transport.before_wechat_reopen = self.session.prepare_reopen
         self.automation = AutomationScheduler(self.transport, self.state, window)
         self.treasure = TreasureFeature(self.transport, self.state, window.pages['treasure'])
         self.damage = DamageFeature(self.transport, self.state, window.pages['damage'], window.store)
         self.desire = DesireFeature(self.transport, self.state, window.pages['desire'], window.store)
         self.season = SeasonFeature(self.transport, self.state, window.pages['bloodmoon'], window.store)
+        self.legion=LegionFeature(self.transport,self.state,window.pages['legion'])
+        from .player_pvp import PlayerPvpHistory
+        self.player_pvp=PlayerPvpHistory(window.store.path.with_name('legion_scan.sqlite3'),
+            'wechat' if self.platform_name=='微信' else 'douyin')
+        self.auction=AuctionFeature(self.transport,self.state,window.pages['auction']) if 'auction' in window.pages and not build_info().is_release else None
         self._closed = asyncio.Event()
         self._poll_lock = asyncio.Lock()
         self._poll_job = None
@@ -55,10 +72,23 @@ class PluginRuntime(QObject):
         self._next_battle_timing = 0.0
         self._next_energy = 0.0
         self._next_summary = time.monotonic() + 3600
+        from .runtime_memory import RuntimeMemoryMonitor
+        self.memory_monitor=RuntimeMemoryMonitor()
+        from .blank_recovery import BlankScreenRecovery
+        self.blank_recovery = BlankScreenRecovery(restart=self._restart_blank_game) if self.platform_name == '微信' else None
+        self._recovery_job = None
+        from .restart_resume import RestartResume
+        self.restart_resume = RestartResume()
+        if self.platform_name == '微信':
+            self.transport.on_wechat_reopened = self._mark_reopened
+            self.transport.before_wechat_restart = self._arm_restart_tasks
         self._last_check_error = None
         self._next_check_error_log = 0.0
         self._player_snapshot = None
+        self._player_target_id=None
+        self._player_request_job=None
         self._feature_ready_session = None
+        self._startup_ready_session = None
         self._authorized = None      # 账号门禁结论；None=还没判定
         self._auth = None            # 后台握手回执，只用于记录与提示
         self._bound_id = None        # 游戏里读到的主角ID，也就是绑定ID
@@ -80,19 +110,54 @@ class PluginRuntime(QObject):
             offset_signal.connect(self.window.set_offset_detecting)
         window.configuration_changed.connect(self._on_config)
         window.test_requested.connect(self._on_test)
-        window.automation_requested.connect(self.automation.set_automation)
+        window.automation_requested.connect(self._on_automation_requested)
         window.treasure_requested.connect(self.treasure.request)
         window.damage_requested.connect(self.damage.request)
-        window.desire_requested.connect(self.desire.request)
+        window.desire_requested.connect(self._on_desire_requested)
         window.bloodmoon_requested.connect(self.season.request)
         window.shutdown_requested.connect(self.request_shutdown)
+        window.player_requested.connect(self._request_scanned_player)
         window.attach_runtime(self.automation.capabilities)
         window.action_label.setText(f'{self.platform_name}运行服务已接入，等待游戏就绪')
         window.set_connection(connected=False, message=f'等待{self.platform_name}／游戏')
         for task_id, panel in window.task_panels.items():
             panel.runtime_message.setText('功能尚未就绪，等待连接游戏并完成挂载')
 
+    def _request_scanned_player(self,player_id):
+        panel=self.window.pages['player']
+        if not player_id:
+            self._player_target_id=None;self._player_snapshot=None
+            panel.message.setText('已切回当前游戏页面；启用玩家信息展示后自动读取')
+            return
+        if not self.state.installed or self.state.closing:
+            panel.message.setText('请先连接游戏并完成挂载');return
+        self._player_target_id=str(player_id)
+        if self._player_request_job and not self._player_request_job.done():return
+        self._player_request_job=asyncio.create_task(self._fetch_scanned_player())
+
+    async def _fetch_scanned_player(self):
+        session=self.state.installed
+        while not self.state.closing and session==self.state.installed:
+            player_id=self._player_target_id
+            if player_id is None:return
+            try:
+                result=await self.transport.call('player_information',{'target_id':player_id})
+                if self.state.closing or session!=self.state.installed:return
+                if player_id!=self._player_target_id:continue
+                if not isinstance(result,dict) or not result.get('text'):raise RuntimeError('未返回玩家资料')
+                history=getattr(self,'player_pvp',None)
+                if history is not None:result=history.decorate(result)
+                self.window.set_player_information(result['text'],result.get('subject',f'玩家 {player_id}'))
+                self.window.pages['player'].message.setText('已读取所选玩家公开资料')
+            except Exception as exc:
+                if self.state.closing or session!=self.state.installed:return
+                if player_id!=self._player_target_id:continue
+                self.window.pages['player'].message.setText(f'查询玩家 {player_id} 失败：{exc}')
+                LOG.exception('扫描玩家透视查询失败：玩家ID=%s',player_id)
+            return
+
     def start(self):
+        self._startup_checked = False
         self.timer.start()
         self._schedule_poll()
 
@@ -109,13 +174,104 @@ class PluginRuntime(QObject):
         return PHASE_WAIT_GAME
 
     def _schedule_poll(self):
-        if self.state.closing or (self._poll_job and not self._poll_job.done()):
+        if self.state.closing:
             return
+        self._observe_restart_tasks()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        if self.blank_recovery is not None:
+            active = self.automation.running or self.automation.busy or self.desire.busy
+            self.blank_recovery.observe(active)
+            if self._recovery_job is None or self._recovery_job.done():
+                self._recovery_job = loop.create_task(self._check_blank_game(active))
+            if self.blank_recovery.restarting:
+                return
+        if self._poll_job and not self._poll_job.done():
+            return
         self._poll_job = loop.create_task(self.poll())
+
+    async def _check_blank_game(self, active):
+        try:
+            await self.blank_recovery.poll(
+                active=active,
+                disconnected=bool(getattr(self.transport, 'unresponsive', False) or not self.transport.connected),
+                kicked=bool(self.wechat_reconnect and self.wechat_reconnect.event),
+                closing=self.state.closing)
+        except Exception as exc:
+            # 截图/窗口激活失败也有冷却，不按秒刷屏或抢焦点。
+            self.blank_recovery.next_check = time.monotonic() + 30
+            LOG.warning('白屏黑屏重开检查未完成：%s', exc)
+
+    async def _restart_blank_game(self):
+        from .wechat_launch import prepare_wechat_game, reopen_wechat_game
+        self._observe_restart_tasks()
+        self.restart_resume.arm()
+        await prepare_wechat_game()
+        self.state.stop_operation = True
+        self.state.blocked = '正在重启白屏／黑屏游戏'
+        self.state.blocked_session = self.state.installed
+        if self.automation.running:
+            self.automation.set_automation(False)
+        self.desire.request('stop')
+        self.window.action_label.setText('检测到断线白屏／黑屏，正在重新打开游戏')
+        await reopen_wechat_game(before_open=self.session.prepare_reopen)
+        self._mark_reopened()
+
+    def _observe_restart_tasks(self):
+        tasks = set()
+        if self.automation.running:
+            tasks.add('daily')
+        elif self.automation.busy and self.automation.active == 'pet_fodder' and not self.state.stop_operation:
+            tasks.add('pet_fodder')
+        if self.desire.busy and not self.desire._stop:
+            tasks.add('desire')
+        self.restart_resume.observe(tasks, self.state.installed,
+            healthy=self.transport.connected and not getattr(self.transport, 'unresponsive', False)
+            and not self.state.blocked and not (self.wechat_reconnect and self.wechat_reconnect.event))
+
+    def _mark_reopened(self):
+        self.restart_resume.launched = True
+
+    def _arm_restart_tasks(self):
+        self._observe_restart_tasks()
+        self.restart_resume.arm()
+
+    def _on_automation_requested(self, running):
+        if running:
+            self.restart_resume.cancel('daily')
+        else:
+            self.restart_resume.cancel('daily', 'pet_fodder')
+        self.automation.set_automation(running)
+
+    def _on_desire_requested(self, op, args):
+        if op in ('start', 'stop'):
+            self.restart_resume.cancel('desire')
+        self.desire.request(op, args)
+
+    def _resume_restarted_tasks(self):
+        if self.state.closing or self.state.blocked or self.automation.busy or self.desire.busy:
+            return False
+        task = self.restart_resume.next_task(self.state.installed)
+        if task is None:
+            return False
+        # 在启动前消费标记，下一轮轮询不能再次创建同一任务。
+        self.restart_resume.consumed(task)
+        if task == 'desire':
+            self.desire.request('start')
+        elif task == 'pet_fodder':
+            if self.automation.handle('pet_fodder') is None:
+                return False
+            self.automation.reset_handlers()
+            self.automation.begin('pet_fodder', manual=True)
+        else:
+            if not self.window.store.snapshot()['daily']['enabled']:
+                return False
+            self.automation.reset_handlers()
+            self.automation.set_automation(True)
+        LOG.info('游戏重启后从头启动任务：%s', {'daily':'日常自动化','desire':'三尸合成','pet_fodder':'狗粮自动合成'}[task])
+        return True
 
     def _on_state(self, state):
         if self.session.note_engine_state(state):
@@ -132,6 +288,7 @@ class PluginRuntime(QObject):
         LOG.info('插件配置更新：总开关=%s，启用任务=%s，玩家信息=%s',state['daily']['enabled'],[k for k,v in state['daily']['tasks'].items() if v['enabled']],state['player']['enabled'])
         self.state.configured = None
         if not state['daily']['enabled']:
+            self.restart_resume.cancel('daily')
             # 全部任务被反选时自动化没有意义，按钮同步回到“开始”。
             self.state.stop_operation = True
             self.automation.running = False
@@ -143,6 +300,8 @@ class PluginRuntime(QObject):
         if self.state.closing or self.automation.handle(task_id) is None or not self.state.installed or self.state.blocked or self.automation.busy:
             self.window.finish_test(task_id, '无法执行：任务尚未接入或当前会话不允许操作')
             return
+        if task_id == 'pet_fodder':
+            self.restart_resume.cancel('pet_fodder')
         self.automation.begin(task_id, manual=True)
 
     async def _sync_automation_overlay(self):
@@ -186,9 +345,15 @@ class PluginRuntime(QObject):
             if panel is not None and hasattr(panel,'set_timing_preview'):
                 panel.set_timing_preview(rows)
 
+    def _publish_zhongkui(self, status, stale=False):
+        panel=self.window.pages.get('zhongkui')
+        if panel is not None and hasattr(panel,'set_monster_status'):
+            panel.set_monster_status(status, stale=stale)
+
     async def _sync_battle_assist_timing(self, config):
         getter=getattr(self.transport,'battle_assist_timing',None)
         if not (config.get('battle_assist') or {}).get('enabled') or not getter:
+            self._publish_zhongkui(None)
             self._publish_battle_assist_timing([])
             return
         if time.monotonic()<self._next_battle_timing:return
@@ -196,11 +361,17 @@ class PluginRuntime(QObject):
         epoch=(self.session.engine_state.get('cdp_port') or self.session.engine_state.get('transport_key'), self.session.engine_state.get('miniapp_epoch'))
         try:
             rows=await getter()
+            status_getter=getattr(self.transport,'battle_assist_status',None)
+            status=await status_getter() if status_getter else None
         except Exception:
-            rows=[]
-        if self.state.closing or not self.state.installed or self.session.stale(epoch):
+            self._publish_zhongkui(None, stale=True)
             self._publish_battle_assist_timing([])
             return
+        if self.state.closing or not self.state.installed or self.session.stale(epoch):
+            self._publish_zhongkui(None)
+            self._publish_battle_assist_timing([])
+            return
+        self._publish_zhongkui(status if isinstance(status,dict) else None)
         self._publish_battle_assist_timing(rows if isinstance(rows,list) else [])
 
     async def poll(self):
@@ -208,11 +379,41 @@ class PluginRuntime(QObject):
             return
         async with self._poll_lock:
             try:
+                if not getattr(self, '_startup_checked', True):
+                    self._startup_checked = True
+                    from .startup_launch import ensure_game_started
+                    self.window.action_label.setText(f'正在检查{self.platform_name}游戏，未运行时自动打开')
+                    if self.platform_name != '微信':
+                        self.session.request_debug()
+                    await ensure_game_started(self.platform_name,
+                        before_open=self.session.prepare_reopen if self.platform_name == '微信' else None)
+                    if self.state.closing:
+                        return
+                self._observe_restart_tasks()
+                await self.memory_monitor.sample(self.transport,self.state.installed)
+                if self.wechat_reconnect and self.transport.connected and getattr(self.transport, 'context_id', None) is not None:
+                    message = await self.wechat_reconnect.poll(self.window.store.snapshot()['ui'])
+                    if message:
+                        self.state.stop_operation = True
+                        self.state.blocked = message
+                        self._reconnect_message = message
+                        self.state.blocked_session = self.state.installed
+                        if self.automation.running:
+                            self.automation.set_automation(False)
+                        self.desire.request('stop')
+                        self.window.action_label.setText(message)
+                        self.window.set_connection(connected=True, target_appid=self.target_appid, runtime_ready=False, message=message)
+                        return
+                    if self._reconnect_message and self.state.blocked == self._reconnect_message:
+                        self.state.blocked = ''
+                        self.state.blocked_session = None
+                    self._reconnect_message = None
                 await self._sync_automation_overlay()
                 if not await self.session.process_available():
                     self._publish_battle_assist_timing([])
+                    self._publish_zhongkui(None)
                     # 微信都没起来，frida 也无从挂起，这里就是在等玩家打开游戏。
-                    self.window.set_connection(connected=False, message=f'等待{self.platform_name}小游戏运行（不会主动打开）')
+                    self.window.set_connection(connected=False, message=f'等待{self.platform_name}小游戏运行')
                     self.window.set_gate(PHASE_WAIT_GAME, f'等待{self.platform_name}运行，请打开并进入《遗弃之地》')
                     return
                 if self.state.closing:
@@ -275,6 +476,17 @@ class PluginRuntime(QObject):
                     self._next_overlay_sync = 0.0
                     self._overlay_error = False
                     self._next_energy = 0.0
+                if self._startup_ready_session != self.state.installed:
+                    cleanup = getattr(self.transport, 'dismiss_startup', None)
+                    if cleanup is not None:
+                        startup = await cleanup()
+                        if self.state.closing or self.session.stale(epoch):
+                            return
+                        if not isinstance(startup, dict) or not startup.get('ready'):
+                            self.window.action_label.setText((startup or {}).get('message', '等待关闭开屏活动页面') if isinstance(startup, dict) else '等待开屏状态确认')
+                            self.window.set_gate(PHASE_MOUNTING, '等待开屏活动关闭并确认大厅稳定')
+                            return
+                    self._startup_ready_session = self.state.installed
                 if self.state.configured is None:
                     self.window.action_label.setText('插件已挂载，正在检查账号与功能配置')
                 if not await self._ensure_authorized():
@@ -287,6 +499,8 @@ class PluginRuntime(QObject):
                     await self.transport.call('configure', config)
                     LOG.info('插件配置同步成功：实例=%s', self.state.installed)
                     self.state.configured = config
+                if not self.state.closing and not self.session.stale(epoch) and hasattr(self.legion,'scanner'):
+                    self.legion.scanner.set_ready(self.state.installed)
                 if self.state.closing or self.automation.busy or self.session.stale(epoch):
                     return
                 config = self.window.store.snapshot()
@@ -304,17 +518,21 @@ class PluginRuntime(QObject):
                 await self.season.poll(config)
                 await self._sync_battle_assist_timing(config)
                 self.timer.setInterval(self.season.scan_interval_ms if config.get('bloodmoon', {}).get('enabled') else 1000)
-                if config['player']['enabled']:
+                if config['player']['enabled'] and self._player_target_id is None:
                     feature_stage('玩家信息')
                     snapshot = await self.transport.call('player_information')
                     if self.state.closing or self.session.stale(epoch):
                         return
-                    if isinstance(snapshot, dict) and snapshot != self._player_snapshot:
+                    if self._player_target_id is None and isinstance(snapshot, dict) and snapshot != self._player_snapshot:
                         self._player_snapshot = snapshot
-                        self.window.set_player_information(snapshot.get('text', ''), snapshot.get('subject', '玩家信息'))
+                        rendered=self.player_pvp.decorate(snapshot)
+                        self.window.set_player_information(rendered.get('text', ''), rendered.get('subject', '玩家信息'))
                         LOG.info('玩家信息页面更新：%s', snapshot.get('subject', '玩家信息'))
                 feature_stage('摸金地图')
                 await self.treasure.poll(config)
+                await self.legion.poll()
+                if self.auction is not None:
+                    await self.auction.poll()
                 feature_stage('PVP伤害采集')
                 await self.damage.poll(config)
                 feature_stage('三尸合成')
@@ -331,11 +549,14 @@ class PluginRuntime(QObject):
                 if time.monotonic() >= self._next_summary:
                     LOG.info('插件日常摘要：%s', self.window.task_panels['energy'].runtime_message.text())
                     self._next_summary = time.monotonic() + config['daily']['summary_interval_seconds']
-                if self.automation.running and not self.state.blocked:
+                if self._resume_restarted_tasks():
+                    return
+                if self.automation.running and not self.state.blocked and not self.desire.busy:
                     selected = self.automation.pick(datetime.now(BEIJING))
                     if selected:
                         self.automation.begin(selected)
             except CdpConnectionPending as exc:
+                self._publish_zhongkui(None, stale=True)
                 self._publish_battle_assist_timing([])
                 error_key=(type(exc).__name__,str(exc),self.state.installed)
                 now=time.monotonic()
@@ -346,6 +567,7 @@ class PluginRuntime(QObject):
                 self.window.action_label.setText('正在等待游戏调试连接恢复')
                 self.window.set_gate(self._link_phase(self.session.engine_state),str(exc))
             except Exception as exc:
+                self._publish_zhongkui(None, stale=True)
                 self._publish_battle_assist_timing([])
                 detail=str(exc) or ('游戏或调试链路未响应' if isinstance(exc,TimeoutError) else type(exc).__name__)
                 if isinstance(exc,TimeoutError) and self.automation.running:
@@ -524,6 +746,12 @@ class PluginRuntime(QObject):
         self.state.closing = True
         self.state.stop_operation = True
         self.timer.stop()
+        if self._recovery_job is not None and not self._recovery_job.done():
+            self._recovery_job.cancel()
+            try:await self._recovery_job
+            except asyncio.CancelledError:pass
+        if self.auction is not None:
+            await self.auction.close()
         if hasattr(self.transport, 'detach_for_shutdown'):
             await self._shutdown_douyin()
             return
@@ -533,6 +761,7 @@ class PluginRuntime(QObject):
                 self._handshake_job.cancel()
             await self.desire.wait_operation()
             await self.season.wait_operation()
+            await self.legion.wait_operation()
             await self.wait_operation()
             if self._poll_job and self._poll_job is not asyncio.current_task():
                 await asyncio.shield(self._poll_job)
@@ -544,8 +773,9 @@ class PluginRuntime(QObject):
                     pass
             await self.transport.close()
             # 插件操作全部收尾后才停止内部调试worker；不停止微信进程。
-            self.service.shutdown(wait=True)
         finally:
+            # 前面的游戏清理失败时也必须回收监听 9421 的 worker。
+            self.service.shutdown(wait=True)
             self.state.installed = self.state.configured = None
             self.window.reset_session()
             self._closed.set()
@@ -566,6 +796,7 @@ class PluginRuntime(QObject):
             async def finish():
                 await self.desire.wait_operation()
                 await self.season.wait_operation()
+                await self.legion.wait_operation()
                 await self.wait_operation()
                 if self._poll_job and self._poll_job is not asyncio.current_task():
                     await asyncio.shield(self._poll_job)

@@ -15,6 +15,9 @@ from package.daily_tasks.config import parse_config
 from package.daily_tasks.energy import EnergyTask
 from package.daily_tasks.scheduler import BEIJING, ExecutionUncertain, RetryableTaskError, TaskContext
 from package.daily_tasks.offline_reward import OfflineRewardTask
+from package.daily_tasks.free_summon import FreeSummonTask
+from package.daily_tasks.pet_hatch import PetHatchTask
+from package.daily_tasks.pet_fodder import PetFodderTask
 from package.daily_tasks.arena import ArenaTask
 from package.daily_tasks.tombs import TombCycleTask, TombFillTask, TombRaidTask
 from package.daily_tasks.tomb_history import TombRaidHistory
@@ -49,6 +52,9 @@ class AutomationScheduler:
             'energy': lambda: EnergyTask(game, None),
             'offline_reward': lambda: OfflineRewardTask(game),
             'arena': lambda: ArenaTask(game),
+            'free_summon': lambda: FreeSummonTask(game),
+            'pet_hatch': lambda: PetHatchTask(game),
+            'pet_fodder': lambda: PetFodderTask(game),
         }
         for kind in ('sanshi', 'artifact'):
             candidates[kind + '_tombs'] = lambda kind=kind: TombCycleTask(game, kind)

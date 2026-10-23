@@ -45,7 +45,7 @@ function createPveAssistOverlay(g,cc,modules) {
     return Number.isFinite(out.x+out.y)?{x:out.x,y:out.y}:null;
   }
   function scanMonsters() {
-    if(!activeZ() || !zcfg().show_monsters){tracked.clear();model=[];return;}
+    if(!activeZ()){tracked.clear();model=[];return;}
     const world=battle.world,scene=world.sceneEntity;
     const context=scene && modules.context && scene.getComponent(modules.context.CompBattleContext);
     if(!context){tracked.clear();model=[];return;}
@@ -127,6 +127,14 @@ function createPveAssistOverlay(g,cc,modules) {
   }
   function chainLines(){
     const rows=[];
+    if(config.shijue){
+      const setting=config.shijue_settings || {},count=battle.shijueCount || 0;
+      const time=helpers.now(battle.world),period=Number(setting.interval)||0;
+      const first=battle.shijueFirst;
+      const due=period>0 && first!=null?(battle.shijueDue??(first+Math.max(1,Math.ceil((time-first)/period))*period)):time;
+      const left=Math.max(0,due-time);
+      rows.push(`十绝阵 ${count}/${setting.count || '持续'} · ${period?'首放后'+period+'秒×轮次':'按冷却'}${battle.shijue?(first==null?' · 等待首次释放':left>0?' · 下轮还需'+left.toFixed(1)+'秒':' · 等待冷却／能量'):' · 关闭'}`);
+    }
     for(const [id,s] of battle.chains){
       const cfg=modules.cfg.SkillBookCfg.getById(id),name=cfg && cfg.name || id,progress=s.target?`${s.count}/${s.target}`:'';
       if(s.active){const left=Math.max(0,s.due-helpers.now(battle.world)),reason=helpers.blockedReason(battle,s);
@@ -170,7 +178,7 @@ function createPveAssistOverlay(g,cc,modules) {
     widget('pve.tab.chain',panel.node,(w-24)/2,32,{text:'控制链 '+(tab==='chain'?'▾':'▸'),active:tab==='chain',click(){tab=tab==='chain'?'none':'chain';page=0;render();}}).node.setPosition(-w/4+2,height/2-60,0);
     widget('pve.tab.zhongkui',panel.node,(w-24)/2,32,{text:'钟馗伏魔 '+(tab==='zhongkui'?'▾':'▸'),active:tab==='zhongkui',click(){tab=tab==='zhongkui'?'none':'zhongkui';page=0;render();}}).node.setPosition(w/4-2,height/2-60,0);
     if(contents.length)widget('pve.contents',panel.node,w-12,contents.length*25,{text:contents.join('\n'),font:16}).node.setPosition(0,height/2-89-contents.length*12.5,0);
-    if(tab==='chain' && config.shijue)widget('pve.shijue',panel.node,w-18,34,{text:'十绝阵：'+(battle.shijue?'开启 · 点击关闭':'关闭 · 点击开启'),active:battle.shijue,fill:battle.shijue?color(24,135,83):color(44,105,188),click(){battle.shijue=!battle.shijue;render();}}).node.setPosition(0,-height/2+23,0);
+    if(tab==='chain' && config.shijue)widget('pve.shijue',panel.node,w-18,34,{text:'十绝阵：'+(battle.shijue?'开启 · 点击关闭':'关闭 · 点击开启'),active:battle.shijue,fill:battle.shijue?color(24,135,83):color(44,105,188),click(){if(helpers.toggleShijue)helpers.toggleShijue(battle,!battle.shijue);else battle.shijue=!battle.shijue;render();}}).node.setPosition(0,-height/2+23,0);
     if(tab==='zhongkui' && activeZ())widget('pve.speed',panel.node,w-18,34,{text:zcfg().unlock_speed?`3倍速：${num(battle.world.battleTime.timeScale)===3?'已开启 · 点击恢复1倍':'点击开启'}`:'3倍速提前解锁已关闭',active:num(battle.world.battleTime.timeScale)===3,click(){
       if(!zcfg().unlock_speed || !helpers.running(battle))return;
       const scale=num(battle.world.battleTime.timeScale)===3?1:3;
@@ -218,7 +226,7 @@ function createPveAssistOverlay(g,cc,modules) {
       if(!valid(host)){destroyNodes();return;}
       patchSpeed();scanMonsters();render();
     },
-    snapshot(){return {expanded,tab,monsters:model.map(({entity,...m})=>m),speedUnlocked:activeZ() && !!zcfg().unlock_speed};},
+    snapshot(){return {active:!!activeZ(),waveUnavailable,updatedAt:Date.now(),expanded,tab,nodeCount:nodes.size,visibleNodeCount:[...nodes.values()].filter(x=>valid(x.node) && x.node.active!==false).length,monsters:model.map(({entity,...m})=>m),speedUnlocked:activeZ() && !!zcfg().unlock_speed};},
     clear(){restoreSpeed();destroyNodes();tracked.clear();model=[];battle=null;config=null;host=null;expanded=true;tab='home';page=0;previousHeight=0;waveUnavailable=false;},
     destroy(){this.clear();}
   };

@@ -356,6 +356,9 @@
       case 'damage-inject': return enableDamage();
       case 'damage-stop': return stopDamage();
       case 'battle-assist-timing': return g.__e0e1BattleAssist ? g.__e0e1BattleAssist.timingPreview() : [];
+      case 'dismiss-startup': return staticScripts.dismissStartup();
+      case 'legion-read': return staticScripts.legionRead(args.id);
+      case 'legion-scan': return staticScripts.legionScan(args.op,args.value);
       case 'damage-status': return typeof g.damageCurveStatus === 'function' ? g.damageCurveStatus() : null;
       case 'damage-snapshot': return typeof g.damageCurveJson === 'function' ? g.damageCurveJson() : null;
       case 'damage-debug': return typeof g.damageCurveDebug === 'function' ? g.damageCurveDebug() : null;

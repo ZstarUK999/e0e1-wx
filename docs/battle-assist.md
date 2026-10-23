@@ -40,3 +40,6 @@ GUI 根节点「PVE辅助 → 控制链」。总开关、逐本开关和次数�
 钟馗伏魔默认勾选提前启用3倍加速图标（模块本身默认关闭）。它只提前开放按钮，不自动切换速度，玩家可点原生图标或浮窗3倍按钮。原生UISubdueBattle.isSpeedUpVisible以类型11、HyakkiUnlockSpeedUp[0]及usedSpecialCardNum控制；已解码配置为[15,3]。本实现仅对当前钟馗世界返回可见和[0,3]，退出/禁用时恢复原方法，不改天书次数上限，也不改全局配置。
 
 源码通信核查：ui-subdue-battle.ts的onClickSpeedUp调用setSpeed；ui-battle-base.ts的setSpeed只更新battleTime.timeScale/baseTimeScale及按钮外观；system-player-action-logger.ts未记录倍速开关。hyakki-module.ts的endBattle发送battleId、battleType、stageId、win、dropItems、wave、static、verifyData、battleTime、killMonster、input、inputGzip，没有倍速开关字段。高级钟馗的onPhaseMaxWave仍调用updateProgress发送battleId、battleType、waveId、stageId；没有屏蔽或改写。结论仅为当前本地源码路径未直接上报「倍速开关/数值」，不能据此断言服务器无法通过时间、施法和校验数据验证战斗。此结论未通过抓包证明所有平台/后续版本的所有遥测。
+
+
+PVE辅助的“解锁3倍速按钮”仅开放原生倍率按钮，最高档点击后切换3倍速；不会自动切换或持续锁定倍率。可以手动切回1倍或其他倍率。暂停和临时减速保持原有行为。关闭功能恢复按钮与锁定显示，不修改玩家当前倍率。配置沿用auto_speed以兼容已有设置。
