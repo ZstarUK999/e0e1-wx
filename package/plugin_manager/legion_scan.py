@@ -162,7 +162,15 @@ class LegionScanPanel(QWidget):
         if not item:return
         data=item.data(0,Qt.ItemDataRole.UserRole)
         task=next((t for t in self.db.tasks() if t['id']==data[1]),None)
-        if task:self.db.pause(task['id'],not task['paused']);self.refresh()
+        if task:
+            if self.feature and not self.feature.enabled:
+                self.db.pause(task['id'],False)
+                self.feature.enable_session()
+                self.refresh()
+                return
+            self.db.pause(task['id'],not task['paused'])
+            if task['paused'] and self.feature:self.feature.enable_session()
+            self.refresh()
 
     def menu(self, point):
         item=self.tree.itemAt(point)
@@ -180,7 +188,7 @@ class LegionScanPanel(QWidget):
 
 
 class LegionScanner:
-    def __init__(self, transport, state, panel):
+    def __init__(self, transport, state, panel, auto_start=False):
         self.transport,self.state,self.panel=transport,state,panel
         self.db=panel.db;panel.feature=self
         panel.set_platform('douyin' if getattr(transport,'platform_name','微信')!='微信' else 'wechat')
@@ -193,16 +201,35 @@ class LegionScanner:
         self.halted=self.db.halt_reason()
         if self.halted:self.panel.status.setText(self.halted)
         self.ready_session=None
+        self.auto_start=auto_start
+        self.enabled=auto_start
+        self.control_enabled=True
+        self.enabled_session=state.installed
         self.timer=QTimer(panel);self.timer.setInterval(100)
         self.timer.timeout.connect(self.schedule)
         self.timer.start()
 
     def set_ready(self,session):
         self.ready_session=session
+        if session!=self.enabled_session:
+            self.enabled_session=session
+            self.enabled=self.auto_start
+
+    def set_auto_start(self,enabled):
+        if enabled==self.auto_start:return
+        self.auto_start=enabled
+        self.enabled=enabled
+        self.next_request=0
+        if not enabled:self.panel.status.setText('区段扫描自动启动已关闭；当前查询结束后停止，可手动继续')
+
+    def enable_session(self):
+        self.enabled=True
+        self.enabled_session=self.state.installed
+        self.next_request=0
 
     def schedule(self):
         # Public read queries continue even while daily automation owns the UI.
-        if self.halted or self.state.closing or not self.state.installed or self.ready_session!=self.state.installed:return
+        if not self.control_enabled or not self.enabled or self.halted or self.state.closing or not self.state.installed or self.ready_session!=self.state.installed:return
         if self.job and not self.job.done():return
         if self.seen_session==self.state.installed and not self.pending_create and time.monotonic()<self.next_request:return
         try:loop=asyncio.get_running_loop()
@@ -210,11 +237,17 @@ class LegionScanner:
         loop.create_task(self.poll())
 
     def valid(self, session):
-        return not self.state.closing and session==self.state.installed
+        return self.control_enabled and not self.state.closing and session==self.state.installed
+
+    def set_control_enabled(self, enabled):
+        self.control_enabled=enabled
+        if enabled:self.timer.start()
+        else:self.timer.stop()
 
     def create(self, text):
         if not text:self.panel.status.setText('请输入阴司名称或ID');return
         if not self.state.installed or self.state.closing:self.panel.status.setText('请先连接游戏并完成挂载');return
+        self.enable_session()
         if self.job and not self.job.done():
             self.pending_create=text
             self.panel.status.setText('当前查询结束后，将搜索阴司并创建区段')
@@ -237,6 +270,7 @@ class LegionScanner:
             self.panel.add.setEnabled(True);self.next_request=time.monotonic()+self.db.interval()
 
     async def poll(self):
+        if not self.control_enabled or not self.enabled:return
         if self.halted:
             self.panel.status.setText(self.halted);return
         if not self.state.installed or self.state.closing:return
@@ -253,7 +287,7 @@ class LegionScanner:
         self.job=asyncio.create_task(self.step())
 
     async def step(self):
-        if self.halted:return
+        if not self.control_enabled or self.halted:return
         self.batch_outcomes=None
         session=self.state.installed;task=None;operation='读取任务';target='';failed=False
         try:
@@ -310,6 +344,7 @@ class LegionScanner:
                 self.priority_requested=False
 
     def insert_member_update(self,lid):
+        self.enable_session()
         count=self.db.enqueue_members(lid)
         self.priority_requested=bool(count)
         if count and not self.halted and (not self.error_window or not self.error_window[-1]):
@@ -382,6 +417,7 @@ class LegionScanner:
             LOG.error('阴司扫描自动停止：平台=%s；%s',self.db.platform,self.halted)
 
     def resume_after_errors(self):
+        self.enable_session()
         self.db.halt('');self.halted='';self.failed_batches=0;self.error_window.clear();self.next_request=0
         self.panel.status.setText('异常停止已解除，将从保存的断点继续查询')
 

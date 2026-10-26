@@ -124,7 +124,7 @@ class DesireFeature:
         if not ready or self._running:
             self._stats_loaded = False
             return
-        if self._stats_loaded:
+        if not config.get('ui', {}).get('desire_poll', False) or self._stats_loaded:
             return
         self._stats_loaded = True
         await self.refresh_stats()

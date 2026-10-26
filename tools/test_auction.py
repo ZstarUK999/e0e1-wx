@@ -14,9 +14,10 @@ from package.plugin_manager.window import PluginWindow
 from tools import build_exe
 
 
-def test_auction_panel():
+def test_auction_panel(tmp_path):
     app=QApplication.instance() or QApplication([])
-    p=AuctionPanel();p.set_ready(True)
+    store=PluginConfigStore(tmp_path/"auction.json");store.set_ui_flag("auction_poll",True)
+    p=AuctionPanel(store);p.set_ready(True)
     rows=[dict(key='7:0',name='拍品甲',price=100,id=1000000,start=11000,preview=True,result=-1),dict(key='8:0',name='拍品乙',price=200,id=1000001,start=11000,preview=True,result=-1)]
     p.show_status(dict(visible=True,now=10000,rows=rows,jobs=[],running=False))
     for i in range(2):p.table.item(i,0).setCheckState(Qt.Checked)

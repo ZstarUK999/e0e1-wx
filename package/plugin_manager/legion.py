@@ -46,7 +46,7 @@ class NumericItem(QTableWidgetItem):
 class LegionPanel(QWidget):
     requested=Signal(str)
     def __init__(self,store):
-        super().__init__();self.history=LegionHistory(store.path.with_name('legion_history.json'));self.selected=None
+        super().__init__();self.store=store;self.history=LegionHistory(store.path.with_name('legion_history.json'));self.selected=None
         layout=QVBoxLayout(self);top=QHBoxLayout();layout.addLayout(top)
         top.addWidget(QLabel('阴司'))
         self.selector=QComboBox();self.selector.setEditable(True);self.selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert);self.selector.lineEdit().setPlaceholderText('输入阴司ID，或选择已浏览阴司');self.selector.setMinimumWidth(260);top.addWidget(self.selector,1)
@@ -58,6 +58,12 @@ class LegionPanel(QWidget):
         from .legion_scan import LegionScanPanel
         self.scan=LegionScanPanel(store.path.with_name('legion_scan.sqlite3'))
         self.tabs.addTab(self.scan,'区段扫描')
+        from .legion_boss import LegionBossPanel
+        self.boss=LegionBossPanel()
+        self.tabs.addTab(self.boss,'跨服战场')
+        from .legion_bloodmoon import LegionBloodmoonPanel
+        self.bloodmoon=LegionBloodmoonPanel(store.path.with_name('legion_bloodmoon.json'))
+        self.tabs.addTab(self.bloodmoon,'血月统计')
         self.query.clicked.connect(self._request);self.selector.lineEdit().returnPressed.connect(self._request);self.selector.activated.connect(self._choose)
         self._reload()
         if self.selector.count():self.show_data(self.history.rows[self.selector.itemData(0)])
@@ -108,8 +114,58 @@ class LegionFeature:
     def __init__(self,transport,state,panel):
         self.transport,self.state,self.panel=transport,state,panel;self.next_poll=0;self.signature=None;self.seen_session=None;self.observed_id=None;self.job=None
         panel.requested.connect(self.request)
+        panel.boss.requested.connect(self.request_boss)
+        panel.bloodmoon.requested.connect(self.request_bloodmoon)
         from .legion_scan import LegionScanner
         self.scanner=LegionScanner(transport,state,panel.scan)
+    def request_bloodmoon(self,op,args):
+        panel=self.panel.bloodmoon
+        if not self.state.installed or self.state.closing or not hasattr(self.transport,'season_insight'):
+            panel.message.setText('请先连接游戏并完成挂载');return
+        if self.job and not self.job.done():
+            panel.message.setText('阴司查询正在进行，请稍后重试');return
+        self.job=asyncio.create_task(self.fetch_bloodmoon(op,args))
+    async def fetch_bloodmoon(self,op,args):
+        panel=self.panel.bloodmoon;panel.busy(True);panel.message.setText('正在读取血月战场数据…');session=self.state.installed
+        try:
+            await self.scanner.wait_operation()
+            if self.state.closing or session!=self.state.installed:return
+            platform=getattr(self.transport,'platform_name',None) or getattr(self.transport,'channel',None) or 'wechat'
+            if op=='statistics':
+                history=await self.transport.season_insight('history',{})
+                if self.state.closing or session!=self.state.installed:return
+                account=platform+':'+history.get('account','unknown')
+                if args.get('cacheAccount') and args['cacheAccount']!=account:
+                    raise RuntimeError('当前角色或阴司已切换，请刷新血月战场列表')
+            data=await self.transport.season_insight(op,{k:v for k,v in args.items() if k!='cacheAccount'})
+            if self.state.closing or session!=self.state.installed:return
+            if not data:raise RuntimeError('未返回血月统计数据')
+            if op=='history':panel.accept_history(dict(data,account=platform+':'+data.get('account','unknown')))
+            else:panel.accept(dict(data,cacheAccount=account))
+        except Exception as exc:
+            panel.message.setText(f'读取失败：{exc}；已有结果为上次查询快照')
+            LOG.warning('血月统计读取失败：%s',exc)
+        finally:panel.busy(False)
+    def request_boss(self):
+        if not self.state.installed or self.state.closing or not hasattr(self.transport,'legion_boss_read'):
+            self.panel.boss.message.setText('请先连接游戏并完成挂载');return
+        if self.job and not self.job.done():
+            self.panel.boss.message.setText('阴司查询正在进行，请稍后刷新');return
+        self.job=asyncio.create_task(self.fetch_boss())
+    async def fetch_boss(self):
+        panel=self.panel.boss;panel.refresh.setEnabled(False);panel.message.setText('正在拉取跨服 Boss 排名及本阴司完整成员…');session=self.state.installed
+        try:
+            await self.scanner.wait_operation()
+            if self.state.closing or session!=self.state.installed:return
+            data=await self.transport.legion_boss_read()
+            if self.state.closing or session!=self.state.installed:return
+            if not data:raise RuntimeError('未返回跨服 Boss 数据')
+            panel.accept(data)
+            LOG.info('跨服 Boss 参与情况查询完成：阴司=%s，成员=%s，排名=%s',data['legionId'],len(data['members']),len(data['ranks']))
+        except Exception as exc:
+            panel.message.setText(f'查询失败：{exc}；已有结果为上次查询快照')
+            LOG.warning('跨服战场 Boss 参与情况查询失败：%s',exc)
+        finally:panel.refresh.setEnabled(True)
     def request(self,key):
         if not self.state.installed or self.state.closing or not hasattr(self.transport,'legion_read'):
             self.panel.message.setText('请先连接游戏并完成挂载，历史快照仍可查看');return
@@ -130,6 +186,9 @@ class LegionFeature:
         await self.scanner.wait_operation()
     async def poll(self):
         if not self.state.installed or self.state.closing or not hasattr(self.transport,'legion_read'):return
+        if not self.panel.store.snapshot()['ui'].get('legion_poll', False):
+            await self.scanner.poll()
+            return
         if self.job and not self.job.done():return
         if self.scanner.job and not self.scanner.job.done():return
         if time.monotonic()<self.next_poll:

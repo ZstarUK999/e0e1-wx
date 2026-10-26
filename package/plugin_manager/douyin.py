@@ -88,27 +88,16 @@ class DouyinCache:
         manager = Path(__file__).resolve().parent
         package = manager.parent
         scripts = package.parent / 'tools/js'
-        core = '\n'.join((package/'daily_tasks'/name).read_text(encoding='utf-8-sig')
-                         for name in ('daily_runtime.js','sweep_runtime.js'))
-        core += '\n' + (manager/'desire_runtime.js').read_text(encoding='utf-8-sig')
-        core += '\n' + (manager/'automation_overlay.js').read_text(encoding='utf-8-sig')
-        core += '\n' + (manager/'pve_assist_overlay.js').read_text(encoding='utf-8-sig')
-        core += '\n' + (manager/'battle_assist_runtime.js').read_text(encoding='utf-8-sig')
-        resident = core + r'''
-if (g.__e0e1PluginRuntime) return {resident_id:g.__e0e1PluginRuntime.id,capabilities:['energy']};
-const api=createEnergyRuntime(g);
-g.__e0e1AutomationOverlay=createAutomationOverlay(g);
-g.__e0e1BattleAssist=createBattleAssistRuntime(g);
-const resident={id,config:null,stopped:false,pending:false,async dispatch(op,args){
-  if(op==='configure'){g.__e0e1GameOverlaysEnabled=!args.ui || args.ui.game_overlays!==false;await g.__e0e1BattleAssist.configure(args.battle_assist);this.config=args;return {status:'ok',value:true};}
-  if(op==='stop'){g.__e0e1BattleAssist.destroy();g.__e0e1AutomationOverlay.destroy();this.stopped=true;return {status:'ok',value:true};}
-  if(this.stopped&&!['inspect','capture','restore','home'].includes(op))return {status:'unavailable',message:'插件已停止'};
-  if(this.pending)return {status:'uncertain',message:'上一条命令尚未结束'};
-  this.pending=true;
-  try{return await api.dispatch(op,args);}finally{this.pending=false;}
-}};
-g.__e0e1PluginRuntime=resident;
-return {resident_id:id,capabilities:['energy']};
+        from .lazy_runtime import SOURCES, factory_source
+        core=manager.joinpath('plugin_runtime.js').read_text(encoding='utf-8')
+        factories='{'+','.join(name+':'+factory_source(name) for name in SOURCES)+'}'
+        resident=core+'\nconst available='+factories+r'''
+if(g.__e0e1PluginRuntime)return {resident_id:g.__e0e1PluginRuntime.id,capabilities:['lazy-v1']};
+g.__e0e1PluginRuntime=createPluginRuntime(g,id,async(name,resident)=>{
+  if(!available[name])throw Error('unknown lazy feature: '+name);
+  return available[name](g,resident);
+});
+return {resident_id:id,capabilities:['lazy-v1']};
 '''
         damage_path = scripts/'damage_curve_probe.js'
         script = {'id':hashlib.sha1(str(damage_path.resolve()).casefold().encode()).hexdigest(),
@@ -120,11 +109,17 @@ return {resident_id:id,capabilities:['energy']};
             return 'async function(){' + '\n'.join('await (async function(){\n' +
                 (scripts/name).read_text(encoding='utf-8-sig') + '\n})();' for name in names) + '\nreturn true;}'
         bundle = '{resident:function(id){\n'+resident+'\n},damageEnable:function(){return '+damage+'\n;},'+ \
-                 'damageStop:function(){return '+stop+'\n;},perf:'+once(('runtime_perf_probe.js',))+',treasure:'+once(('treasure_map_dump.js','treasure_map_overlay.js'))+ \
+                 'damageStop:function(){return '+stop+'\n;},perf:'+once(('runtime_perf_probe.js',))+',treasure:'+once(('treasure_map_dump.js',))+',treasureOverlay:'+once(('treasure_map_overlay.js',))+ \
                  ',season:'+once(('season_bloodmoon.js',))+',dismissStartup:function(){\n'+manager.joinpath('startup_cleanup.js').read_text(encoding='utf-8-sig')+'\nreturn dismissStartupPage(g);}}'
         template = manager.joinpath('douyin_bridge.js').read_text(encoding='utf-8')
         legion_source=manager.joinpath('legion_runtime.js').read_text(encoding='utf-8-sig')
         bundle=bundle[:-1]+',legionRead:async function(id){\n'+legion_source+'\nreturn readLegionPerspective(g,id);},legionScan:async function(op,value){\n'+legion_source+'\nif(op==="player")return scanLegionPlayer(g,value);if(op==="players")return scanLegionPlayers(g,value);if(op==="search")return searchScanLegion(g,value);throw Error("未知阴司扫描操作");}}'
+        insight_source=manager.joinpath('season_insight_runtime.js').read_text(encoding='utf-8-sig')
+        bundle=bundle[:-1]+',seasonInsight:async function(op,args){\n'+insight_source+'\nreturn await seasonInsight(g,op,args);}}'
+        boss_source=manager.joinpath('legion_boss_runtime.js').read_text(encoding='utf-8-sig')
+        bundle=bundle[:-1]+',legionBossRead:async function(){\n'+boss_source+'\nreturn await readLegionCrossBoss(g);}}'
+        flag_source=manager.joinpath('flag_upgrade_runtime.js').read_text(encoding='utf-8-sig')
+        bundle=bundle[:-1]+',flagUpgradeRead:async function(){\n'+flag_source+'\nreturn await readFlagUpgrade(g);}}'
         material = template.replace('__BRIDGE_STATIC_SCRIPTS__',bundle)
         self.build = sha((self.token+material).encode())
         return material.replace('__BRIDGE_TOKEN__',json.dumps(self.token)).replace('__BRIDGE_BUILD__',json.dumps(self.build))
@@ -400,6 +395,10 @@ class DouyinTransport(PluginTransport):
                 raise asyncio.TimeoutError('抖音命令终态未确认，不会重发；请保持游戏运行')
             await asyncio.sleep(.05)
 
+    async def optional_controls(self, config):
+        # Static channel uses its existing configure command; never dynamic JS.
+        await self.call('configure', config)
+
     async def automation_overlay(self, payload):
         # 与 heartbeat 共用状态文件，不进入可能正在等待业务回执的 _file_lock。
         status = self.cache.status()
@@ -540,14 +539,21 @@ class DouyinTransport(PluginTransport):
     async def perf_stop(self): return await self._rpc('perf-stop')
     async def battle_assist_timing(self): return await self._rpc('battle-assist-timing', timeout_ms=2000)
     async def dismiss_startup(self): return await self._rpc('dismiss-startup', timeout_ms=2000)
+    async def season_insight(self, op, args=None):
+        if op not in ('history','ranks','reports','replay','replay_status','statistics','legion_roster','guard_count'):raise ValueError('未知血月数据操作')
+        return await self._rpc('season-insight',{'op':op,'args':args or {}},timeout_ms=15000)
     async def legion_read(self, legion_id=None):
         return await self._rpc('legion-read', {'id':legion_id}, timeout_ms=8000)
+    async def legion_boss_read(self):
+        return await self._rpc('legion-boss-read', {}, timeout_ms=30000)
+    async def flag_upgrade_read(self):
+        return await self._rpc('flag-upgrade-read', {}, timeout_ms=15000)
     async def legion_scan_call(self, op, value=None):
         if op not in ('player','players','search'):raise ValueError('未知阴司扫描操作')
         return await self._rpc('legion-scan', {'op':op,'value':value}, timeout_ms=8000)
 
     async def damage_status(self): return await self._rpc('damage-status')
-    async def damage_snapshot(self): return await self._rpc('damage-snapshot',timeout_ms=30000)
+    async def damage_snapshot(self,cursor=None): return await self._rpc('damage-snapshot',{'cursor':cursor},timeout_ms=30000)
     async def damage_debug(self): return await self._rpc('damage-debug')
     async def damage_reset(self): return await self._rpc('damage-reset')
     async def treasure_inject(self): return await self._rpc('treasure-inject',timeout_ms=20000)

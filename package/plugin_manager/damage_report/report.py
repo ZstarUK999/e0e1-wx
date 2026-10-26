@@ -9,6 +9,7 @@ from pathlib import Path
 from .serialize import render_csv, slim
 from .buff_catalog import BUFF_CATALOG
 from .template import HTML_TEMPLATE
+from .analysis import analyze_recording
 
 # ── HTML ──
 
@@ -64,6 +65,7 @@ def report_match_name(data: dict) -> str:
 def write_outputs(data: dict, out_dir: Path, stamp: str, *, save_json: bool = True,
                   write_csv: bool = False, keep_events: bool = True, basename: str | None = None) -> list[Path]:
     """把一份数据写成 JSON / CSV / HTML，返回写出的文件列表。"""
+    data=analyze_recording(data)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     stem = basename or f"{report_match_name(data)}_{stamp}"
@@ -75,7 +77,7 @@ def write_outputs(data: dict, out_dir: Path, stamp: str, *, save_json: bool = Tr
         stem = candidate
     if save_json:
         path = out_dir / f"{stem}.json"
-        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        path.write_text(json.dumps(data.get('rawRecording') or data, ensure_ascii=False), encoding="utf-8")
         written.append(path)
     if write_csv:
         path = out_dir / f"{stem}.csv"
@@ -89,6 +91,7 @@ def write_outputs(data: dict, out_dir: Path, stamp: str, *, save_json: bool = Tr
 
 def describe(data: dict) -> list[str]:
     """给人看的几行摘要，GUI 和 CLI 都用它。"""
+    data=analyze_recording(data)
     lines = []
     mode = data.get("mode") or "single"
     pvp = data.get("pvp")

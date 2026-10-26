@@ -64,6 +64,8 @@ class PluginTransport:
         self._generation = 0
         self._damage_persistent = ""
         self._lock = asyncio.Lock()
+        self._lazy_lock = asyncio.Lock()
+        self._lazy_registered = set()
         self.cdp.on('Runtime.executionContextCreated', self._created)
         self.cdp.on('Runtime.executionContextDestroyed', self._destroyed)
         self.cdp.on('Runtime.executionContextsCleared', self._cleared)
@@ -170,6 +172,7 @@ class PluginTransport:
             self.invalidate()
 
     def invalidate(self):
+        self._lazy_registered.clear()
         self._error_capture_context=None
         self._heap_api_unavailable_context=None
         self._generation += 1
@@ -277,31 +280,13 @@ class PluginTransport:
                 raise RuntimeError('前次JS终态未确认，不注入新实例')
             generation = self._generation
             sid = self.session_id or uuid.uuid4().hex
-            scripts = Path(__file__).resolve().parents[1] / 'daily_tasks'
-            desire_script = Path(__file__).resolve().parent / 'desire_runtime.js'
-            source = (scripts.joinpath('daily_runtime.js').read_text(encoding='utf-8') + '\n'
-                      + scripts.joinpath('sweep_runtime.js').read_text(encoding='utf-8') + '\n'
-                      + desire_script.read_text(encoding='utf-8') + '\n'
-                      + Path(__file__).with_name('automation_overlay.js').read_text(encoding='utf-8') + '\n'
-                      + Path(__file__).with_name('pve_assist_overlay.js').read_text(encoding='utf-8')+'\n'
-                      + Path(__file__).with_name('battle_assist_runtime.js').read_text(encoding='utf-8'))
+            source=Path(__file__).with_name('plugin_runtime.js').read_text(encoding='utf-8')
             expression = f'''(() => {{
 {source}
 const id = {json.dumps(sid)};
-if (globalThis.__e0e1PluginRuntime) return {{resident_id: globalThis.__e0e1PluginRuntime.id, capabilities:['energy']}};
-const api = createEnergyRuntime(globalThis);
-globalThis.__e0e1AutomationOverlay = createAutomationOverlay(globalThis);
-globalThis.__e0e1BattleAssist = createBattleAssistRuntime(globalThis);
-const resident = {{id, config: null, stopped:false, pending:false, async dispatch(op, args) {{
-  if (op === 'configure') {{ globalThis.__e0e1GameOverlaysEnabled = !args.ui || args.ui.game_overlays !== false; await globalThis.__e0e1BattleAssist.configure(args.battle_assist); this.config = args; return {{status:'ok', value:true}}; }}
-  if (op === 'stop') {{ globalThis.__e0e1BattleAssist.destroy(); globalThis.__e0e1AutomationOverlay.destroy(); this.stopped = true; return {{status:'ok', value:true}}; }}
-  if (this.stopped && !['inspect','capture','restore','home'].includes(op)) return {{status:'unavailable',message:'插件已停止'}};
-  if (this.pending) return {{status:'uncertain',message:'上一条命令尚未结束'}};
-  this.pending = true;
-  try {{ return await api.dispatch(op, args); }} finally {{ this.pending=false; }}
-}}}};
-globalThis.__e0e1PluginRuntime = resident;
-return {{resident_id:id, capabilities:['energy']}};
+if (globalThis.__e0e1PluginRuntime) return {{resident_id:globalThis.__e0e1PluginRuntime.id,capabilities:['lazy-v1']}};
+globalThis.__e0e1PluginRuntime=createPluginRuntime(globalThis,id);
+return {{resident_id:id,capabilities:['lazy-v1']}};
 }})()'''
             receipt = await self._evaluate(expression, self.context_id, timeout_ms=5000)
             if generation != self._generation:
@@ -311,6 +296,25 @@ return {{resident_id:id, capabilities:['energy']}};
             self.session_id = sid
             self._owned_ids.add(sid)
             return sid
+
+    async def _prepare_features(self,names):
+        from .lazy_runtime import factory_source
+        async with self._lazy_lock:
+            for name in names:
+                key=(self._generation,self.context_id,self.session_id,name)
+                if key in self._lazy_registered:continue
+                if not self.connected or self.context_id is None or not self.session_id:
+                    raise RuntimeError('游戏会话未就绪，无法加载功能脚本')
+                sid=self.session_id;context=self.context_id;generation=self._generation
+                source=factory_source(name)
+                expression=('(()=>{const r=globalThis.__e0e1PluginRuntime;if(!r||r.id!=='
+                    +json.dumps(sid)+')return false;r.register('+json.dumps(name)+','+source+');return true;})()')
+                receipt=await self._evaluate(expression,context,timeout_ms=5000)
+                if generation!=self._generation or context!=self.context_id or sid!=self.session_id:
+                    raise RuntimeError('加载功能时游戏会话发生变化')
+                if receipt is not True:raise RuntimeError('功能脚本注册未确认：'+name)
+                self._lazy_registered.add(key)
+                LOG.info('已按需注入功能脚本：%s',name)
 
     QUALITY_NAMES = {1: '白', 2: '蓝', 3: '紫', 4: '橙', 5: '红', 6: '黑金', 7: '幻彩', 8: '轮回'}
     TYPE_NAMES = {1: '贪·心', 2: '嗔·心', 3: '痴·心', 4: '贪·凡', 5: '嗔·凡', 6: '痴·凡'}
@@ -353,6 +357,8 @@ return {{resident_id:id, capabilities:['energy']}};
                 raise RuntimeError('实际目标已变化，不执行插件命令')
             if generation != self._generation or self.context_id is None or self.session_id is None:
                 raise RuntimeError('目标检查期间游戏上下文已失效，未发送操作')
+            from .lazy_runtime import operation_features
+            await self._prepare_features(operation_features(op,payload))
             expression = ('globalThis.__e0e1PluginRuntime && (globalThis.__e0e1PluginRuntime.id === '
                           + json.dumps(self.session_id) + ' ? globalThis.__e0e1PluginRuntime.dispatch('
                           + json.dumps(op) + ', ' + json.dumps(payload or {}, ensure_ascii=False, allow_nan=False)
@@ -446,7 +452,7 @@ return {{resident_id:id, capabilities:['energy']}};
 
     async def treasure_inject(self):
         folder = Path(__file__).resolve().parents[2] / "tools" / "js"
-        for name in self.TREASURE_SCRIPTS:
+        for name in self.TREASURE_SCRIPTS[:1]:
             source = folder.joinpath(name).read_text(encoding="utf-8")
             await self._evaluate(f"(async () => {{\n{source}\n}})()", self.context_id, timeout_ms=20000)
         return True
@@ -457,6 +463,10 @@ return {{resident_id:id, capabilities:['energy']}};
             'return typeof fn === "function" ? fn() : null;})()', self.context_id, timeout_ms=20000)
 
     async def treasure_overlay(self, on: bool):
+        if on:
+            source=(Path(__file__).resolve().parents[2]/'tools/js/treasure_map_overlay.js').read_text(encoding='utf-8')
+            return await self._evaluate('(async()=>{if(typeof globalThis.treasureMapOverlayOn!=="function"){'+source+
+                '\n}return String(globalThis.treasureMapOverlayOn());})()',self.context_id,timeout_ms=20000)
         name = "treasureMapOverlayOn" if on else "treasureMapOverlayOff"
         return await self._evaluate(
             f'(() => {{const g = globalThis; return typeof g.{name} === "function" ? String(g.{name}()) : "摸金脚本尚未注入";}})()',
@@ -492,11 +502,10 @@ return {{resident_id:id, capabilities:['energy']}};
     async def damage_stop(self):
         """取消长期脚本并清理后续页面的自动注册。"""
         bridge = _CdpBridge(self.cdp)
-        try:
-            result = await disable_runtime_js_file(bridge, self._damage_script(),
-                                                   persistent_identifier=self._damage_persistent)
-        except Exception:
-            result = {"ok": True, "message": "已取消", "enabled": False}
+        result = await disable_runtime_js_file(bridge, self._damage_script(),
+                                               persistent_identifier=self._damage_persistent)
+        if not result.get('ok', False) or result.get('enabled'):
+            raise RuntimeError(result.get('message') or '伤害采集停止未确认')
         self._damage_persistent = ""
         return result
 
@@ -519,6 +528,15 @@ return {{resident_id:id, capabilities:['energy']}};
         source=Path(__file__).with_name('legion_runtime.js').read_text(encoding='utf-8-sig')
         expression='(async()=>{'+source+'\ntry{return await readLegionPerspective(globalThis,'+json.dumps(legion_id)+');}catch(e){return {error:String(e.message||e)};}})()'
         result=await self._evaluate(expression,self.context_id,timeout_ms=8000 if legion_id is not None else 1000)
+        if isinstance(result,dict) and result.get('error'):raise RuntimeError(result['error'])
+        return result
+
+    async def legion_boss_read(self):
+        if not self.connected or self.context_id is None:
+            raise RuntimeError('游戏未连接')
+        source=Path(__file__).with_name('legion_boss_runtime.js').read_text(encoding='utf-8')
+        expression='(async()=>{'+source+'\ntry{return await readLegionCrossBoss(globalThis);}catch(e){return {error:String(e.message||e)};}})()'
+        result=await self._evaluate(expression,self.context_id,timeout_ms=30000)
         if isinstance(result,dict) and result.get('error'):raise RuntimeError(result['error'])
         return result
 
@@ -570,10 +588,10 @@ return {{resident_id:id, capabilities:['energy']}};
             '(() => {const g = globalThis; return typeof g.damageCurveStatus === "function" '
             '? g.damageCurveStatus() : "采集脚本尚未注入";})()', self.context_id, timeout_ms=10000)
 
-    async def damage_snapshot(self):
+    async def damage_snapshot(self, cursor=None):
         return await self._evaluate(
             '(() => {const g = globalThis; return typeof g.damageCurveJson === "function" '
-            '? g.damageCurveJson() : null;})()', self.context_id, timeout_ms=30000)
+            '? g.damageCurveJson('+json.dumps(cursor,ensure_ascii=True)+') : null;})()', self.context_id, timeout_ms=30000)
 
     async def damage_debug(self):
         return await self._evaluate(
@@ -604,13 +622,20 @@ return {{resident_id:id, capabilities:['energy']}};
             '? String(g.damageCurveReset()) : "采集脚本尚未注入";})()', self.context_id, timeout_ms=10000)
 
     async def automation_overlay(self, payload):
-        # 独立的纯状态通道；不能排在等待战斗回执的业务锁后面。
-        if not self.connected or not self.session_id or self.context_id is None:
-            return None
-        expression = ("(async()=>{const r=globalThis.__e0e1PluginRuntime,o=globalThis.__e0e1AutomationOverlay;"
-                      "if(!r||r.id!==" + json.dumps(self.session_id) + "||!o)return null;"
-                      "const before=o.snapshot();await o.update(" + json.dumps(payload, ensure_ascii=False) + ");return before;})()")
-        return await self._evaluate(expression, self.context_id, timeout_ms=1000)
+        # Only an active overlay needs its factory. Off messages never load it.
+        if not self.connected or not self.session_id or self.context_id is None:return None
+        if payload.get('active'):await self._prepare_features(['automation_overlay'])
+        expression=("(async()=>{const r=globalThis.__e0e1PluginRuntime;if(!r||r.id!=="+json.dumps(self.session_id)+")return null;"
+            "let o=globalThis.__e0e1AutomationOverlay;if(!o&&"+json.dumps(bool(payload.get('active')))+")o=await r.ensure('automation_overlay');"
+            "if(!o)return null;const before=o.snapshot();await o.update("+json.dumps(payload,ensure_ascii=False)+");return before;})()")
+        return await self._evaluate(expression,self.context_id,timeout_ms=3000)
+
+    async def optional_controls(self, config):
+        if not self.connected or self.context_id is None:return
+        if config['battle_assist'].get('enabled'):await self._prepare_features(['battle_assist'])
+        expression=('(async()=>{const r=globalThis.__e0e1PluginRuntime;if(!r||r.id!=='
+            +json.dumps(self.session_id)+')return false;await r.configure('+json.dumps(config)+');return true;})()')
+        await self._evaluate(expression,self.context_id,timeout_ms=5000)
 
     async def wechat_reconnect_status(self, enabled):
         if not self.connected or self.context_id is None:
@@ -620,8 +645,22 @@ return {{resident_id:id, capabilities:['energy']}};
         return await self._evaluate(expression, self.context_id, timeout_ms=2000)
 
     async def dismiss_startup(self):
-        source = Path(__file__).with_name('startup_cleanup.js').read_text(encoding='utf-8')
-        return await self._evaluate('(()=>{' + source + '\nreturn dismissStartupPage(globalThis);})()', self.context_id, timeout_ms=2000)
+        await self._prepare_features(['startup'])
+        return await self._evaluate("(async()=>{const r=globalThis.__e0e1PluginRuntime;return (await r.ensure('startup'))();})()",self.context_id,timeout_ms=2000)
+
+    async def season_insight(self, op, args=None):
+        if op not in ('history','ranks','reports','replay','replay_status','statistics','legion_roster','guard_count'):
+            raise ValueError('未知血月数据操作')
+        source=Path(__file__).with_name('season_insight_runtime.js').read_text(encoding='utf-8')
+        expression='(async()=>{'+source+'\nreturn await seasonInsight(globalThis,'+json.dumps(op)+','+json.dumps(args or {},ensure_ascii=False,allow_nan=False)+');})()'
+        return await self._evaluate(expression,self.context_id,timeout_ms=15000)
+
+    async def flag_upgrade_read(self):
+        if not self.connected or self.context_id is None:
+            raise RuntimeError('游戏尚未连接')
+        source = Path(__file__).with_name('flag_upgrade_runtime.js').read_text(encoding='utf-8')
+        return await self._evaluate('(async()=>{' + source +
+            '\nreturn await readFlagUpgrade(globalThis);})()', self.context_id, timeout_ms=15000)
 
     async def wechat_restart_after_kick(self, event):
         if not self.connected or self.context_id is None:

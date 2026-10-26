@@ -16,7 +16,7 @@ LOG = logging.getLogger('plugin_manager')
 
 # 调试会话一直连不上时的重发间隔与次数。
 DEBUG_RETRY_SECONDS = 20.0
-DEBUG_MAX_RETRIES = 4
+DEBUG_MAX_RETRIES = 10
 
 # 微信进程探测的缓存间隔。
 PROCESS_CHECK_SECONDS = 5.0
@@ -25,7 +25,7 @@ PROCESS_CHECK_SECONDS = 5.0
 def wechat_ready() -> bool:
     for process in psutil.process_iter(['name']):
         try:
-            if str(process.info['name']).casefold() == 'wechatappex.exe' and 'wxwork' not in process.exe().casefold():
+            if str(process.info['name']).casefold() == 'wechatappex.exe' and 'radiumwmpf' in process.exe().casefold() and 'wxwork' not in process.exe().casefold():
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass

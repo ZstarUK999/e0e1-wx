@@ -303,6 +303,7 @@ class DevtoolsService(QObject):
         self.ensure_worker_started()
         command = {
             "type": "enable_runtime_js_script",
+            "channel": state.get('channel', 'wechat'),
             "record_id": record_id,
             "owner_key": str(state.get("owner_key") or "").strip(),
             "display_name": str(state.get("display_name") or "").strip(),
@@ -327,6 +328,7 @@ class DevtoolsService(QObject):
         self.ensure_worker_started()
         command = {
             "type": "disable_runtime_js_script",
+            "channel": state.get('channel', 'wechat'),
             "record_id": record_id,
             "owner_key": str(state.get("owner_key") or "").strip(),
             "display_name": str(state.get("display_name") or "").strip(),
@@ -625,6 +627,7 @@ class DevtoolsService(QObject):
             "record_id": int(record.get("id") or 0),
             "owner_key": record_owner_key(record),
             "display_name": record_display_name(record),
+            "channel": record.get('_channel', 'wechat'),
             "debug_port": normalize_devtools_port(
                 record.get("_miniapp_debug_port") if isinstance(record, dict) else None,
                 DEFAULT_MINIAPP_DEBUG_PORT,

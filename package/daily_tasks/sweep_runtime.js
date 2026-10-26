@@ -49,7 +49,7 @@ function createEnergyRuntime(g, timing) {
       const root = view.ui && view.ui.view && view.ui.view.node_guideRoot;
       return !!root && root.active === false;
     }
-    return ['Debug','MoveDebug','TipsUI','PowerUp','FightPowerUp'].some(key=>cfg[key] && view.cfg === cfg[key]);
+    return ['Debug','MoveDebug','TipsUI','PowerUp','FightPowerUp','TreasureActionSideTipUI'].some(key=>cfg[key] && view.cfg === cfg[key]);
   }
   function normalPages() {
     return ['AttrUp','GameMethod','Hangup','DesireUI','MagicArtifactUI','PetUI','Draw','Setting','MineUI','MineOtherUI','MineOtherMagicArtifactUI','MineListUI','ArenaUI','ChatUI','ChatRecruitUI','MainMoreUI']
@@ -698,6 +698,8 @@ function createEnergyRuntime(g, timing) {
     const bestMagic=magicPlans.reduce((best,p)=>!best||p.pvp>best.pvp?p:best,currentMagic||null);
     const faces=[];
     eachMap(snapshot.equipment,8,(item,slot)=>{
+      // Empty equipment slots carry no attributes or entries to subtract.
+      if(!item || !(Number(item.configId)>0))return;
       const row=item && rowOf('EquipmentCfg',item.configId);
       const level=isMap(snapshot.equipmentLevel)?(snapshot.equipmentLevel.get(Number(slot))??snapshot.equipmentLevel.get(String(slot))??(item && item.level)):item && item.level;
       const growth=row && row.LevelGrowthAttr;
@@ -721,7 +723,7 @@ function createEnergyRuntime(g, timing) {
     if(!isMap(snapshot.desirePlan))missing.push('当前三尸方案未下发');
     if(!isMap(snapshot.allDesirePlan))missing.push('三尸其他方案未下发');
     if(!magic || !isMap(magic.plan) || !currentMagic)missing.push('当前法器方案未下发');
-    if(faces.length!==8)missing.push('八件脸谱资料不完整');
+    if(!isMap(snapshot.equipment))missing.push('当前脸谱装备未下发');
     let erlangSnapshot=null;
     if(kind==='erlang'){
       try{erlangSnapshot=JSON.parse(JSON.stringify(snapshot,(_key,v)=>isMap(v)?{__map__:Array.from(v.entries())}:v));}
@@ -975,13 +977,24 @@ function createEnergyRuntime(g, timing) {
     }
     return battleCfg;
   }
-  const extra=typeof createDailyRuntime==='function'?createDailyRuntime(g,{ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,closeControl,
-    configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig}):null;
+  const helpers={ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,closeControl,
+    configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig};
+  let extra=null,desire=null;
+  function extraRuntime(){
+    const factory=typeof createDailyRuntime==='function'?createDailyRuntime:
+      g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.features && g.__e0e1PluginRuntime.features.daily;
+    if(!extra && factory)extra=factory(g,helpers);
+    return extra;
+  }
+  function desireRuntime(){
+    const factory=typeof createDesireRuntime==='function'?createDesireRuntime:
+      g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.features && g.__e0e1PluginRuntime.features.desire;
+    if(!desire && factory)desire=factory(g,helpers);
+    return desire;
+  }
   // 三尸合成是独立的运行时（package/plugin_manager/desire_runtime.js），
   // 只借用这里的通用UI辅助，不进日常任务的任何分支。
   const DESIRE_OPS=['desire_bag_stats','desire_compose_probe','desire_compose_open','desire_compose_once','desire_compose_close'];
-  const desire=typeof createDesireRuntime==='function'?createDesireRuntime(g,{ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,
-    configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig}):null;
   return {async dispatch(op, args) {
     args=args || {};
     const overlay=g.__e0e1AutomationOverlay;
@@ -1018,7 +1031,7 @@ function createEnergyRuntime(g, timing) {
       }
       else if (op==='identity') value=identity();
       else if (op==='reward_info') value=await rewardInfo();
-      else if (op==='pet_fodder_state') value=await extra.dispatch(op,args);
+      else if (op==='pet_fodder_state') value=await extraRuntime().dispatch(op,args);
       else if (op==='home') value=await home();
       else {
         if (!safe()) throw error('当前界面被阻挡：'+blockers().join(', '));
@@ -1032,8 +1045,8 @@ function createEnergyRuntime(g, timing) {
         else if (op==='restore') value=await restore(args.original);
         // 三尸的操作必须走它自己的运行时：daily_runtime 对不认识的操作是 throw，
         // 放到后面就永远轮不到 desire。
-        else if (desire && DESIRE_OPS.includes(op)) value=await desire.dispatch(op,args);
-        else if (extra) value=await extra.dispatch(op,args);
+        else if (DESIRE_OPS.includes(op) && desireRuntime()) value=await desireRuntime().dispatch(op,args);
+        else if (extraRuntime()) value=await extraRuntime().dispatch(op,args);
         else throw error('未知操作');
       }
       return {status:'ok',value:value===undefined?null:value};

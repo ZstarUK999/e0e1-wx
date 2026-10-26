@@ -12,10 +12,20 @@ class WechatReconnect:
         self.started = 0
         self.restarted = False
         self.restart_message = None
+        self._configured = False
 
     async def poll(self, settings):
         self.transport.wechat_sidebar=settings.get('wechat_sidebar')
-        status = await self.transport.wechat_reconnect_status(settings.get('wechat_reconnect', False))
+        enabled = settings.get('wechat_reconnect', False)
+        if not enabled and not self._configured:
+            self.event = None
+            self.restarted = False
+            self.restart_message = None
+            return None
+        # Mark before sending: a lost acknowledgement may still have installed the hook.
+        if enabled:self._configured = True
+        status = await self.transport.wechat_reconnect_status(enabled)
+        if not enabled:self._configured = False
         if not settings.get('wechat_reconnect') or not status or not status.get('kicked'):
             self.event = None
             self.restarted = False

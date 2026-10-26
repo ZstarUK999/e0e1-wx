@@ -101,8 +101,6 @@ class WechatImageLauncher:
             self.sleep(.3)
         if not window.isActive:
             raise RuntimeError('微信窗口无法置前，停止图像点击')
-        if window.left < 0 or window.top < 0 or window.right > self.gui.size().width or window.bottom > self.gui.size().height:
-            raise RuntimeError('请将微信主窗口完整放在主屏幕内')
 
     def locate(self, name, window):
         self.focus(window)
@@ -175,16 +173,23 @@ class WechatImageLauncher:
         if self.cancel.is_set():
             raise RuntimeError('桌面重开已取消')
 
-    def blank_screen(self):
+    def blank_screen(self, *, focus=True):
         windows = self.game_windows()
         if len(windows) != 1 or windows[0].isMinimized:
             return None
         window = windows[0]
-        self.focus(window)
         from ctypes import wintypes as W
         rect, point = W.RECT(), W.POINT()
         user = ctypes.windll.user32
         handle = ctypes.c_void_p(window._hWnd)
+        if focus:
+            self.focus(window)
+        else:
+            foreground = user.GetForegroundWindow
+            foreground.restype = W.HWND
+            if foreground() != window._hWnd:
+                # A screenshot of an obscured window cannot prove a blank game.
+                return None
         if not user.GetClientRect(handle, ctypes.byref(rect)) or not user.ClientToScreen(handle, ctypes.byref(point)):
             return None
         if rect.right < 200 or rect.bottom < 200:

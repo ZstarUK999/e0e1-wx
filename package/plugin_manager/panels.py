@@ -304,6 +304,12 @@ class GlobalPanel(QWidget):
         self.game_overlays.setToolTip("关闭后移除日常和PVE的自定义悬浮窗，用于白屏对照排查；日常、控制链和3倍按钮功能仍保留。")
         self.form.addRow("游戏悬浮窗", self.game_overlays)
         self.game_overlays.toggled.connect(store.set_game_overlays)
+        self.legion_scan_auto_start = QCheckBox('启动时自动进行区段扫描')
+        self.legion_scan_auto_start.setObjectName('ui.legion_scan_auto_start')
+        self.legion_scan_auto_start.setChecked(store.snapshot()['ui']['legion_scan_auto_start'])
+        self.legion_scan_auto_start.setToolTip('默认关闭。开启后，启动辅助及重启游戏连接就绪时自动更新阴司、成员并续扫；关闭后仍可手动启动任务。开关立即保存。')
+        self.form.addRow('阴司透视区段扫描', self.legion_scan_auto_start)
+        self.legion_scan_auto_start.toggled.connect(store.set_legion_scan_auto_start)
         self.wechat_reconnect = QCheckBox('顶号后自动重新打开游戏（仅微信）')
         self.wechat_reconnect.setObjectName('ui.wechat_reconnect')
         self.reconnect_seconds = QSpinBox()
@@ -325,8 +331,8 @@ class GlobalPanel(QWidget):
         self.reconnect_seconds.setValue(store.snapshot()['ui']['reconnect_seconds'])
         self.wechat_reconnect.toggled.connect(lambda enabled: store.set_wechat_reconnect(enabled, self.reconnect_seconds.value()))
         note = QLabel("每一步 UI 操作之间等待的时间，方便观察执行过程；只影响节奏，不改变任何安全检查。\n"
-                      "首次需要手动打开游戏；微信顶号后按倒计时重开。长期任务断线后，持续15秒确认游戏客户区纯白／纯黑才自动重开。"
-                      "重开通过图片确认微信入口和“小程序”页的绿色选中状态，再点击《遗弃之地》。请保持微信已登录、主窗口完整位于主屏幕内。")
+                      "首次需要手动打开游戏；微信顶号后按倒计时重开。游戏客户区纯白／纯黑持续15秒自动重开，连接正常时仅检测前台游戏窗口。"
+                      "重开通过图片确认微信入口和“小程序”页的绿色选中状态，再点击《遗弃之地》。请保持微信已登录，相关入口可见即可。")
         note.setWordWrap(True)
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -357,6 +363,7 @@ class GlobalPanel(QWidget):
 
     def sync(self, state):
         set_checked(self.game_overlays,state["ui"]["game_overlays"])
+        set_checked(self.legion_scan_auto_start,state['ui']['legion_scan_auto_start'])
         set_checked(self.wechat_reconnect, state['ui']['wechat_reconnect'])
         value = state["ui"]["delay_ms"]
         if self.delay.value() != value:
@@ -544,16 +551,16 @@ class BloodmoonPanel(QWidget):
         heading = QLabel("血月战场")
         heading.setObjectName("panelTitle")
         layout.addWidget(heading)
-        note = QLabel("战旗探测只读战场内已同步的旗帜数据；自动加速点击原按钮；自动攻击直接调用原模块，"
-                      "保留冷却、剩余时间、道具与状态限制，被拒绝就停。\n"
-                      "不读取、不展示被游戏隐藏的敌方隐匿行军，隐匿目标不作为自动攻击的选敌来源。")
+        note = QLabel("战旗探测读取已同步的旗帜数据；自动赶路、自动挑战直接调用游戏接口，"
+                      "赶路间隔可调，剩余8～10秒最多再尝试一次，低于8秒停止。\n"
+                      "显示已同步的隐匿玩家头像和行军路线；自动挑战仍按节点驻留资格选敌。")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.enabled = QCheckBox("血月总开关（探测、加速、挑战、隐匿标注）")
         self.enabled.setObjectName("bloodmoon.enabled")
         layout.addWidget(self.enabled)
 
-        self.master_note = QLabel("关闭总开关会暂停全部血月功能，并保留下方设置；开启后自动加速、自动挑战与隐匿标注统一运行。\n"
+        self.master_note = QLabel("关闭总开关会暂停全部血月功能，并保留下方设置；开启后分别按加速、挑战与隐匿标注开关运行。\n"
                                  "战旗探测需点击“开始探测”；诊断和复位不受总开关控制。")
         self.master_note.setWordWrap(True)
         layout.addWidget(self.master_note)
@@ -595,7 +602,7 @@ class BloodmoonPanel(QWidget):
         probe_layout.addWidget(self.probe_tree, 1)
         layout.addWidget(self.probe_box)
 
-        self.speed_box = QGroupBox("自动加速（正常加速按钮）")
+        self.speed_box = QGroupBox("自动赶路（直接请求）")
         speed_layout = QVBoxLayout(self.speed_box)
         speed_form = QFormLayout()
         self.speed_times = QSpinBox()
@@ -603,12 +610,13 @@ class BloodmoonPanel(QWidget):
         self.speed_times.setSuffix(" 次")
         self.speed_times.setObjectName("bloodmoon.speed_up.max_times")
         speed_form.addRow("单次行军最多加速", self.speed_times)
-        self.speed_margin = QSpinBox()
-        self.speed_margin.setRange(0, 60)
-        self.speed_margin.setSuffix(" 秒")
-        self.speed_margin.setObjectName("bloodmoon.speed_up.safety_margin_seconds")
-        self.speed_margin.setToolTip("在游戏要求的最低剩余时间上额外预留；例如游戏最低要求10秒、预留2秒，则剩余不足12秒不加速；原生UI禁止时绝不操作。")
-        speed_form.addRow("额外预留时间（游戏最低要求之外）", self.speed_margin)
+        self.speed_interval = QSpinBox()
+        self.speed_interval.setRange(0, 3600)
+        self.speed_interval.setSuffix(" 秒")
+        self.speed_interval.setObjectName("bloodmoon.speed_up.interval_seconds")
+        self.speed_interval.setSpecialValueText("跟随游戏间隔")
+        self.speed_interval.setToolTip("0：读取游戏 MarchSpeedUpCD；正数：使用自定义秒数。8～10秒窗口内最多尝试一次，仍遵守请求间隔；低于8秒不发送。")
+        speed_form.addRow("赶路请求间隔（0跟随游戏）", self.speed_interval)
         speed_layout.addLayout(speed_form)
         self.speed_save = QPushButton("保存加速设置")
         speed_layout.addWidget(self.speed_save)
@@ -626,7 +634,7 @@ class BloodmoonPanel(QWidget):
         self.attack_limit.setSpecialValueText("不限制")
         self.attack_limit.setObjectName("bloodmoon.attack.power_limit")
         attack_form.addRow("目标战力上限", self.attack_limit)
-        attack_hint = QLabel("只攻击战力低于我方、且低于此上限的可见玩家；0 表示只按我方战力筛选。每100毫秒扫描当前节点；待命后直接挑战，发送至少间隔1秒，等待回执期间不重复发送。")
+        attack_hint = QLabel("只攻击战力低于我方、且低于此上限的可见玩家；0 表示只按我方战力筛选。每100毫秒扫描当前节点；待命后直接挑战，上一场结束且回到待命后立即续战，等待回执期间不重复发送。")
         attack_hint.setWordWrap(True)
         attack_layout.addWidget(attack_hint)
         self.attack_max = QSpinBox()
@@ -642,10 +650,10 @@ class BloodmoonPanel(QWidget):
         attack_layout.addWidget(self.attack_status)
         layout.addWidget(self.attack_box)
 
-        self.mark_box = QGroupBox("隐匿状态标注")
+        self.mark_box = QGroupBox("隐匿玩家头像与行军路线")
         mark_layout = QVBoxLayout(self.mark_box)
-        mark_note = QLabel("只标注当前本来就能看到的单位（已到达本节点、已在可见队列里）。"
-                           "不揭示被游戏隐藏的敌方行军，也不把它们加进自动攻击的候选。")
+        mark_note = QLabel("使用已同步的行军数据，显示隐匿玩家的队列头像、行军动画和路线。"
+                           "关闭血月功能后恢复游戏原来的显示规则；尚在行军的目标不会因此变为可挑战目标。")
         mark_note.setWordWrap(True)
         mark_layout.addWidget(mark_note)
         layout.addWidget(self.mark_box)
@@ -696,7 +704,7 @@ class BloodmoonPanel(QWidget):
 
     def _speed_patch(self) -> dict:
         return {"speed_up": {"max_times": self.speed_times.value(),
-                             "safety_margin_seconds": self.speed_margin.value()}}
+                             "interval_seconds": self.speed_interval.value()}}
 
     def _attack_patch(self) -> dict:
         return {"attack": {"power_ratio": 100, "power_limit": int(self.attack_limit.value()),
@@ -704,6 +712,16 @@ class BloodmoonPanel(QWidget):
 
     def sync(self, state):
         bloodmoon = state.get("bloodmoon") or {}
+        if not hasattr(self, 'sub_switches'):
+            self.sub_switches = {}
+            for key, title in (('speed_up', '自动加速'), ('attack', '自动挑战'), ('stealth_mark', '隐匿标注与状态检查')):
+                box = QCheckBox(title)
+                box.setObjectName('bloodmoon.' + key + '.enabled')
+                self.layout().insertWidget(2, box)
+                box.toggled.connect(lambda on, key=key: self._patch({key: {'enabled': on}}))
+                self.sub_switches[key] = box
+        for key, box in self.sub_switches.items():
+            set_checked(box, bool((bloodmoon.get(key) or {}).get('enabled')))
         probe = bloodmoon.get("flag_probe") or {}
         speed = bloodmoon.get("speed_up") or {}
         attack = bloodmoon.get("attack") or {}
@@ -711,9 +729,9 @@ class BloodmoonPanel(QWidget):
         for widget, value in ((self.probe_refresh, probe.get("refresh_seconds", 5)),
                               (self.probe_top, probe.get("top_members", 3)),
                               (self.speed_times, speed.get("max_times", 15)),
-                              (self.speed_margin, speed.get("safety_margin_seconds", 2)),
+                              (self.speed_interval, speed.get("interval_seconds", 0)),
                               (self.attack_limit, attack.get("power_limit", 0)),
-                              (self.attack_max, attack.get("max_battles", 10))):
+                              (self.attack_max, attack.get("max_battles", 20))):
             if widget.value() != value:
                 widget.setValue(int(value))
         self.set_ready(getattr(self, '_ready', False))
@@ -729,7 +747,7 @@ class BloodmoonPanel(QWidget):
         self.probe_start.setEnabled(active and not getattr(self, '_probe_running', False))
         self.probe_stop.setEnabled(bool(ready) and getattr(self, '_probe_running', False))
         self.master_status.setText('总开关已关闭：全部血月功能暂停' if not master else
-                                   ('总开关已开启：加速、挑战与隐匿标注运行中' if ready else '总开关已开启：等待游戏与插件就绪'))
+                                   ('总开关已开启：按各子功能开关运行' if ready else '总开关已开启：等待游戏与插件就绪'))
         if not ready:
             self.probe_stop.setEnabled(False)
 

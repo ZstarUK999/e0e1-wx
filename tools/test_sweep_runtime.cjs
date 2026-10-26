@@ -156,6 +156,20 @@ test('PVP inputs use raw permanent attributes, plan differences and complete Erl
   result=await f.runtime.dispatch('player_information',{target_id:12324803});
   assert.equal(result.value.pvp_estimate.desire.extra,0);assert.equal(result.value.pvp_estimate.magic.extra,0);
   assert.match(result.value.text,/三尸补差：最高 30%.*当前 30% = \+0%/);
+  // Empty slots are not missing configurations; partial pieces retain both
+  // their base and entry contributions for per-piece replacement in Python.
+  snapshot.equipment=new Map([[1,{configId:6000,entry:[{id:1,value:100}]}],[2,null],[3,{configId:0}]]);
+  result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  p=result.value.pvp_estimate;
+  assert.equal(p.face_kind,'other');assert.equal(p.face_complete,false);
+  assert.equal(p.faces.length,1);assert.equal(p.face_pvp,6);
+  assert.deepEqual(Array.from(p.missing),[]);
+  snapshot.equipment=new Map([[1,null],[2,{configId:0}]]);
+  result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.equal(result.value.pvp_estimate.faces.length,0);assert.equal(result.value.pvp_estimate.face_pvp,0);
+  delete snapshot.equipment;
+  result=await f.runtime.dispatch('player_information',{target_id:12324803});
+  assert.ok(result.value.pvp_estimate.missing.includes('当前脸谱装备未下发'));
 });
 
 test('desire details resolve real nested item configs and never silently omit unknown IDs',async()=>{
@@ -641,6 +655,19 @@ test('desire ops are routed to the standalone desire runtime, never to the daily
   const out=await runtime.dispatch('desire_bag_stats',{});
   assert.equal(out.status,'ok',out.message);
   assert.deepEqual(seen,['desire_bag_stats']);
+});
+
+test('persistent treasure side tip does not block hall operations; unknown dialog still blocks',async()=>{
+  const f=fixture();
+  f.cfg.TreasureActionSideTipUI={id:'TreasureActionSideTipUI'};
+  f.windows.set(f.cfg.TreasureActionSideTipUI,{view:{btn_cancel:{node:{activeInHierarchy:false}}}});
+  const ready=await f.runtime.dispatch('inspect');
+  assert.equal(ready.value.safe,true);
+  assert.equal(f.inputs.length,0);
+  f.windows.set({id:'PaymentConfirm'},{view:{}});
+  const blocked=await f.runtime.dispatch('inspect');
+  assert.equal(blocked.value.safe,false);
+  assert(blocked.value.blockers.includes('PaymentConfirm'));
 });
 
 

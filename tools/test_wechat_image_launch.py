@@ -78,19 +78,20 @@ def test_game_clicked_once_then_window_confirmation_required():
     assert len(clicks) == 1
 
 
-def test_blank_recovery_requires_disconnect_activity_and_persistence():
+@pytest.mark.parametrize('kind', ['white', 'black'])
+@pytest.mark.parametrize('disconnected', [True, False])
+def test_blank_recovery_requires_activity_and_persistence(kind, disconnected):
     async def run():
         now, captures, restarts = [0.], [], []
         async def capture():
             captures.append(True)
-            return (123, 'white')
+            return (123, kind)
         async def restart():restarts.append(True)
         recovery = BlankScreenRecovery(clock=lambda: now[0], capture=capture, restart=restart)
         async def poll(**kwargs):
-            await recovery.poll(**dict(active=True, disconnected=True, kicked=False, closing=False, **kwargs))
+            await recovery.poll(**dict(active=True, disconnected=disconnected, kicked=False, closing=False, **kwargs))
         await recovery.poll(active=False, disconnected=True, kicked=False, closing=False)
         assert not captures
-        await recovery.poll(active=True, disconnected=False, kicked=False, closing=False)
         await recovery.poll(active=True, disconnected=True, kicked=True, closing=False)
         assert not captures
         for t in (0, 5, 10):
@@ -106,6 +107,53 @@ def test_blank_recovery_requires_disconnect_activity_and_persistence():
     asyncio.run(run())
 
 
+def test_screenshot_failure_resets_continuous_confirmation():
+    async def run():
+        now, restarts = [0.], []
+        async def capture():
+            if now[0] == 10:
+                raise OSError('capture unavailable')
+            return (1, 'black')
+        async def restart():restarts.append(True)
+        recovery = BlankScreenRecovery(clock=lambda: now[0], capture=capture, restart=restart)
+        for t in (0, 5, 10, 15, 20, 25, 30):
+            now[0] = t
+            if t == 10:
+                with pytest.raises(OSError):
+                    await recovery.poll(active=True, disconnected=False, kicked=False, closing=False)
+            else:
+                await recovery.poll(active=True, disconnected=False, kicked=False, closing=False)
+            assert len(restarts) == (1 if t == 30 else 0)
+    asyncio.run(run())
+
+
+def test_connected_checks_only_foreground_without_stealing_focus(monkeypatch, tmp_path):
+    import ctypes
+    monkeypatch.chdir(tmp_path)
+    window = SimpleNamespace(_hWnd=2**40+123, isMinimized=False)
+    foreground = [1]
+    def current():return foreground[0]
+    def rect(handle, pointer):
+        pointer._obj.right = pointer._obj.bottom = 300
+        return True
+    user = SimpleNamespace(GetForegroundWindow=current, GetClientRect=rect, ClientToScreen=lambda *args: True)
+    monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=user))
+    shots, focused = [], []
+    def screenshot(**kwargs):
+        shots.append(kwargs)
+        return Image.new('RGB', (300, 300), 'black')
+    launcher = WechatImageLauncher(gui=SimpleNamespace(screenshot=screenshot))
+    launcher.game_windows = lambda: [window]
+    launcher.focus = lambda w: focused.append(w)
+    assert launcher.blank_screen(focus=False) is None
+    assert not shots and not focused
+    foreground[0] = window._hWnd
+    assert launcher.blank_screen(focus=False) == (window._hWnd, 'black')
+    assert len(shots) == 1 and not focused
+    assert launcher.blank_screen() == (window._hWnd, 'black')
+    assert focused == [window]
+
+
 def test_nonblank_or_changed_window_resets_confirmation():
     async def run():
         now, results, restarts = [0.], iter([(1,'black'),None,(1,'black'),(2,'black'),(2,'black')]), []
@@ -116,4 +164,63 @@ def test_nonblank_or_changed_window_resets_confirmation():
             now[0] = t
             await recovery.poll(active=True, disconnected=True, kicked=False, closing=False)
         assert not restarts
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failures', [1, 10, 11])
+def test_blank_restart_retries_without_recapturing_old_window(failures):
+    async def run():
+        now, attempts, captures, delays = [0.], [], [], []
+        async def capture():
+            captures.append(True)
+            return (123, 'white')
+        async def restart():
+            attempts.append(True)
+            if len(attempts) <= failures:
+                raise OSError('1400 - Invalid window handle')
+        async def sleep(seconds):
+            assert recovery.restarting
+            delays.append(seconds)
+            now[0] += seconds
+        recovery = BlankScreenRecovery(clock=lambda: now[0], capture=capture,
+                                       restart=restart, sleep=sleep)
+        async def poll():
+            await recovery.poll(active=True, disconnected=True, kicked=False, closing=False)
+        for t in (0, 5, 10):
+            now[0] = t
+            await poll()
+        now[0] = 15
+        if failures == 11:
+            with pytest.raises(OSError, match='1400'):
+                await poll()
+        else:
+            await poll()
+        assert len(attempts) == min(failures + 1, 11)
+        assert delays == [20.] * min(failures, 10)
+        assert len(captures) == 4
+        assert not recovery.restarting
+        assert recovery.next_restart == now[0] + 300
+        await poll()
+        assert len(captures) == 4
+    asyncio.run(run())
+
+
+def test_blank_restart_cancellation_stops_retries():
+    async def run():
+        now, attempts = [0.], []
+        async def capture():return (123, 'black')
+        async def restart():
+            attempts.append(True)
+            raise RuntimeError('open failed')
+        async def sleep(seconds):raise asyncio.CancelledError()
+        recovery = BlankScreenRecovery(clock=lambda: now[0], capture=capture,
+                                       restart=restart, sleep=sleep)
+        for t in (0, 5, 10):
+            now[0] = t
+            await recovery.poll(active=True, disconnected=True, kicked=False, closing=False)
+        now[0] = 15
+        with pytest.raises(asyncio.CancelledError):
+            await recovery.poll(active=True, disconnected=True, kicked=False, closing=False)
+        assert len(attempts) == 1
+        assert not recovery.restarting
     asyncio.run(run())

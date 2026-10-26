@@ -1,0 +1,32 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),path=require('node:path');
+const source=fs.readFileSync(path.join(__dirname,'js/damage_curve_probe.js'),'utf8');
+(async()=>{
+ const api=await vm.runInNewContext('(async()=>{'+source+`;return {state:e0e1NewState,record:e0e1RecordFactors,sample:e0e1SampleFormulaState,collect:e0e1CollectSide,probe:e0e1Probe,patch:e0e1PatchFactorCapture,
+ configure(helper){E0E1_CHARACTER={characterHelper:helper};},push(ctx){E0E1_DAMAGE_STACK.push({context:ctx});},pop(){E0E1_DAMAGE_STACK.pop();},stop:damageCurveStop};})()`,{console:{log(){}},Map,Date,Promise,setTimeout,clearTimeout,setInterval:()=>1,clearInterval(){},__e0e1RegisterRuntimeToggle(){}});
+ const world={instanceId:1,options:{battleData:{type:20}},battleTime:{battleTime:2}},state=api.state(world,'self',false),target={compBoss:{}},book={cat:'book'};
+ for(let i=0;i<1000;i++)api.record(state,{},20,10,target,book,2);
+ assert.equal(state.diagnostics.counts['factor.skip.no_context.book'],1000);
+ assert.equal(state.diagnostics.samples.filter(s=>s.reason==='factor.skip.no_context.book').length,2);
+ api.push({battleWorld:{instanceId:2},target,skillId:20});api.record(state,{},20,10,target,book,2);api.pop();
+ assert.equal(state.diagnostics.counts['factor.skip.world_mismatch.book'],1);
+ api.push({battleWorld:world,target,skillId:10});api.record(state,{},20,10,target,book,2);api.pop();
+ assert.equal(state.diagnostics.counts['factor.skip.skill_mismatch.book'],1);
+ api.push({battleWorld:world,target,skillId:20});api.record(state,{},20,10,target,book,2);api.pop();
+ assert.equal(state.diagnostics.counts['factor.skip.no_multiplier'],1);
+ api.sample(state);assert.equal(state.diagnostics.counts['snapshot.modules_missing'],1);
+ let touched=false;const object={get dangerous(){touched=true;throw Error('must not read live objects');}};
+ api.probe(state,'test.scalar',{world:object,number:123,text:'x'.repeat(1000)});
+ assert.equal(touched,false);const sample=state.diagnostics.samples.at(-1);assert.equal(sample.world,undefined);assert.equal(sample.text.length,240);
+ const helper={subLife(){return 123;}},original=helper.subLife;api.configure(helper);api.patch();
+ assert.equal(helper.subLife({battleWorld:world,target,skillId:20}),123);
+ const report=api.collect(state),encoded=JSON.stringify(report.diagnostics);
+ assert.equal(report.diagnostics.modules.subLifePatched,true);assert.equal(report.diagnostics.runtime.counts['hook.installed'],1);
+ assert.equal(report.diagnostics.runtime.counts['subLife.enter'],1);assert(encoded.includes('no_context.book'));assert(!encoded.includes('dangerous'));
+ assert.equal(state.eventCount,0);assert.equal(state.factorRows.length,0,'probes cannot invent damage or multiplier rows');
+ for(let i=0;i<100;i++)api.probe(state,'test.normal.'+i,{});
+ assert(state.diagnostics.samples.length<=32);
+ for(let i=0;i<100;i++)api.probe(state,'test.exception.'+i,{error:'late failure'});
+ assert.equal(state.diagnostics.samples.length,48);assert(state.diagnostics.samples.some(s=>s.error==='late failure'));
+ api.stop();assert.equal(helper.subLife,original);
+ console.log('PASS reason counters, mismatch evidence, missing modules, hook status, bounded samples, failure reserve, scalar-only serialization, unchanged native results and zero synthetic damage');
+})().catch(error=>{console.error(error);process.exitCode=1;});

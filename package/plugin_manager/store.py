@@ -16,6 +16,7 @@ from package.daily_tasks.pet_hatch import PET_EGGS
 from .feature_flags import task_enabled
 from .battle_assist import default_battle_assist, validate_battle_assist
 from .paths import default_config_path
+from .polling_controls import DEFAULTS as POLLING_DEFAULTS
 
 SECONDS_MAX = 604800
 PRIORITY_MAX = 1000000
@@ -81,7 +82,7 @@ def default_config() -> dict:
     daily = {"version": 1, "enabled": False, "timezone": "Asia/Shanghai", "poll_seconds": 1,
              "summary_interval_seconds": 3600, "tasks": tasks}
     return {"version": 1, "daily": daily, "player": {"enabled": False},
-            "ui": {"delay_ms": 500, "game_overlays": True, "wechat_reconnect": False, "reconnect_seconds": 300, "wechat_sidebar": None},
+            "ui": {**POLLING_DEFAULTS, "delay_ms": 500, "game_overlays": True, "wechat_reconnect": False, "reconnect_seconds": 300, "wechat_sidebar": None, "legion_scan_auto_start": False},
             "treasure": {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30},
             "damage": {"enabled": False, "auto_csv": True},
             # 三尸自动合成：kind 1贪 2嗔 3痴；expected_rate 是报告里理论曲线的默认成功率（百分数）。
@@ -92,9 +93,9 @@ def default_config() -> dict:
             "bloodmoon": {"enabled": False,
                           "flag_probe": {"refresh_seconds": 5, "top_members": 3},
                           "speed_up": {"enabled": False, "max_times": 15,
-                                       "safety_margin_seconds": 2, "poll_seconds": 2},
+                                       "safety_margin_seconds": 0, "poll_seconds": 2, "interval_seconds": 0},
                           "attack": {"enabled": False, "power_ratio": 100, "power_limit": 0,
-                                     "max_battles": 10, "wait_seconds": 0},
+                                     "max_battles": 20, "wait_seconds": 0},
                           "stealth_mark": {"enabled": False}}}
 
 
@@ -171,11 +172,18 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(player, dict) or set(player) != {"enabled"} or type(player["enabled"]) is not bool:
         raise ValueError("player配置只接受enabled布尔开关")
     ui = raw.get("ui", {"delay_ms": 500})
-    if not isinstance(ui, dict) or set(ui) - {"delay_ms", "auto_open_game", "game_overlays", "wechat_reconnect", "reconnect_seconds", "wechat_sidebar"}:
+    if not isinstance(ui, dict) or set(ui) - (set(POLLING_DEFAULTS) | {"delay_ms", "auto_open_game", "game_overlays", "wechat_reconnect", "reconnect_seconds", "wechat_sidebar", "legion_scan_auto_start"}):
         # auto_open_game 已废弃（不再自动打开游戏），老配置里遇到就忽略。
         raise ValueError("ui配置只接受delay_ms/game_overlays")
     ui=dict(ui)
+    for key, default in POLLING_DEFAULTS.items():
+        ui.setdefault(key, default)
+        if type(ui[key]) is not bool:
+            raise ValueError(key + ' 必须是布尔开关')
     ui.pop("auto_open_game", None)
+    ui.setdefault('legion_scan_auto_start', False)
+    if type(ui['legion_scan_auto_start']) is not bool:
+        raise ValueError('区段扫描自动启动须为布尔开关')
     ui.setdefault('wechat_reconnect', False)
     ui.setdefault('reconnect_seconds', 300)
     ui.setdefault('wechat_sidebar', None)
@@ -282,11 +290,11 @@ def _validate_bloodmoon(raw) -> dict:
     if type(probe["top_members"]) is not int or not 1 <= probe["top_members"] <= 50:
         raise ValueError("每个阴司默认显示人数必须是1至50的整数")
     speed = merged["speed_up"]
-    if not isinstance(speed, dict) or set(speed) - {"enabled", "max_times", "safety_margin_seconds", "poll_seconds"}:
-        raise ValueError("bloodmoon.speed_up 只接受 enabled/max_times/safety_margin_seconds/poll_seconds")
+    if not isinstance(speed, dict) or set(speed) - {"enabled", "max_times", "safety_margin_seconds", "poll_seconds", "interval_seconds"}:
+        raise ValueError("bloodmoon.speed_up 只接受 enabled/max_times/safety_margin_seconds/poll_seconds/interval_seconds")
     if type(speed["enabled"]) is not bool:
         raise ValueError("bloodmoon.speed_up.enabled 必须是布尔开关")
-    for label, low, high in (("max_times", 0, 99), ("safety_margin_seconds", 0, 60), ("poll_seconds", 1, 60)):
+    for label, low, high in (("max_times", 0, 99), ("safety_margin_seconds", 0, 60), ("poll_seconds", 1, 60), ("interval_seconds", 0, 3600)):
         value = speed[label]
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"bloodmoon.speed_up.{label} 必须是{low}至{high}的整数")
@@ -356,6 +364,18 @@ class PluginConfigStore(QObject):
     def set_game_overlays(self, enabled: bool) -> None:
         raw=self.snapshot()
         raw['ui']['game_overlays']=enabled
+        self._commit(raw)
+
+    def set_ui_flag(self, key, enabled):
+        if key not in POLLING_DEFAULTS:
+            raise ValueError('未知后台开关')
+        raw = self.snapshot()
+        raw['ui'][key] = enabled
+        self._commit(raw)
+
+    def set_legion_scan_auto_start(self, enabled: bool) -> None:
+        raw=self.snapshot()
+        raw['ui']['legion_scan_auto_start']=enabled
         self._commit(raw)
 
     def set_ui_delay(self, delay_ms: int) -> None:

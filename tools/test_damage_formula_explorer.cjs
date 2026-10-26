@@ -59,6 +59,22 @@ assert.match(template,/<div class="formula-comparison-body" id="bonus-summary">/
 assert(!template.includes('section("天书", p.books'));
 console.log('PASS formula filters and skill mode, no-hit gaps, click-to-compare, red/green labels, zone→attribute→source drilldown, attack excludes book attributes, flat table and folded bottom details');
 
+DATA.initialAttributes={status:'captured',time:0,attributes:{1:100,117:.5,118:.1},attrMeta:[{key:1,label:'攻击'},{key:117,label:'PVP增伤',percent:true},{key:'finalPvp',label:'最终PVP增伤',percent:true}],context:{opponentPvpRed:.2}};
+DATA.other.initialAttributes={status:'captured',time:0,attributes:{1:80,117:.3,118:.2}};
+vm.runInNewContext('renderInitialAttributes()',context);
+assert.match(text(nodes.get('initial-attrs-note')),/首次伤害前/);
+assert.match(text(nodes.get('initial-attrs-table')),/攻击.*100.*20.*80/);
+assert.match(text(nodes.get('initial-attrs-table')),/最终PVP增伤/);
+assert.equal(DATA.initialAttributes.attributes.finalPvp,undefined,'renderer must not modify frozen input');
+delete DATA.other.initialAttributes;
+vm.runInNewContext('renderInitialAttributes()',context);
+assert.match(text(nodes.get('initial-attrs-note')),/敌方初始快照缺失/);
+delete DATA.initialAttributes;
+vm.runInNewContext('renderInitialAttributes()',context);
+assert.match(text(nodes.get('initial-attrs-note')),/旧报告或开战后/);
+assert.equal(nodes.get('initial-attrs-table').children.length,0);
+console.log('PASS initial panel comparison, precise difference, derived PVP, immutable input and missing-side/old-report states');
+
 // Exercise the real SVG hover: totals use both sides; Top sources use the matching side denominator.
 const line=script.slice(script.indexOf('  function drawLine'),script.indexOf('  // 曲线点表示'));
 const svg=node(),wrap=node(),tip=node();wrap.appendChild(svg);context.svg=svg;context.tip=tip;

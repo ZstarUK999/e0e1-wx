@@ -48,7 +48,7 @@ KNOWN_TASKS: tuple[str, ...] = (
     "sanshi_fill", "artifact_fill", "energy", "offline_reward", "arena", "free_summon", "pet_hatch", "pet_fodder",
 )
 KNOWN_PANELS: tuple[str, ...] = (
-    "global", "daily", "bloodmoon", "player", "treasure", "damage", "debug",
+    "global", "daily", "bloodmoon", "flag_upgrade", "player", "treasure", "damage", "debug",
     "energy", "mines", "arena", "pet_hatch",
 )
 
@@ -63,6 +63,10 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/plugin_manager/battle_assist_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/auction_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/legion_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/plugin_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/legion_boss_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/season_insight_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/flag_upgrade_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/wechat_reconnect.js", "package/plugin_manager"),
     ("package/plugin_manager/startup_cleanup.js", "package/plugin_manager"),
     ("package/plugin_manager/wechat_recent.ps1", "package/plugin_manager"),
@@ -72,6 +76,8 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("tools/config/daily_tasks.json", "tools/config"),
     ("tools/js", "tools/js"),
     ("tools/hook.js", "tools"),  # frida 注入脚本，缺失会导致调试启动失败
+    ("tools/hook_androws.js", "tools"),
+    ("tools/config/androws", "tools/config/androws"),
     ("tools/config/win", "tools/config/win"),  # 各 WMPF 版本偏移配置
     ("tools/config/wi32", "tools/config/wi32"),
     ("tools/wmpf_autodetect", "tools/wmpf_autodetect"),  # 无现成配置时现算偏移

@@ -58,6 +58,9 @@ class DouyinImageLauncher(WechatImageLauncher):
 
 async def ensure_game_started(platform, *, before_open=None, factory=None):
     """已有目标游戏窗口则保留；缺失时准备监听后只点击一次入口。"""
+    if platform == '应用宝' and factory is None:
+        from .androws import ensure_game_started as start_androws
+        return await start_androws(before_open=before_open)
     factory = factory or (WechatImageLauncher if platform == '微信' else DouyinImageLauncher)
     cancel = threading.Event()
     launcher = await asyncio.to_thread(factory, cancel=cancel)

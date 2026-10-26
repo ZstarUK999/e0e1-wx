@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name 战斗伤害曲线采集（支持 PVP 双世界）
-// @description 逐条记录伤害事件并分类（普攻/符咒/天书逐本/觉醒分支/技能）。PVP 对局下同时采集我方与敌方两个 World，并按客户端公式采样双方分数与伤害天平。
+// @description 仅记录双方 World 的原始伤害、命中输入与属性快照，增量传给 Python；分类、统计、分数复算和图表在软件端完成。
 // @match *
 // @run-at document-start
 // @e0e1-mode runtime_toggle
@@ -9,9 +9,8 @@
 // 用法：
 //   python tools/cdp_inject.py --port 62000 --toggle tools/js/damage_curve_probe.js
 // 然后在 DevTools Console（切到 gameContext）里：
-//   damageCurveText()          文本：PVP 先看分数，再看双方伤害拆解
-//   damageCurveJson()          { mode, pvp, self, other }
-//   damageCurveCsv()           CSV（含 side 列，双方都在）
+//   damageCurveJson(cursor)    recordingSchema=1 原始记录/增量包
+//   文本拆解、CSV、图表通过 Python 软件或 tools/damage_curve_report.py 生成。
 //   damageCurveStatus()        当前挂了几个 World / 采了多少事件
 //   damageCurveReset() / damageCurveStop()
 //
@@ -105,6 +104,37 @@ var E0E1_TYPE_COMPONENTS = null;
 var E0E1_LIFE = null;
 var E0E1_FORMULA_MODULES = null;
 var E0E1_DAMAGE_STACK = [];
+var E0E1_PROBE_VERSION = '20261026.recording.1';
+// Production enables recording-only mode at installation. The legacy helpers
+// remain available to offline parity fixtures, never to the installed hot path.
+var E0E1_RECORD_ONLY=false,E0E1_RECORD_CATALOG=null,E0E1_RECORD_STREAM=0;
+function e0e1NextRecordingStream(){
+  var next=(Number(globalThis.__e0e1DamageRecordingSerial)||0)+1;
+  globalThis.__e0e1DamageRecordingSerial=next;return next;
+}
+var E0E1_PROBE_RUNTIME = {counts:{},samples:[]};
+// Bounded scalar evidence only: never retain entities, worlds or damage contexts.
+function e0e1Probe(state,reason,detail) {
+  try {
+    var diag=state ? state.diagnostics : E0E1_PROBE_RUNTIME;
+    if(!diag)return;
+    var count=diag.counts[reason] || 0;diag.counts[reason]=count+1;
+    var failure=/skip|missing|exception|filtered|unavailable/.test(reason);
+    if(count>=2 || diag.samples.length>=(failure?48:32))return;
+    var sample={reason:reason};
+    if(state){sample.t=Number(state.world && state.world.battleTime && state.world.battleTime.battleTime)||0;sample.side=state.side;}
+    Object.keys(detail || {}).slice(0,20).forEach(function(key){var v=detail[key];if(v===null || typeof v==='boolean' || typeof v==='number')sample[key]=v;else if(typeof v==='string')sample[key]=v.slice(0,240);});
+    diag.samples.push(sample);
+  }catch(error){}
+}
+function e0e1ProbeModules() {
+  var helper=E0E1_CHARACTER && E0E1_CHARACTER.characterHelper,mods=E0E1_FORMULA_MODULES || {};
+  return {cfg:!!E0E1_CFG,manager:!!E0E1_BM,character:!!helper,subLife:!!(helper && typeof helper.subLife==='function'),
+    subLifePatched:!!(helper && helper.subLife && helper.subLife.__e0e1Factors),
+    damage:!!mods.damage,skill:!!mods.skill,decimal:!!mods.decimal,hero:!!mods.hero,
+    rateCalculator:!!(mods.damage && mods.damage.DamageContext && typeof mods.damage.DamageContext.prototype.calcDmgRate==='function'),
+    skillShare:!!(mods.skill && mods.skill.SkillContextShareData),decimalZero:!!(mods.decimal && mods.decimal.DecimalNumber && mods.decimal.DecimalNumber.ZERO),lastError:E0E1_LAST_ERROR};
+}
 var E0E1_CFG_TRIED = false;
 var E0E1_BM = null;
 var E0E1_BM_TRIED = false;
@@ -171,8 +201,10 @@ async function e0e1LoadBattleManager() {
   E0E1_BATTLE_CONST = await e0e1Import("chunks:///_virtual/battle-const.ts");
   E0E1_TYPE_COMPONENTS = await e0e1Import("chunks:///_virtual/type-components.ts");
   E0E1_LIFE = await e0e1Import("chunks:///_virtual/comp-life.ts");
-  var formulaModules=await Promise.all(['damage-context.ts','skill-context.ts','DecimalNumber.ts','comp-hero.ts'].map(function(name){return e0e1Import('chunks:///_virtual/'+name);}));
-  E0E1_FORMULA_MODULES={damage:formulaModules[0],skill:formulaModules[1],decimal:formulaModules[2],hero:formulaModules[3]};
+  if(!E0E1_RECORD_ONLY){
+    var formulaModules=await Promise.all(['damage-context.ts','skill-context.ts','DecimalNumber.ts','comp-hero.ts'].map(function(name){return e0e1Import('chunks:///_virtual/'+name);}));
+    E0E1_FORMULA_MODULES={damage:formulaModules[0],skill:formulaModules[1],decimal:formulaModules[2],hero:formulaModules[3]};
+  }
   return E0E1_BM;
 }
 
@@ -441,9 +473,13 @@ function e0e1BossDamageOf(world) {
 
 // 每整秒记一次双方分数与对敌方英雄累计伤害
 function e0e1SamplePvp(forceFinal) {
+  [E0E1_SIDES.self,E0E1_SIDES.other].forEach(function(state){if(state)e0e1CaptureInitialAttributes(state,'clock');});
   var self = E0E1_SIDES.self;
   if (!self || !self.world) return;
   var world = self.world;
+  if(E0E1_RECORD_ONLY)[E0E1_SIDES.self,E0E1_SIDES.other].forEach(function(state){
+    if(state && state.world)state.lastTime=Math.max(state.lastTime,Number(state.world.battleTime && state.world.battleTime.battleTime)||0);
+  });
   var t = 0;
   try {
     t = world.battleTime.battleTime || 0;
@@ -453,7 +489,7 @@ function e0e1SamplePvp(forceFinal) {
     if (world.battleTime && world.battleTime.isSkipping) E0E1_PVP.skipped = true;
   } catch (error) {}
   var sec = Math.floor(t);
-  [E0E1_SIDES.self,E0E1_SIDES.other].forEach(function(state){if(state)e0e1SampleFormulaState(state);});
+  if(!E0E1_RECORD_ONLY)[E0E1_SIDES.self,E0E1_SIDES.other].forEach(function(state){if(state)e0e1SampleFormulaState(state);});
   if (sec === E0E1_PVP.lastSecond) {
     // 时钟信号早于本帧伤害结算；同步跳过返回后补齐最后一帧，不制造重复秒。
     if(forceFinal && E0E1_PVP.samples.length){
@@ -693,6 +729,7 @@ function e0e1BuffLabel(buff){
 
 // 只读当前实际生效的 changeAttributes，不重新执行技能表达式，不改游戏属性。
 function e0e1ReadAttrSources(world, entity) {
+  if(E0E1_RECORD_ONLY)return e0e1RecordAttrSources(world,entity);
   var out={};
   try {
     var hero=entity || (world.getFightHero && world.getFightHero()), comp=hero && hero.compAttributes;
@@ -911,6 +948,8 @@ function e0e1NewState(world, side, fromUi) {
     seed: (world && world.options && world.options.battleData && world.options.battleData.randomSeed),
     replay: world && world.__e0e1DamageReplay || null,
     bucket: 1,
+    initialAttributes: null,
+    diagnostics: {version:E0E1_PROBE_VERSION,counts:{},samples:[]},
     factorSnapshots: [], lastFactorSampleSecond: -1, factorRows: [], factorIndex: {}, factorSources: [], factorSourceIndex: {}, factorsTruncated: false,
     events: [],
     truncated: false,
@@ -927,6 +966,20 @@ function e0e1NewState(world, side, fromUi) {
     activeBranches: [],
     players: null
   };
+}
+
+// Freeze initialized hero attributes at the native Running transition, before
+// the battle clock or any skill damage. Never relabel a later sample as initial.
+function e0e1CaptureInitialAttributes(state,phase) {
+  if(!state || !state.world || state.initialAttributes)return;
+  var world=state.world,time=Number(world.battleTime && world.battleTime.battleTime)||0;
+  if(time>0 || state.eventCount>0){
+    state.initialAttributes={status:'missed',reason:'采集器未在战斗开始前取得属性快照',time:time};return;
+  }
+  var attrs=e0e1ReadHeroAttrs(world);
+  if(!Object.keys(attrs).length)return;
+  state.initialAttributes={status:'captured',time:time,phase:phase,attributes:attrs,
+    attrMeta:e0e1AttrMeta(),context:e0e1ReadAttrContext(world)};
 }
 
 function e0e1Bump(map, key, dmg, isCrit) {
@@ -976,6 +1029,7 @@ function e0e1Classify(skillId, state) {
 }
 
 function e0e1MakeHandler(state) {
+  if(E0E1_RECORD_ONLY)return e0e1RecordHandler(state);
   return function (source, skillId, damage, target, isCrit) {
     if (!state || !state.world) return;
     var dmg = Number(damage) || 0;
@@ -985,7 +1039,8 @@ function e0e1MakeHandler(state) {
       t = state.world.battleTime.battleTime || 0;
     } catch (error) {}
     var info = e0e1Classify(skillId, state);
-    try { e0e1RecordFactors(state,source,skillId,dmg,target,info,t); } catch(error) { E0E1_LAST_ERROR=String(error); }
+    e0e1Probe(state,'signal.'+info.cat,{skillId:Number(skillId),boss:!!(target && target.compBoss),damage:dmg,stackDepth:E0E1_DAMAGE_STACK.length});
+    try { e0e1RecordFactors(state,source,skillId,dmg,target,info,t); } catch(error) { E0E1_LAST_ERROR=String(error);e0e1Probe(state,'factor.exception',{skillId:Number(skillId),error:String(error.stack || error)}); }
     if(dmg===0) return;
     state.lastTime = Math.max(state.lastTime, t);
     state.eventCount += 1;
@@ -1097,27 +1152,30 @@ function e0e1MakeHandler(state) {
 // 不挂 calcDamage：它也会被伤害预估调用，不能把预估当成实际攻击。
 function e0e1PatchFactorCapture() {
   var owner=E0E1_CHARACTER && E0E1_CHARACTER.characterHelper;
-  if(!owner || typeof owner.subLife!=='function' || owner.subLife.__e0e1Factors) return;
+  if(!owner || typeof owner.subLife!=='function'){e0e1Probe(null,'hook.unavailable',e0e1ProbeModules());return;}
+  if(owner.subLife.__e0e1Factors)return;
   var original=owner.subLife;
   var wrapper=function(context) {
     var frame={context:context,snapshot:null};
     try {
       var state=E0E1_SIDES.self && E0E1_SIDES.self.world===context.battleWorld ? E0E1_SIDES.self :
         E0E1_SIDES.other && E0E1_SIDES.other.world===context.battleWorld ? E0E1_SIDES.other : null;
+      e0e1Probe(state,'subLife.enter',{skillId:Number(context.skillId),worldId:context.battleWorld && context.battleWorld.instanceId,boss:!!(context.target && context.target.compBoss),multiplier:!!context.multiplier,sourceAttr:!!context.sourceAttr,targetAttr:!!context.targetAttr});
       if(state && context.target && context.target.compBoss && state.factorRows.length<12000) frame.snapshot=e0e1FactorInputs(context);
-    } catch(error) { E0E1_LAST_ERROR=String(error); }
+    } catch(error) { E0E1_LAST_ERROR=String(error);e0e1Probe(state,'subLife.snapshot_exception',{error:String(error.stack || error)}); }
     E0E1_DAMAGE_STACK.push(frame);
     try {
       var result=original.apply(this,arguments);
       // 免伤可能在广播采集信号前返回0；补记该结算，不加入伤害事件/总伤害。
       if(frame.snapshot && !frame.recorded && e0e1AttrNumber(result)===0 && frame.snapshot.settlement.inputDamage>0){
-        try {e0e1RecordFactors(state,context.source,context.skillId,0,context.target,e0e1Classify(context.skillId,state),state.world.battleTime.battleTime || 0);}
+        try {e0e1RecordFactors(state,context.source,context.skillId,0,context.target,E0E1_RECORD_ONLY ? null : e0e1Classify(context.skillId,state),state.world.battleTime.battleTime || 0);}
         catch(error){E0E1_LAST_ERROR=String(error);}
       }
       return result;
     } finally { E0E1_DAMAGE_STACK.pop(); }
   };
   wrapper.__e0e1Factors=true;owner.subLife=wrapper;
+  e0e1Probe(null,'hook.installed',e0e1ProbeModules());
   E0E1_PATCHES.push({owner:owner,key:'subLife',original:original,wrapper:wrapper});
 }
 
@@ -1236,44 +1294,68 @@ function e0e1ReadSettlement(ctx){
     ignoreArmor:!!ctx.ignoreArmor,reallyDamage:!!ctx.reallyDamage};
 }
 
-function e0e1FactorInputs(ctx) {
-  var inputs={self:{},target:{}};
-  E0E1_ATTR_KEYS.forEach(function(meta){
-    if(ctx.sourceAttr && ctx.sourceAttr.get) inputs.self[meta.key]=e0e1AttrNumber(ctx.sourceAttr.get(meta.key));
-    if(ctx.targetAttr && ctx.targetAttr.get) inputs.target[meta.key]=e0e1AttrNumber(ctx.targetAttr.get(meta.key));
-  });
+function e0e1FactorInputs(ctx, sampleCache) {
+  if(E0E1_RECORD_ONLY)return e0e1RecordInputs(ctx);
+  // Cache only within one synchronous per-second sampling pass. Actual hits
+  // never use this cache: buffs/shields can change between hits in the same frame.
+  function memo(map,key,read) {
+    if(!map)return read();
+    if(!map.has(key))map.set(key,read());
+    return map.get(key);
+  }
+  function attrs(group) {
+    return memo(sampleCache && sampleCache.attrs,group,function(){
+      var values={};
+      E0E1_ATTR_KEYS.forEach(function(meta){
+        if(group && group.get)values[meta.key]=e0e1AttrNumber(group.get(meta.key));
+      });
+      return values;
+    });
+  }
+  function sources(entity) {
+    return memo(sampleCache && sampleCache.sources,entity,function(){return e0e1ReadAttrSources(ctx.battleWorld,entity);});
+  }
+  var inputs={self:attrs(ctx.sourceAttr),target:attrs(ctx.targetAttr)};
   var hero=ctx.battleWorld.getFightHero && ctx.battleWorld.getFightHero();
   var entity=hero && hero.compAttributes && hero.compAttributes.attributes===ctx.sourceAttr ? hero : ctx.source;
   var matches=entity && entity.compAttributes && entity.compAttributes.attributes===ctx.sourceAttr;
   var context=e0e1ReadAttrContext(ctx.battleWorld),life=ctx.target && ctx.target.compLife;
   if(life && e0e1AttrNumber(life.max)>0) context.targetHpRatio=e0e1AttrNumber(life.current)/e0e1AttrNumber(life.max);
-  return {inputs:inputs,settlement:e0e1ReadSettlement(ctx),provenance:{self:matches ? e0e1ReadAttrSources(ctx.battleWorld,entity) : {},target:e0e1ReadAttrSources(ctx.battleWorld,ctx.target),targetBuffs:e0e1ReadBossBuffs(ctx.target)},
+  return {inputs:inputs,settlement:e0e1ReadSettlement(ctx),provenance:{self:matches ? sources(entity) : {},target:sources(ctx.target),targetBuffs:memo(sampleCache && sampleCache.buffs,ctx.target,function(){return e0e1ReadBossBuffs(ctx.target);})},
     context:context};
 }
 
 // 按秒只读计算：仅调用 calcDmgRate，它只写入新建的本地乘区对象。
 // 不调用 createSkillContext/calcDamage/暴击判定，不消耗战斗随机数或执行技能效果。
 function e0e1SampleFormulaState(state){
+  if(E0E1_RECORD_ONLY)return; // Never execute a second, hypothetical damage calculation.
   var mods=E0E1_FORMULA_MODULES,world=state.world;
-  if(!mods || !mods.damage || !mods.skill || !mods.decimal || !world)return;
+  if(!mods || !mods.damage || !mods.skill || !mods.decimal || !world){e0e1Probe(state,'snapshot.modules_missing',e0e1ProbeModules());return;}
   var time=Number(world.battleTime && world.battleTime.battleTime)||0,sec=Math.floor(time);
   if(state.lastFactorSampleSecond===sec || state.factorSnapshots.length>=12000)return;
   var hero=world.getFightHero && world.getFightHero(),battleContext=world.sceneEntity && world.sceneEntity.battleContext;
   var enemies=battleContext && battleContext.awakenedEnemies || [];
   var target=enemies.find(function(entity){return entity && entity.isValid!==false && entity.compBoss && entity.compAttributes;});
-  if(!hero || !target || !hero.compAttributes)return;
+  if(!hero || !target || !hero.compAttributes){e0e1Probe(state,'snapshot.target_or_hero_missing',{hero:!!hero,heroAttrs:!!(hero && hero.compAttributes),enemies:enemies.length,bosses:enemies.filter(function(e){return !!(e && e.compBoss);}).length,target:!!target});return;}
   state.lastFactorSampleSecond=sec;
   var actors=[hero];
   ['getFightPet','getFightMagicWeapon'].forEach(function(method){var actor=world[method] && world[method]();if(actor && actors.indexOf(actor)<0)actors.push(actor);});
   var decimal=mods.decimal.DecimalNumber,zero=decimal && decimal.ZERO;
-  if(!zero)return;
+  if(!zero){e0e1Probe(state,'snapshot.decimal_zero_missing');return;}
+  var sampleCache={attrs:new Map(),sources:new Map(),buffs:new Map()};
   actors.forEach(function(actor){
     var recipes=actor.compSkillAssistant && actor.compSkillAssistant.allSkills;
-    if(!recipes || !recipes.forEach)return;
+    if((state.diagnostics.counts['snapshot.actor'] || 0)<2)e0e1Probe(state,'snapshot.actor',{actorId:actor.uuid,assistantKeys:Object.keys(actor.compSkillAssistant || {}).slice(0,24).join(','),recipeCount:recipes && (recipes.size===undefined?recipes.length:recipes.size)});
+    if(!recipes || !recipes.forEach){e0e1Probe(state,'snapshot.recipes_missing',{actorId:actor.uuid});return;}
     recipes.forEach(function(recipe){
       var cfg=recipe.cfg || e0e1CfgRow('SkillCfg',recipe.skillId);
-      if(!cfg || [1,2,3].indexOf(cfg.type)<0 || state.factorSnapshots.length>=12000)return;
-      var info=e0e1Classify(cfg.id,state);if(['monster','flag','other','desire','store'].indexOf(info.cat)>=0)return;
+      if(!cfg || state.factorSnapshots.length>=12000){e0e1Probe(state,cfg?'snapshot.limit':'snapshot.cfg_missing',{skillId:Number(recipe.skillId)});return;}
+      var info=e0e1Classify(cfg.id,state);
+      e0e1Probe(state,'recipe.'+info.cat,{skillId:Number(cfg.id),type:cfg.type,sft:cfg.skillFunctionType,bookId:cfg.bookId});
+      if(['monster','flag','other','desire','store'].indexOf(info.cat)>=0){e0e1Probe(state,'snapshot.category_filtered',{skillId:Number(cfg.id),category:info.cat});return;}
+      // Native passive/triggered books use type 4. Restricting this to 1/2/3
+      // dropped every book snapshot even when their damage events were present.
+      if([1,2,3].indexOf(cfg.type)<0 && info.cat!=='book' && info.cat!=='card'){e0e1Probe(state,'snapshot.type_filtered',{skillId:Number(cfg.id),category:info.cat,type:cfg.type});return;}
       try{
         var share=Object.create(mods.skill.SkillContextShareData.prototype);
         share.world=world;share.source=actor;share.skillCfg=cfg;share.skillRecipe=recipe;
@@ -1284,7 +1366,7 @@ function e0e1SampleFormulaState(state){
           var type=mods.hero && mods.hero[name],component=type && actor.getComponent && actor.getComponent(type);
           if(component && component.owner && (name!=='CompSummon' || component.config && component.config.attrInherit===1))ctx.sourceAttr=component.owner.compAttributes.attributes;
         });
-        if(!ctx.sourceAttr || !ctx.targetAttr)return;
+        if(!ctx.sourceAttr || !ctx.targetAttr){e0e1Probe(state,'snapshot.attributes_missing',{skillId:Number(cfg.id),source:!!ctx.sourceAttr,target:!!ctx.targetAttr});return;}
         ctx.multiplier={};['baseCoeff','dmgAddRate','elementAddRate','hpDmgAddRate','skillTypeAddRate','dmgTypeRate','attackDmgRate','finalDmgRate','pvpDmgRate'].forEach(function(key){ctx.multiplier[key]=zero;});
         ctx.atk=ctx.sourceAttr.get(1);ctx.isCrit=false;ctx.isSkillCrit=false;ctx.isSpCrit=false;ctx.isMobsBoss=true;
         ctx.calcDmgRate();
@@ -1293,7 +1375,7 @@ function e0e1SampleFormulaState(state){
           targetType:num(mul.dmgTypeRate),hp:num(mul.hpDmgAddRate),skillType:num(mul.skillTypeAddRate),attackBonus:num(mul.attackDmgRate),
           pvp:Math.max(.5,1+(num(mul.pvpDmgRate)||0)),final:Math.max(.25,1+(num(mul.finalDmgRate)||0)),crit:1,skillCrit:1};
         factors.type=1+factors.targetType+factors.hp+factors.skillType+factors.attackBonus;
-        var snapshot=e0e1FactorInputs(ctx),context=snapshot.context;
+        var snapshot=e0e1FactorInputs(ctx,sampleCache),context=snapshot.context;
         if(state.battleType===20 || state.battleType===27){
           factors.season=1+(snapshot.inputs.self[200103] || 0)-(snapshot.inputs.target[200104] || 0);factors.spCrit=1;
           if(state.battleType===20 && context.stamina){factors.staminaSkill=context.stamina.skillDamage;factors.staminaFinal=context.stamina.finalDamage;}
@@ -1305,16 +1387,19 @@ function e0e1SampleFormulaState(state){
           sampleKind:'second',formulaMode:'standard',factors:factors,inputs:snapshot.inputs,sourceRef:ref,context:context,
           parts:e0e1FactorParts(ctx,snapshot.inputs,factors,context)});
         state.lastTime=Math.max(state.lastTime,time);
-      }catch(error){E0E1_LAST_ERROR='每秒乘区快照：'+String(error);}
+        e0e1Probe(state,'snapshot.saved.'+info.cat,{skillId:Number(cfg.id),attack:factors.attack,damage:factors.damage,sourceKeys:Object.keys(snapshot.inputs.self).length,targetKeys:Object.keys(snapshot.inputs.target).length,sourceAttack:snapshot.inputs.self[1],sourceBook:snapshot.inputs.self[115],sourceAttackBonus:snapshot.inputs.self[708],sourceGetter:typeof ctx.sourceAttr.get,targetGetter:typeof ctx.targetAttr.get});
+      }catch(error){E0E1_LAST_ERROR='每秒乘区快照：'+String(error);e0e1Probe(state,'snapshot.exception.'+info.cat,{skillId:Number(cfg.id),error:String(error.stack || error)});}
     });
   });
 }
 
 function e0e1RecordFactors(state,source,skillId,damage,target,info,t) {
-  if(state.factorRows.length>=12000){state.factorsTruncated=true;return;}
+  if(E0E1_RECORD_ONLY)return e0e1RecordHit(state,source,skillId,damage,target,t);
+  if(state.factorRows.length>=12000){state.factorsTruncated=true;e0e1Probe(state,'factor.limit');return;}
   var frame=E0E1_DAMAGE_STACK[E0E1_DAMAGE_STACK.length-1],ctx=frame && frame.context;
-  if(!target || !target.compBoss || !ctx || ctx.battleWorld!==state.world || ctx.target!==target || Number(ctx.skillId)!==Number(skillId) || info.cat==='flag') return;
-  var mul=ctx.multiplier;if(!mul) return;
+  var reason=!target || !target.compBoss ? 'not_boss' : !ctx ? 'no_context' : ctx.battleWorld!==state.world ? 'world_mismatch' : ctx.target!==target ? 'target_mismatch' : Number(ctx.skillId)!==Number(skillId) ? 'skill_mismatch' : info.cat==='flag' ? 'flag' : null;
+  if(reason){e0e1Probe(state,'factor.skip.'+reason+'.'+info.cat,{skillId:Number(skillId),category:info.cat,contextSkill:ctx && Number(ctx.skillId),stackDepth:E0E1_DAMAGE_STACK.length,worldId:state.instanceId,contextWorld:ctx && ctx.battleWorld && ctx.battleWorld.instanceId});return;}
+  var mul=ctx.multiplier;if(!mul){e0e1Probe(state,'factor.skip.no_multiplier',{skillId:Number(skillId),category:info.cat});return;}
   frame.recorded=true;
   state.lastTime=Math.max(state.lastTime,t);
   var cfg=e0e1CfgRow('SkillCfg',skillId), group=cfg && cfg.type===1 ? 'attack' : info.cat==='book' ? 'book' : 'skill';
@@ -1363,6 +1448,7 @@ function e0e1RecordFactors(state,source,skillId,damage,target,info,t) {
     state.factorIndex[identity]={signature:key,row:row};state.factorRows.push(row);
   }
   row.lastT=t;row.hits++;row.damage+=damage;
+  e0e1Probe(state,'factor.saved.'+info.cat,{skillId:Number(skillId),group:group,attack:factors.attack,damage:factors.damage,sourceKeys:Object.keys(inputs.self).length,targetKeys:Object.keys(inputs.target).length,sourceAttack:inputs.self[1],sourceBook:inputs.self[115],sourceAttackBonus:inputs.self[708],sourceGetter:typeof ctx.sourceAttr.get,targetGetter:typeof ctx.targetAttr.get});
 }
 
 // ── 挂接 / 摘除 ──
@@ -1396,6 +1482,10 @@ function e0e1TryAttachWorld(world) {
   state.players = players;
   var handler = e0e1MakeHandler(state);
   sig.add(handler, null);
+  var runningHandler=function(){e0e1CaptureInitialAttributes(state,'battle_running');};
+  var runningSig=world.battleSignal.battleRunningSignal;
+  if(runningSig && typeof runningSig.add==='function')runningSig.add(runningHandler,null);
+  else if(runningSig && typeof runningSig.on==='function')runningSig.on(runningHandler,null);
   // 分数采样挂战斗内时钟，不能只靠实时定时器：
   // 好友切磋「跳过」会把整场在一次同步调用里跑完（46623），实时定时器插不进去，
   // 曲线会塌成一个点。timeBattleTickSignal 在 world.update() 内部触发，快进时每步都发。
@@ -1405,10 +1495,11 @@ function e0e1TryAttachWorld(world) {
     tickHandler = function () { e0e1SamplePvp(); };
     tickSig.add(tickHandler, null);
   }
-  E0E1_HOOKS.push({ world: world, handler: handler, tickHandler: tickHandler,
+  E0E1_HOOKS.push({ world: world, handler: handler, tickHandler: tickHandler,runningHandler:runningHandler,
                     state: state, side: side });
   if (state.replay || side === "self" || e0e1PairKey(state)) e0e1ResetPvpIfNewBattle(state);
   E0E1_SIDES[side] = state;
+  e0e1Probe(state,'world.attached',{instanceId:state.instanceId,battleType:state.battleType,replay:!!state.replay,runningSignal:!!runningSig,initialTime:Number(world.battleTime && world.battleTime.battleTime)||0});
   return true;
 }
 
@@ -1534,7 +1625,7 @@ function e0e1PatchBattleManager() {
 function e0e1AttachAll() {
   E0E1_REPLAY_CONTEXTS=E0E1_REPLAY_CONTEXTS.filter(function(context){
     var controller=context.controller,worlds=[controller.selfBattleWorld,controller.otherBattleWorld].filter(Boolean);
-    return !worlds.length || worlds.some(function(world){return !world.isQuitted;});
+    return worlds.some(function(world){return !world.isQuitted;});
   });
   if (!E0E1_BM_PATCHED) e0e1PatchBattleManager();
   // 候选 = createBattle 钩到的 + getBattles() 里现存的
@@ -1563,9 +1654,10 @@ function e0e1AttachAll() {
         var tsig = dead.world.battleSignal && dead.world.battleSignal["timeBattleTickSignal"];
         if (tsig && typeof tsig.remove === "function") tsig.remove(dead.tickHandler, null);
       }
+      e0e1RemoveInitialListener(dead);
     } catch (error) {}
     // 保留报告的纯数据，释放已退出 World 对场景、实体和纹理的强引用。
-    if(dead.state && dead.world && dead.world.isQuitted)dead.state.world=null;
+    if(dead.state)dead.state.world=null;
     E0E1_HOOKS.splice(k, 1);
   }
 }
@@ -1579,12 +1671,20 @@ function e0e1DetachAll() {
         var tsig = E0E1_HOOKS[i].world.battleSignal && E0E1_HOOKS[i].world.battleSignal["timeBattleTickSignal"];
         if (tsig && typeof tsig.remove === "function") tsig.remove(E0E1_HOOKS[i].tickHandler, null);
       }
+      e0e1RemoveInitialListener(E0E1_HOOKS[i]);
     } catch (error) {}
   }
   E0E1_HOOKS = [];
   E0E1_WATCHED = [];
   E0E1_SIDES = { self: null, other: null };
   E0E1_PVP = { cfg: null, samples: [], attrSeconds: [], lastSecond: -1, battleType: null, skipped: false, instanceKey: null };
+}
+
+function e0e1RemoveInitialListener(hook) {
+  var signal=hook.world && hook.world.battleSignal && hook.world.battleSignal.battleRunningSignal;
+  if(!signal || !hook.runningHandler)return;
+  if(typeof signal.remove==='function')signal.remove(hook.runningHandler,null);
+  else if(typeof signal.off==='function')signal.off(hook.runningHandler,null);
 }
 
 // ── 输出 ──
@@ -1803,6 +1903,9 @@ function e0e1CollectSide(state) {
   return {
     side: state.side,
     replay: state.replay,
+    initialAttributes: state.initialAttributes,
+    diagnostics: {version:E0E1_PROBE_VERSION,counts:state.diagnostics.counts,samples:state.diagnostics.samples,
+      modules:e0e1ProbeModules(),runtime:E0E1_PROBE_RUNTIME},
     players: state.players,
     perSecondTop: perSecondTop,
     perSecondBossTop: perSecondBossTop,
@@ -1889,11 +1992,13 @@ function e0e1Collect() {
   };
 }
 
-function damageCurveJson() {
+function damageCurveJson(cursor) {
+  if(E0E1_RECORD_ONLY)return e0e1RecordingPacket(cursor);
   return e0e1Collect();
 }
 
 function damageCurveText(width) {
+  if(E0E1_RECORD_ONLY)return '原始数据采集中；统计和图表请在 Python 软件的伤害报告中查看。';
   var data = e0e1Collect();
   if (!data.self && !data.other) return "尚未挂上战斗 World（还没进战斗？）";
   width = width || 60;
@@ -1991,6 +2096,7 @@ function e0e1SideText(side, title, width) {
 }
 
 function damageCurveCsv() {
+  if(E0E1_RECORD_ONLY)return '请在 Python 软件中导出伤害报告 CSV。';
   var data = e0e1Collect();
   var rows = ["side,t_sec,skill_id,skill_name,category,kind,origin,book_id,book_name,branch_id,branch_name,branch_level,element,damage,is_crit,is_boss,is_elite"];
   var sides = [["self", data.self], ["other", data.other]];
@@ -2034,13 +2140,16 @@ function damageCurveStatus() {
       battleType: st.battleType,
       eventCount: st.eventCount,
       duration: st.lastTime,
-      totalDamage: st.total.__total ? st.total.__total.dmg : 0,
+      totalDamage: E0E1_RECORD_ONLY ? null : (st.total.__total ? st.total.__total.dmg : 0),
       factorRows: st.factorRows.length, factorSnapshots: st.factorSnapshots.length, factorSources: st.factorSources.length,
       rawEvents: st.events.length, activeBranches: st.activeBranches.length
     } : null;
   });
   return {
     hooked: E0E1_HOOKS.length,
+    recordOnly:E0E1_RECORD_ONLY,
+    probeVersion:E0E1_PROBE_VERSION,
+    probeModules:e0e1ProbeModules(),
     running: !!E0E1_TIMER,
     mode: (E0E1_SIDES.self && E0E1_SIDES.other) ? "pvp" : "single",
     sides: sides,
@@ -2055,6 +2164,7 @@ function damageCurveStatus() {
 // 技能来源反查结果：按「类别 → 来源」汇总，用来确认某一档伤害到底出自哪个系统。
 // 例如 15/16 那一档枚举名叫 EQUIPMENT_*，到底是脸谱套装还是法器宝石，看这个就知道。
 function damageCurveOrigins() {
+  if(E0E1_RECORD_ONLY)return '技能来源由 Python 软件离线分析。';
   var data = e0e1Collect();
   var lines = [];
   ["self", "other"].forEach(function (sideKey) {
@@ -2091,6 +2201,11 @@ function damageCurveOrigins() {
 // 采不到数据时先用这个定位：脚本在不在、World 挂没挂、分数采到几个
 function damageCurveDebug() {
   var report = {
+    recordOnly:E0E1_RECORD_ONLY,
+    probeVersion:E0E1_PROBE_VERSION,
+    probeModules:e0e1ProbeModules(),
+    probeRuntime:E0E1_PROBE_RUNTIME,
+    diagnostics:{self:E0E1_SIDES.self && E0E1_SIDES.self.diagnostics,other:E0E1_SIDES.other && E0E1_SIDES.other.diagnostics},
     scriptLoaded: true,
     timerRunning: !!E0E1_TIMER,
     cfgLoaded: !!E0E1_CFG,
@@ -2137,6 +2252,7 @@ function damageCurveDebug() {
 }
 
 function damageCurveReset() {
+  E0E1_RECORD_STREAM=e0e1NextRecordingStream();
   e0e1DetachAll();
   e0e1AttachAll();
   return "已清空" + (E0E1_HOOKS.length ? "，重新挂上 " + E0E1_HOOKS.length + " 个 World" : "（当前无战斗 World）");
@@ -2161,11 +2277,129 @@ function damageCurveStop() {
 }
 
 // 可选诊断仅在手动启用 e0e1Perf 时计时，不保存参数或战斗对象。
-var e0e1SampleFormulaOriginal=e0e1SampleFormulaState,e0e1RecordFactorsOriginal=e0e1RecordFactors;
+var e0e1SampleFormulaOriginal=e0e1SampleFormulaState,e0e1RecordFactorsOriginal=e0e1RecordFactors,e0e1FactorInputsOriginal=e0e1FactorInputs;
+e0e1FactorInputs=function(){var p=globalThis.e0e1Perf;return p?p.measure('damage.inputs.sync',e0e1FactorInputsOriginal,this,arguments):e0e1FactorInputsOriginal.apply(this,arguments);};
 e0e1SampleFormulaState=function(){var p=globalThis.e0e1Perf;return p?p.measure('damage.snapshot.sync',e0e1SampleFormulaOriginal,this,arguments):e0e1SampleFormulaOriginal.apply(this,arguments);};
 e0e1RecordFactors=function(){var p=globalThis.e0e1Perf;return p?p.measure('damage.factors.sync',e0e1RecordFactorsOriginal,this,arguments):e0e1RecordFactorsOriginal.apply(this,arguments);};
 
 // ── 轮询挂接 ──
+
+// Recording protocol: scalar copies only, append-only hit/event arrays. No
+// classification, statistics, formula execution, hashing or chart construction.
+function e0e1RecordCatalog(){
+  var out={},fields=['id','name','Name','cfgName','title','note','skillFunctionType','bookId','sourceBookId','elementalType','type',
+    'skillId','evolutionId','skillLevel','evolutionPath','skillBookBelong','nodeName','_properties','skill','attackSkill',
+    'pveSkill','pvpSkill','c_item_itemId','evolutionSkillId','_passive','_active','_emitters','bulletIds'];
+  var tables=['SkillCfg','SkillBookCfg','SkillBookEvolutionCfg','EvolutionSkillCfg','ItemCfg','PassiveSkillCfg','ActiveSkillCfg','EmitterCfg','BulletCfg','BuffCfg'];
+  E0E1_ORIGIN_SOURCES.forEach(function(source){if(tables.indexOf(source.table)<0)tables.push(source.table);});
+  tables.forEach(function(name){
+    out[name]=((E0E1_CFG && E0E1_CFG[name] && E0E1_CFG[name].list)||[]).map(function(row){
+      var copy={};fields.forEach(function(key){if(row[key]!==undefined)copy[key]=row[key];});
+      Object.keys(row).forEach(function(key){if(/^_.*[Ee]ffects$/.test(key))copy[key]=row[key];});
+      if(row.itemId && row.itemId.name)copy.itemName=row.itemId.name;
+      return copy;
+    });
+  });
+  return out;
+}
+function e0e1RecordAttrSources(world,entity){
+  var hero=entity || (world.getFightHero && world.getFightHero()),comp=hero && hero.compAttributes;
+  var values=comp && comp.attributes && comp.attributes.attributes,out={raw:true,attributes:{},changes:[],buffs:[]};
+  function changes(group,descriptor){
+    var rows=[];function add(value,key){var n=e0e1AttrNumber(value);if(n!==null && n!==0)rows.push([Number(key),n]);}
+    if(group && group.forEach)group.forEach(add);
+    else if(group)Object.keys(group).forEach(function(key){add(group[key],key);});
+    if(rows.length){descriptor.values=rows;out.changes.push(descriptor);}
+  }
+  if(values && values.get)E0E1_ATTR_KEYS.forEach(function(meta){
+    var attr=values.get(meta.key);if(!attr)return;
+    out.attributes[meta.key]={base:e0e1AttrNumber(attr.baseValue),scale:e0e1AttrNumber(attr.addScaleValue),
+      absolute:e0e1AttrNumber(attr.addAbsoluteValue),total:e0e1AttrNumber(comp.get(meta.key))};
+  });
+  var recipes=hero && hero.compSkillAssistant && hero.compSkillAssistant.allSkills;
+  if(recipes && recipes.forEach)recipes.forEach(function(recipe){changes(recipe.changeAttributes,{kind:'skill',skillId:recipe.skillId || (recipe.cfg && recipe.cfg.id)});});
+  ((hero && hero.compBuffAssistant && hero.compBuffAssistant.buffs)||[]).forEach(function(buff){
+    if(buff.isFinish)return;
+    var cfg=buff.cfg || {},share=buff.skillContext && buff.skillContext.shareData,skill=share && share.skillCfg;
+    var descriptor={kind:'buff',id:cfg.id,name:cfg.name || cfg.note,piles:buff.piles,skillId:skill && skill.id};
+    changes(buff.changeAttributes,Object.assign({},descriptor));
+    (buff.endCond||[]).forEach(function(cond){changes(cond.applied,Object.assign({state:true},descriptor));});
+    out.buffs.push({id:cfg.id,name:cfg.name || cfg.note,piles:buff.piles,skillId:skill && skill.id,
+      sourceName:share && share.source && share.source.name,time:buff.time,timeMax:buff.timeMax,tag:cfg.tag});
+  });
+  return out;
+}
+function e0e1RecordInputs(ctx){
+  function attrs(group){var out={};E0E1_ATTR_KEYS.forEach(function(meta){if(group && group.get)out[meta.key]=e0e1AttrNumber(group.get(meta.key));});return out;}
+  var hero=ctx.battleWorld.getFightHero && ctx.battleWorld.getFightHero();
+  var entity=hero && hero.compAttributes && hero.compAttributes.attributes===ctx.sourceAttr ? hero : ctx.source;
+  var matches=entity && entity.compAttributes && entity.compAttributes.attributes===ctx.sourceAttr;
+  var life=ctx.target && ctx.target.compLife,context=e0e1ReadAttrContext(ctx.battleWorld);
+  context.targetHpCurrent=e0e1AttrNumber(life && life.current);context.targetHpMax=e0e1AttrNumber(life && life.max);
+  return {inputs:{self:attrs(ctx.sourceAttr),target:attrs(ctx.targetAttr)},context:context,
+    settlement:e0e1ReadSettlement(ctx),provenance:{self:matches ? e0e1RecordAttrSources(ctx.battleWorld,entity) : {},
+      target:e0e1RecordAttrSources(ctx.battleWorld,ctx.target)}};
+}
+function e0e1RecordHit(state,source,skillId,damage,target,t){
+  if(state.factorRows.length>=12000){state.factorsTruncated=true;return;}
+  var frame=E0E1_DAMAGE_STACK[E0E1_DAMAGE_STACK.length-1],ctx=frame && frame.context;
+  if(!target || !target.compBoss || !ctx || ctx.battleWorld!==state.world || ctx.target!==target || Number(ctx.skillId)!==Number(skillId) || !ctx.multiplier)return;
+  frame.recorded=true;
+  var snapshot=frame.snapshot || e0e1RecordInputs(ctx),mul={};
+  ['baseCoeff','dmgAddRate','elementAddRate','hpDmgAddRate','skillTypeAddRate','dmgTypeRate','attackDmgRate','finalDmgRate','pvpDmgRate'].forEach(function(key){mul[key]=e0e1AttrNumber(ctx.multiplier[key]);});
+  var share=ctx.skillContext && ctx.skillContext.shareData,pairs={};
+  ['getElementAttrType','getElementAttrTypeSpecialSkill','getQualityAttrTypeSpecialSkill'].forEach(function(key){if(share && typeof share[key]==='function')pairs[key]=share[key]();});
+  var fly=E0E1_TYPE_COMPONENTS && E0E1_TYPE_COMPONENTS.CompFly;
+  var hit={t:t,skillId:Number(skillId),damage:damage,sourceId:source && source.uuid,sourceName:source && source.name,
+    targetId:target.uuid,targetName:target.name,boss:true,monster:!!target.compMonster,
+    fly:!!(fly && target.getComponent && target.getComponent(fly)),pairs:pairs,
+    attack:e0e1AttrNumber(ctx.atk),multiplier:mul,isCrit:!!ctx.isCrit,isSkillCrit:!!ctx.isSkillCrit,
+    critPwr:e0e1AttrNumber(ctx.critPwr),skillCritPwr:e0e1AttrNumber(ctx.skillCritPwr),
+    isSpCrit:!!ctx.isSpCrit,hitCount:ctx.skillContext && ctx.skillContext.effectParams && ctx.skillContext.effectParams.hitCount,
+    spCritAoeLimit:E0E1_BATTLE_CONST && E0E1_BATTLE_CONST.BattleConst && E0E1_BATTLE_CONST.BattleConst.SPCRIT_AOE_HIT_COUNT,
+    trueDamage:!!ctx.reallyDamage,seckill:!!ctx.isSeckill,inputs:snapshot.inputs,context:snapshot.context,
+    provenance:snapshot.provenance,settlement:snapshot.settlement};
+  hit.settlement.actualDamage=damage;hit.settlement.shieldAfter=e0e1AttrNumber(target.compArmor && target.compArmor.current);
+  state.factorRows.push(hit);state.lastTime=Math.max(state.lastTime,t);
+}
+function e0e1RecordHandler(state){
+  return function(source,skillId,damage,target,isCrit){
+    if(!state || !state.world)return;
+    var dmg=Number(damage)||0;if(dmg<0)return;
+    var t=Number(state.world.battleTime && state.world.battleTime.battleTime)||0;
+    try{e0e1RecordHit(state,source,skillId,dmg,target,t);}catch(error){E0E1_LAST_ERROR=String(error);e0e1Probe(state,'record.exception',{error:String(error)});}
+    if(dmg===0)return;
+    state.lastTime=Math.max(state.lastTime,t);state.eventCount++;
+    if(state.events.length>=E0E1_RAW_LIMIT){state.truncated=true;return;}
+    state.events.push({t:t,skill:Number(skillId),dmg:dmg,crit:!!isCrit,boss:!!(target && target.compBoss),
+      elite:!!(target && target.compElite),self:!!(source && source.compCampFriend)});
+  };
+}
+function e0e1RecordingPacket(cursor){
+  cursor=cursor || {};var same=cursor.stream===E0E1_RECORD_STREAM,out={recordingSchema:1,stream:E0E1_RECORD_STREAM,
+    mode:E0E1_SIDES.self && E0E1_SIDES.other ? 'pvp' : 'single',attrMeta:e0e1AttrMeta()};
+  if(!same || cursor.includeCatalog!==false)out.catalog=E0E1_RECORD_CATALOG || e0e1RecordCatalog();
+  ['self','other'].forEach(function(key){
+    var state=E0E1_SIDES[key];if(!state){out[key]=null;return;}
+    var previous=same && cursor.pair===E0E1_PVP.instanceKey && cursor[key] && cursor[key].instanceId===state.instanceId ? cursor[key] : {};
+    var eventStart=Math.min(Math.max(0,Number(previous.events)||0),state.events.length);
+    var hitStart=Math.min(Math.max(0,Number(previous.hits)||0),state.factorRows.length);
+    out[key]={side:key,replay:state.replay,instanceId:state.instanceId,battleType:state.battleType,
+      battleTypeName:E0E1_BATTLE_TYPE_NAMES[state.battleType] || null,seed:state.seed,duration:state.lastTime,
+      bucketSeconds:state.bucket,eventCount:state.eventCount,truncated:state.truncated,factorsTruncated:state.factorsTruncated,
+      initialAttributes:state.initialAttributes,players:state.players,activeBranches:state.activeBranches,
+      diagnostics:{version:E0E1_PROBE_VERSION,counts:state.diagnostics.counts,samples:state.diagnostics.samples,modules:e0e1ProbeModules()},
+      eventStart:eventStart,hitStart:hitStart,events:state.events.slice(eventStart),hits:state.factorRows.slice(hitStart)};
+  });
+  var pvpSame=same && cursor.pair===E0E1_PVP.instanceKey;
+  // The last native score sample can be corrected by forceFinal after detach.
+  var start=pvpSame ? Math.max(0,Math.min(Number(cursor.samples)||0,E0E1_PVP.samples.length)-1) : 0;
+  var attrs=pvpSame ? Math.max(0,Math.min(Number(cursor.attrs)||0,E0E1_PVP.attrSeconds.length)) : 0;
+  var cfg=E0E1_PVP.cfg || {},copy={};['PVPInitScore','PVPInitVariable','PVPBaseBonus','PVPLimitTime','PVPWinRate'].forEach(function(key){copy[key]=cfg[key];});
+  out.pvp={instanceKey:E0E1_PVP.instanceKey,battleType:E0E1_PVP.battleType,cfg:copy,skipped:!!E0E1_PVP.skipped,
+    sampleStart:start,attrStart:attrs,samples:E0E1_PVP.samples.slice(start),attrSeconds:E0E1_PVP.attrSeconds.slice(attrs)};
+  return out;
+}
 
 function e0e1Tick() {
   try {
@@ -2179,6 +2413,7 @@ function e0e1Tick() {
 }
 
 async function e0e1Install() {
+  E0E1_RECORD_ONLY=true;E0E1_RECORD_CATALOG=null;E0E1_RECORD_STREAM=e0e1NextRecordingStream();
   var api = {
     damageCurveText: damageCurveText,
     damageCurveJson: damageCurveJson,
@@ -2201,7 +2436,7 @@ async function e0e1Install() {
 
   await e0e1LoadCfg();
   await e0e1LoadBattleManager();
-  E0E1_EVO = e0e1BuildEvoIndex();
+  E0E1_RECORD_CATALOG=e0e1RecordCatalog();
 
   var timer = game.setInterval || globalThis.setInterval;
   E0E1_TIMER = timer.call(game, e0e1Tick, 200);
@@ -2210,8 +2445,8 @@ async function e0e1Install() {
   return {
     ok: true,
     message: "伤害曲线采集已启动（PVP 会同时采我方与敌方两个 World）。进入好友切磋／斗法／血月对战自动开始，" +
-      "打完运行 damageCurveText() 看分数与伤害拆解。",
-    log: ""
+      "数据增量传给 Python 软件，在软件中查看分数、伤害拆解与图表。",
+    log: "伤害采集探针 " + E0E1_PROBE_VERSION + "：" + JSON.stringify(e0e1ProbeModules())
   };
 }
 
@@ -2226,7 +2461,7 @@ if (typeof globalThis.__e0e1RegisterRuntimeToggle === "function") {
     async enable() {
       var result = await e0e1Install();
       e0e1CurveEnabled = !!result.ok;
-      return { ok: true, enabled: e0e1CurveEnabled, message: result.message, log: "" };
+      return { ok: true, enabled: e0e1CurveEnabled, message: result.message, log: result.log || "" };
     },
     async disable() {
       var result = e0e1Uninstall();

@@ -48,6 +48,9 @@ class PluginRuntime(QObject):
                     widget.setEnabled(False)
         self.window.TARGET_APPID = self.target_appid
         self.record = {'id': 1, 'name': '遗弃之地插件管理器'}
+        if self.platform_name == '应用宝':
+            self.record.update(_channel='androws', _miniapp_debug_port=9422,
+                               _devtools_cdp_port=63000, name='遗弃之地插件管理器·应用宝')
         self.state = RuntimeState()
         self.session = GameSession(service, self.transport, self.state, record=self.record, process_ready=process_ready)
         if self.platform_name == '微信':
@@ -57,14 +60,28 @@ class PluginRuntime(QObject):
         self.damage = DamageFeature(self.transport, self.state, window.pages['damage'], window.store)
         self.desire = DesireFeature(self.transport, self.state, window.pages['desire'], window.store)
         self.season = SeasonFeature(self.transport, self.state, window.pages['bloodmoon'], window.store)
+        from .season_insight import SeasonInsightFeature
+        self.season_insight = SeasonInsightFeature(self.transport,self.state,window.pages['season_insight'],self.damage,
+            busy=lambda:self.automation.busy or self.desire.busy)
+        from .flag_upgrade import FlagUpgradeFeature
+        self.flag_upgrade = FlagUpgradeFeature(self.transport, self.state, window.pages['flag_upgrade'])
         self.legion=LegionFeature(self.transport,self.state,window.pages['legion'])
+        self.legion.scanner.set_auto_start(window.store.snapshot()['ui']['legion_scan_auto_start'])
+        window.store.changed.connect(lambda config: self.legion.scanner.set_auto_start(config['ui']['legion_scan_auto_start']))
+        self.legion.scanner.set_control_enabled(window.store.snapshot()['ui']['legion_scan_enabled'])
+        window.store.changed.connect(lambda config: self.legion.scanner.set_control_enabled(config['ui']['legion_scan_enabled']))
         from .player_pvp import PlayerPvpHistory
         self.player_pvp=PlayerPvpHistory(window.store.path.with_name('legion_scan.sqlite3'),
-            'wechat' if self.platform_name=='微信' else 'douyin')
+            {'微信':'wechat', '抖音':'douyin', '应用宝':'androws'}.get(self.platform_name, 'douyin'))
         self.auction=AuctionFeature(self.transport,self.state,window.pages['auction']) if 'auction' in window.pages and not build_info().is_release else None
         self._closed = asyncio.Event()
         self._poll_lock = asyncio.Lock()
         self._poll_job = None
+        self._controls_job = None
+        self._controls_applied = None
+        self._controls_lock = asyncio.Lock()
+        self._next_controls_sync = 0.0
+        self._overlay_session = None
         self._shutdown_job = None
         self._handshake_job = None   # 后台登录上报；纯上报，失败不影响使用
         self._next_overlay_sync = 0.0
@@ -181,8 +198,10 @@ class PluginRuntime(QObject):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        if self.blank_recovery is not None:
-            active = self.automation.running or self.automation.busy or self.desire.busy
+        if self._controls_job is None or self._controls_job.done():
+            self._controls_job = loop.create_task(self._sync_optional_controls())
+        if self.blank_recovery is not None and self.window.store.snapshot()['ui'].get('blank_recovery', True):
+            active = bool(self.state.installed) or self.automation.running or self.automation.busy or self.desire.busy
             self.blank_recovery.observe(active)
             if self._recovery_job is None or self._recovery_job.done():
                 self._recovery_job = loop.create_task(self._check_blank_game(active))
@@ -215,7 +234,7 @@ class PluginRuntime(QObject):
         if self.automation.running:
             self.automation.set_automation(False)
         self.desire.request('stop')
-        self.window.action_label.setText('检测到断线白屏／黑屏，正在重新打开游戏')
+        self.window.action_label.setText('检测到持续白屏／黑屏，正在重新打开游戏')
         await reopen_wechat_game(before_open=self.session.prepare_reopen)
         self._mark_reopened()
 
@@ -287,6 +306,12 @@ class PluginRuntime(QObject):
         self.timer.setInterval(100 if state.get('bloodmoon', {}).get('enabled') else 1000)
         LOG.info('插件配置更新：总开关=%s，启用任务=%s，玩家信息=%s',state['daily']['enabled'],[k for k,v in state['daily']['tasks'].items() if v['enabled']],state['player']['enabled'])
         self.state.configured = None
+        self._next_overlay_sync = 0
+        self._next_controls_sync = 0
+        if not state['ui'].get('blank_recovery', True) and self.blank_recovery is not None:
+            if self._recovery_job and not self._recovery_job.done():self._recovery_job.cancel()
+            self.blank_recovery.candidate = None
+            self.blank_recovery.samples = 0
         if not state['daily']['enabled']:
             self.restart_resume.cancel('daily')
             # 全部任务被反选时自动化没有意义，按钮同步回到“开始”。
@@ -304,11 +329,58 @@ class PluginRuntime(QObject):
             self.restart_resume.cancel('pet_fodder')
         self.automation.begin(task_id, manual=True)
 
+    async def _sync_optional_controls(self):
+        """Apply off switches even while a daily command owns the action lock."""
+        if self._controls_lock.locked() or time.monotonic() < self._next_controls_sync:return
+        self._next_controls_sync = time.monotonic() + 1.0
+        async with self._controls_lock:
+            await self._apply_optional_controls()
+
+    async def _apply_optional_controls(self):
+        if not self.state.installed or self.state.closing or not self.transport.connected:return
+        config = self.window.store.snapshot()
+        async def apply(name, operation):
+            try:
+                await operation()
+                return True
+            except Exception as exc:
+                LOG.warning('后台开关清理未确认：%s；将重试：%s', name, exc)
+                return False
+        signature = (self.state.installed, config['ui']['game_overlays'], config['battle_assist'])
+        setter = getattr(self.transport, 'optional_controls', None)
+        if setter and signature != self._controls_applied:
+            if await apply('PVE辅助', lambda: setter(config)):
+                self._controls_applied = signature
+        config = self.window.store.snapshot()
+        if not config['treasure']['enabled']:
+            await apply('摸金', lambda: self.treasure.poll(config))
+        elif not config['treasure']['overlay'] and self.treasure._injected and self.treasure._overlay is not False:
+            if await apply('摸金标注', lambda: self.transport.treasure_overlay(False)):
+                self.treasure._overlay = False
+        config = self.window.store.snapshot()
+        if not config['damage']['enabled']:
+            await apply('伤害采集', lambda: self.damage.poll(config))
+        config = self.window.store.snapshot()
+        if not config['bloodmoon']['enabled']:
+            await apply('血月', lambda: self.season.poll(config))
+        elif self.season._injected and not config['bloodmoon']['stealth_mark']['enabled'] and self.season._marks:
+            await apply('血月标注', lambda: self.season._sync_marks(config['bloodmoon']))
+        if self.auction and not self.window.store.snapshot()['ui'].get('auction_poll', False):
+            await apply('拍卖', self.auction.poll)
+        await apply('日常浮层', self._sync_automation_overlay)
+
     async def _sync_automation_overlay(self):
         sync = getattr(self.transport, 'automation_overlay', None)
         if not sync or not self.state.installed or not self.transport.connected or time.monotonic() < self._next_overlay_sync:
             return
         self._next_overlay_sync = time.monotonic() + 1.0
+        enabled = self.window.store.snapshot()['ui'].get('automation_overlay', False)
+        if not enabled:
+            if self._overlay_session == self.state.installed:
+                await sync({'active': False, 'run_id': self.automation.run_id})
+                self._overlay_session = None
+            return
+        self._overlay_session = self.state.installed
         active = self.automation.active
         payload = {'run_id': self.automation.run_id,
                    'active': self.automation.running or self.automation.stopping,
@@ -379,18 +451,40 @@ class PluginRuntime(QObject):
             return
         async with self._poll_lock:
             try:
+                # Bloodmoon needs 50–100 ms target checks, not a full GUI/CDP
+                # refresh at that rate. Keep connection/configuration work at 1 Hz.
+                config = self.window.store.snapshot()
+                if self.season_insight.replay_job and not self.season_insight.replay_job.done():
+                    # Replay owns the temporary collector and game scene until
+                    # its final snapshot is saved; do not schedule game actions.
+                    return
+                now = time.monotonic()
+                if (config.get('bloodmoon', {}).get('enabled')
+                        and self.state.installed and not self.state.blocked
+                        and self.transport.connected
+                        and self._feature_ready_session == self.state.installed
+                        and not self.session.stale(self.state.epoch)
+                        and config == self.state.configured
+                        and now < getattr(self, '_next_full_poll', 0.0)):
+                    if not self.automation.busy:
+                        await self.season.poll(config)
+                        self.timer.setInterval(self.season.scan_interval_ms)
+                    return
+                self._next_full_poll = now + 1.0
                 if not getattr(self, '_startup_checked', True):
                     self._startup_checked = True
                     from .startup_launch import ensure_game_started
                     self.window.action_label.setText(f'正在检查{self.platform_name}游戏，未运行时自动打开')
-                    if self.platform_name != '微信':
+                    if self.platform_name not in ('微信', '应用宝'):
                         self.session.request_debug()
                     await ensure_game_started(self.platform_name,
-                        before_open=self.session.prepare_reopen if self.platform_name == '微信' else None)
+                        before_open=self.session.prepare_reopen if self.platform_name in ('微信', '应用宝') else None)
                     if self.state.closing:
                         return
                 self._observe_restart_tasks()
-                await self.memory_monitor.sample(self.transport,self.state.installed)
+                await self._sync_optional_controls()
+                if self.window.store.snapshot()['ui'].get('memory_poll', False):
+                    await self.memory_monitor.sample(self.transport,self.state.installed)
                 if self.wechat_reconnect and self.transport.connected and getattr(self.transport, 'context_id', None) is not None:
                     message = await self.wechat_reconnect.poll(self.window.store.snapshot()['ui'])
                     if message:
@@ -476,17 +570,31 @@ class PluginRuntime(QObject):
                     self._next_overlay_sync = 0.0
                     self._overlay_error = False
                     self._next_energy = 0.0
-                if self._startup_ready_session != self.state.installed:
+                startup_initial = self._startup_ready_session != self.state.installed
+                if startup_initial or time.monotonic() < getattr(self, '_startup_watch_until', 0):
                     cleanup = getattr(self.transport, 'dismiss_startup', None)
                     if cleanup is not None:
                         startup = await cleanup()
                         if self.state.closing or self.session.stale(epoch):
                             return
-                        if not isinstance(startup, dict) or not startup.get('ready'):
+                        # First-face assets can arrive after the hall's quiet check.
+                        # During the grace period only recognized startup pages gate
+                        # work; normal pages opened by the user remain usable.
+                        pending = not isinstance(startup, dict) or not startup.get('ready')
+                        if pending and (startup_initial or isinstance(startup, dict) and startup.get('pendingStartup')):
+                            wait_key = (self.state.installed, repr(startup))
+                            now = time.monotonic()
+                            if (getattr(self, '_startup_wait_key', None) != wait_key or
+                                    now >= getattr(self, '_next_startup_wait_log', 0.0)):
+                                LOG.info('挂载等待开屏检查：实例=%s；状态=%r', self.state.installed, startup)
+                                self._startup_wait_key = wait_key
+                                self._next_startup_wait_log = now + 30
                             self.window.action_label.setText((startup or {}).get('message', '等待关闭开屏活动页面') if isinstance(startup, dict) else '等待开屏状态确认')
                             self.window.set_gate(PHASE_MOUNTING, '等待开屏活动关闭并确认大厅稳定')
                             return
-                    self._startup_ready_session = self.state.installed
+                    if startup_initial:
+                        self._startup_ready_session = self.state.installed
+                        self._startup_watch_until = time.monotonic() + 60
                 if self.state.configured is None:
                     self.window.action_label.setText('插件已挂载，正在检查账号与功能配置')
                 if not await self._ensure_authorized():
@@ -515,33 +623,35 @@ class PluginRuntime(QObject):
                         self.window.action_label.setText('正在初始化功能：' + name)
                         LOG.info('功能初始化阶段：%s；实例=%s', name, self.state.installed)
                 feature_stage('血月战场')
-                await self.season.poll(config)
-                await self._sync_battle_assist_timing(config)
+                await self.season.poll(self.window.store.snapshot())
+                await self._sync_battle_assist_timing(self.window.store.snapshot())
                 self.timer.setInterval(self.season.scan_interval_ms if config.get('bloodmoon', {}).get('enabled') else 1000)
-                if config['player']['enabled'] and self._player_target_id is None:
+                if self.window.store.snapshot()['player']['enabled'] and self._player_target_id is None:
                     feature_stage('玩家信息')
                     snapshot = await self.transport.call('player_information')
                     if self.state.closing or self.session.stale(epoch):
                         return
-                    if self._player_target_id is None and isinstance(snapshot, dict) and snapshot != self._player_snapshot:
+                    if self.window.store.snapshot()['player']['enabled'] and self._player_target_id is None and isinstance(snapshot, dict) and snapshot != self._player_snapshot:
                         self._player_snapshot = snapshot
                         rendered=self.player_pvp.decorate(snapshot)
                         self.window.set_player_information(rendered.get('text', ''), rendered.get('subject', '玩家信息'))
                         LOG.info('玩家信息页面更新：%s', snapshot.get('subject', '玩家信息'))
                 feature_stage('摸金地图')
-                await self.treasure.poll(config)
+                await self.treasure.poll(self.window.store.snapshot())
                 await self.legion.poll()
                 if self.auction is not None:
                     await self.auction.poll()
                 feature_stage('PVP伤害采集')
-                await self.damage.poll(config)
+                await self.damage.poll(self.window.store.snapshot())
                 feature_stage('三尸合成')
-                await self.desire.poll(config)
+                await self.desire.poll(self.window.store.snapshot())
                 if self.state.closing or self.session.stale(epoch):
                     return
                 self.window.set_connection(connected=True, target_appid=self.target_appid, runtime_ready=not bool(self.state.blocked))
                 if initializing:
                     self._feature_ready_session = self.state.installed
+                    self.window.pages['season_insight'].set_ready(True)
+                    self.window.pages['flag_upgrade'].set_ready(True)
                     LOG.info('功能初始化完成：平台=%s；实例=%s',self.platform_name,self.state.installed)
                     self.window.action_label.setText('游戏与插件已就绪')
                 if self.state.closing or self.session.stale(epoch):
@@ -746,6 +856,10 @@ class PluginRuntime(QObject):
         self.state.closing = True
         self.state.stop_operation = True
         self.timer.stop()
+        await self.season_insight.close()
+        await self.flag_upgrade.close()
+        if self._controls_job and not self._controls_job.done():
+            await self._controls_job
         if self._recovery_job is not None and not self._recovery_job.done():
             self._recovery_job.cancel()
             try:await self._recovery_job
@@ -767,6 +881,18 @@ class PluginRuntime(QObject):
                 await asyncio.shield(self._poll_job)
             await self.transport.wait_idle()
             if self.state.installed and self.transport.connected:
+                # The WeChat resident stop only destroyed its own overlays.
+                # Remove the persistent collector before closing the CDP channel.
+                if hasattr(self.transport, 'damage_stop'):
+                    try:
+                        await self.transport.damage_stop()
+                    except Exception as exc:
+                        LOG.warning('退出时停止伤害采集失败：%s', exc)
+                if hasattr(self.transport, 'season_call'):
+                    try:
+                        await self.transport.season_call('stop')
+                    except Exception as exc:
+                        LOG.warning('退出时停止血月标注失败：%s', exc)
                 try:
                     await self.transport.call('stop')
                 except Exception:

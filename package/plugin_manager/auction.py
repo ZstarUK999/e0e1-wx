@@ -13,6 +13,7 @@ class AuctionPanel(QWidget):
     requested = Signal(str, object)
     def __init__(self, store=None):
         super().__init__()
+        self.store=store
         self.rows=[];self.checked=set();self.stamp=0;self.server_now=0;self.running=False;self.ready=False
         layout=QVBoxLayout(self)
         title=QLabel('拍卖助手');title.setObjectName('panelTitle');layout.addWidget(title)
@@ -29,7 +30,7 @@ class AuctionPanel(QWidget):
         layout.addLayout(buttons)
         self.start.clicked.connect(self._start);self.stop.clicked.connect(lambda:self.requested.emit('stop',{}));self.refresh.clicked.connect(lambda:self.requested.emit('status',{}))
         self.table.itemChanged.connect(self._check)
-        self.timer=QTimer(self);self.timer.setInterval(100);self.timer.timeout.connect(self._countdown);self.timer.start()
+        self.timer=QTimer(self);self.timer.setInterval(100);self.timer.timeout.connect(self._countdown)
         self.set_ready(False)
     def _check(self,item):
         if item.column()!=0:return
@@ -41,7 +42,10 @@ class AuctionPanel(QWidget):
         if not keys:self.message.setText('请先勾选要一口价购买的拍品');return
         self.requested.emit('arm',{'keys':keys})
     def set_ready(self,ready):
-        self.ready=bool(ready)
+        enabled=self.store is not None and self.store.snapshot()['ui'].get('auction_poll', False)
+        self.ready=bool(ready) and enabled
+        if self.ready:self.timer.start()
+        else:self.timer.stop()
         self.start.setEnabled(self.ready and not self.running and bool(self.rows))
         self.stop.setEnabled(self.ready);self.refresh.setEnabled(self.ready)
         if not ready:self.message.setText('未连接游戏；拍卖请求已暂停')
@@ -78,8 +82,11 @@ class AuctionFeature:
     def __init__(self,transport,state,panel):
         self.transport,self.state,self.panel=transport,state,panel;self.job=None
         self._job_signature=None;self._audit_cursor={};self._last_poll_error=None
+        self._touched=False
         panel.requested.connect(self.request)
     def request(self,op,args):
+        if op!='stop' and not self.panel.store.snapshot()['ui'].get('auction_poll', False):
+            self.panel.message.setText('请先开启拍卖助手');return
         if not self.state.installed or self.state.closing:
             self.panel.message.setText('请先连接游戏');return
         if self.job and not self.job.done():return
@@ -100,10 +107,16 @@ class AuctionFeature:
             if result.get('jobs'):LOG.info('拍卖助手状态：%s',signature)
         self.panel.show_status(result)
     async def command(self,op,args):
+        if op!='stop' and not self.panel.store.snapshot()['ui'].get('auction_poll', False):return
+        self._touched=True
         self.panel.start.setEnabled(False)
         try:
             result=await self.transport.auction_call(op,args)
             if result is None:raise RuntimeError('游戏未连接')
+            if op!='stop' and not self.panel.store.snapshot()['ui'].get('auction_poll', False):
+                await self.transport.auction_call('stop',{})
+                self._touched=False
+                return
             if not self.state.closing:self._accept(result)
         except Exception as exc:
             LOG.exception('拍卖助手操作失败：%s',op)
@@ -111,7 +124,17 @@ class AuctionFeature:
         finally:self.panel.set_ready(bool(self.state.installed) and not self.state.closing)
     async def poll(self):
         ready=bool(self.state.installed) and not self.state.closing;self.panel.set_ready(ready)
+        if not self.panel.store.snapshot()['ui'].get('auction_poll', False):
+            if ready and self._touched:
+                try:
+                    await self.transport.auction_call('stop',{})
+                    self._touched=False
+                    self.panel.running=False
+                except Exception as exc:
+                    LOG.warning('停止拍卖助手未确认，下次继续清理：%s',exc)
+            return
         if not ready or (self.job and not self.job.done()):return
+        self._touched=True
         try:
             result=await self.transport.auction_call('status',{})
             if result is None:raise RuntimeError('游戏未连接')
@@ -124,7 +147,7 @@ class AuctionFeature:
             self.panel.message.setText(f'读取拍卖行失败：{exc}')
     async def close(self):
         try:
-            if self.state.installed:
+            if self.state.installed and self._touched:
                 result=await self.transport.auction_call('stop',{})
                 if result:self._accept(result)
         except Exception as exc:LOG.warning('拍卖助手退出停止未确认：%s',exc)

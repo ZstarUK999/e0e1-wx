@@ -23,6 +23,47 @@ def fixture():
     f.summary=lambda data:'';f.hint=lambda data:'';f.status_text=lambda data:''
     return f,t
 
+
+def test_zero_damage_initial_snapshot_is_reportable():
+    from package.plugin_manager.damage_report.serialize import slim
+    snapshot = {'status': 'captured', 'time': 0, 'attributes': {'1': 100}}
+    data = {'self': {'battleType': 26, 'eventCount': 0, 'initialAttributes': snapshot}}
+    assert damage.DamageFeature._has_data(data)
+    assert slim(data, False)['initialAttributes'] == snapshot
+    data['self']['initialAttributes'] = {'status': 'missed'}
+    assert not damage.DamageFeature._has_data(data)
+
+
+def test_diagnostics_are_preserved_and_logged(caplog):
+    import json
+    import logging
+    from package.plugin_manager.damage_report.serialize import slim
+    diag = {'version': '20261024.1', 'modules': {'subLifePatched': False},
+            'counts': {'factor.skip.no_context.book': 100},
+            'samples': [{'reason': 'factor.skip.no_context.book', 'skillId': 20}]}
+    data = {'self': {'instanceId': 7, 'battleType': 20, 'eventCount': 100,
+                     'factorRows': [], 'diagnostics': diag}}
+    assert json.loads(json.dumps(slim(data, False)))['diagnostics'] == diag
+    with caplog.at_level(logging.INFO, logger='plugin_manager'):
+        damage.DamageFeature._log_diagnostics(data, '报告')
+    assert '20261024.1' in caplog.text
+    assert 'factor.skip.no_context.book' in caplog.text
+    assert 'diagnostics' in caplog.text
+
+def test_stop_failure_keeps_cleanup_pending_for_retry():
+    async def run():
+        f,t=fixture();f._injected=True;calls=[]
+        async def stop():
+            calls.append(True)
+            if len(calls)==1:raise RuntimeError('temporary disconnection')
+        t.damage_stop=stop
+        await f.poll({'damage':{'enabled':False}})
+        assert f._injected
+        await f.poll({'damage':{'enabled':False}})
+        assert not f._injected and len(calls)==2
+    asyncio.run(run())
+
+
 def test_unchanged_and_active_snapshots_are_throttled():
     async def run():
         f,t=fixture();await f.take();await f.take();assert t.fetches==1

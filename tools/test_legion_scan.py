@@ -152,12 +152,41 @@ def test_independent_tick_only_queries_ready_session(tmp_path):
         async def read(lid):calls.append(lid);return guild(lid)
         state=SimpleNamespace(installed='s',closing=False)
         scanner=LegionScanner(SimpleNamespace(legion_read=read),state,panel)
+        scanner.set_auto_start(True)
         scanner.schedule();await asyncio.sleep(0);assert not calls
         scanner.set_ready('s');scanner.schedule()
         await asyncio.sleep(0);await scanner.wait_operation()
         assert calls==['42']
         state.installed='different';scanner.schedule();await asyncio.sleep(0)
         assert calls==['42']
+        panel.close()
+    asyncio.run(run())
+
+
+def test_auto_scan_defaults_off_and_manual_enable_resets_on_game_restart(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    async def run():
+        panel=LegionScanPanel(tmp_path/'disabled.db');panel.db.create_task(guild())
+        calls=[]
+        async def read(lid):calls.append(lid);return guild(lid)
+        state=SimpleNamespace(installed='first',closing=False)
+        scanner=LegionScanner(SimpleNamespace(legion_read=read),state,panel)
+        scanner.set_ready('first')
+        scanner.schedule();await scanner.poll();await asyncio.sleep(0)
+        assert not calls and not scanner.enabled
+        scanner.enable_session()
+        await scanner.poll();await scanner.wait_operation()
+        assert calls==['42']
+        scanner.set_ready('first');assert scanner.enabled
+        state.installed='second';scanner.set_ready('second')
+        await scanner.poll()
+        assert not scanner.enabled and calls==['42']
+        scanner.set_auto_start(True)
+        await scanner.poll();await scanner.wait_operation()
+        assert calls==['42','42']
+        scanner.set_auto_start(False)
+        scanner.next_request=0;await scanner.poll()
+        assert not scanner.enabled and calls==['42','42']
         panel.close()
     asyncio.run(run())
 
@@ -274,6 +303,7 @@ def test_launch_and_game_restart_automatically_resume_persisted_task(tmp_path):
         panel.db.set_workers(1)
         state=SimpleNamespace(installed='first',closing=False)
         scanner=LegionScanner(SimpleNamespace(legion_read=read,legion_scan_call=lookup),state,panel)
+        scanner.set_auto_start(True)
         await scanner.poll();await scanner.wait_operation()
         assert calls==[('legion','42')]
         scanner.next_request=0

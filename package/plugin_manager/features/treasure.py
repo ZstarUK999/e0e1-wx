@@ -55,6 +55,9 @@ class TreasureFeature:
             return
         await self.transport.treasure_inject()
         self._injected = True
+        self._overlay = None  # 注入脚本会自行启动标注，必须显式同步开关。
+        await self.transport.treasure_overlay(False)
+        self._overlay = False
         LOG.info('摸金脚本已注入：地图导出与画面标注可用')
 
     def reset(self) -> None:
@@ -88,11 +91,19 @@ class TreasureFeature:
         treasure = config.get('treasure', {})
         ready = self.state.installed and not self.state.closing
         self.panel.set_enabled(ready)
-        if not ready or not treasure.get('enabled'):
+        if not ready:
+            return
+        if not treasure.get('enabled'):
+            if self._injected and self._overlay is not False:
+                try:
+                    await self.transport.treasure_overlay(False)
+                    self._overlay = False
+                except Exception as exc:
+                    LOG.warning('关闭摸金地图标注失败，下次继续清理：%s', exc)
             return
         try:
             await self._ensure_injected()
-            if bool(treasure.get('overlay')) != bool(self._overlay):
+            if self._overlay is None or bool(treasure.get('overlay')) != self._overlay:
                 message = await self.transport.treasure_overlay(bool(treasure.get('overlay')))
                 self._overlay = bool(treasure.get('overlay'))
                 LOG.info('摸金地图标注：%s', message)

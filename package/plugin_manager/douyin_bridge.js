@@ -285,10 +285,12 @@
   function heartbeatBody() {
     applyShutdown();
     const control=read('automation'),overlay=g.__e0e1AutomationOverlay,resident=g.__e0e1PluginRuntime;
-    if(!stopped && overlay && resident && control && control.token===token && control.runtime===runtime && control.resident===resident.id &&
+    if(!stopped && resident && control && control.token===token && control.runtime===runtime && control.resident===resident.id &&
        Number.isFinite(control.at) && Date.now()-control.at>=0 && Date.now()-control.at<5000 && control.at!==lastAutomationAt) {
       lastAutomationAt=control.at;
-      Promise.resolve(overlay.update(control.payload)).catch(e=>{lastError=errorText(e);});
+      const getOverlay=overlay?Promise.resolve(overlay):control.payload && control.payload.active && resident.ensure?
+        resident.ensure('automation_overlay'):Promise.resolve(null);
+      getOverlay.then(api=>{if(api && !stopped && !resident.stopped)return api.update(control.payload);}).catch(e=>{lastError=errorText(e);});
     }
     maintainKeepAlive();
     if(storageReserve.checked && !busy && !transfer && !storageReserve.bytes && Date.now()>=reserveRetryAt)
@@ -357,15 +359,22 @@
       case 'damage-stop': return stopDamage();
       case 'battle-assist-timing': return g.__e0e1BattleAssist ? g.__e0e1BattleAssist.timingPreview() : [];
       case 'dismiss-startup': return staticScripts.dismissStartup();
+      case 'season-insight': {
+        if(!['history','ranks','reports','replay','replay_status','statistics','legion_roster','guard_count'].includes(args.op))throw Error('未知血月数据操作');
+        return staticScripts.seasonInsight(args.op,args.args || {});
+      }
       case 'legion-read': return staticScripts.legionRead(args.id);
+      case 'legion-boss-read': return staticScripts.legionBossRead();
+      case 'flag-upgrade-read': return staticScripts.flagUpgradeRead();
       case 'legion-scan': return staticScripts.legionScan(args.op,args.value);
       case 'damage-status': return typeof g.damageCurveStatus === 'function' ? g.damageCurveStatus() : null;
-      case 'damage-snapshot': return typeof g.damageCurveJson === 'function' ? g.damageCurveJson() : null;
+      case 'damage-snapshot': return typeof g.damageCurveJson === 'function' ? g.damageCurveJson(args.cursor) : null;
       case 'damage-debug': return typeof g.damageCurveDebug === 'function' ? g.damageCurveDebug() : null;
       case 'damage-reset': return typeof g.damageCurveReset === 'function' ? String(g.damageCurveReset()) : '采集脚本尚未注入';
       case 'treasure-inject': return staticScripts.treasure();
       case 'treasure-dump': return typeof g.dumpTreasureMap === 'function' ? g.dumpTreasureMap() : null;
       case 'treasure-overlay': {
+        if(args.on && typeof g.treasureMapOverlayOn!=='function')await staticScripts.treasureOverlay();
         const fn = args.on ? g.treasureMapOverlayOn : g.treasureMapOverlayOff;
         return typeof fn === 'function' ? String(fn()) : '摸金脚本尚未注入';
       }

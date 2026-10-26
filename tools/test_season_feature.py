@@ -110,7 +110,7 @@ def test_speed_up_clicks_only_when_legal(app, tmp_path):
 
     asyncio.run(feature.poll(config(speed_up={"enabled": True, "max_times": 2, "safety_margin_seconds": 2, "poll_seconds": 2})))
 
-    assert ("speedUp", {"safety_margin_seconds": 2, "max_times": 2}) in transport.calls
+    assert ("speedUp", {"interval_seconds": 0, "max_times": 2}) in transport.calls
     assert "已加速" in feature.panel.speed_status.text()
 
 
@@ -183,7 +183,7 @@ def test_no_second_challenge_before_server_confirms_battle(app, tmp_path):
     assert not feature._attack_pending
 
 
-def test_stealth_marks_follow_master_and_ignore_legacy_child_switch(app, tmp_path):
+def test_stealth_marks_follow_master_and_child_switch(app, tmp_path):
     transport = FakeTransport()
     feature = build(transport, tmp_path)
 
@@ -191,10 +191,10 @@ def test_stealth_marks_follow_master_and_ignore_legacy_child_switch(app, tmp_pat
     assert ("marks", {"on": True}) in transport.calls
 
     asyncio.run(feature.poll(config(stealth_mark={"enabled": False})))
-    assert ("marks", {"on": False}) not in transport.calls
-    assert sum(isinstance(c, tuple) and c[0] == "marks" for c in transport.calls) == 1
-    assert ("march", None) in transport.calls
-    assert ("candidates", None) in transport.calls
+    assert ("marks", {"on": False}) in transport.calls
+    assert sum(isinstance(c, tuple) and c[0] == "marks" for c in transport.calls) == 2
+    assert ("march", {"interval_seconds": 0}) not in transport.calls
+    assert ("candidates", {"compact": True}) not in transport.calls
     asyncio.run(feature.poll(config(enabled=False)))
     assert ("stop", None) in transport.calls
 
@@ -204,7 +204,7 @@ def test_config_partial_patch_keeps_sibling_values(app, tmp_path):
     store.set_bloodmoon({"speed_up": {"enabled": True}})
     store.set_bloodmoon({"speed_up": {"max_times": 7}})
     speed = store.snapshot()["bloodmoon"]["speed_up"]
-    assert speed == {"enabled": True, "max_times": 7, "safety_margin_seconds": 2, "poll_seconds": 2}
+    assert speed == {"enabled": True, "max_times": 7, "safety_margin_seconds": 0, "poll_seconds": 2, "interval_seconds": 0}
 
 
 def test_config_rejects_bad_values(app, tmp_path):
@@ -383,7 +383,7 @@ def test_only_actual_battle_state_confirms_challenge(app, tmp_path, self_state):
 
 
 @pytest.mark.parametrize('self_state', [None, 1, 2])
-def test_unconfirmed_challenge_times_out_for_any_nonbattle_state(app, tmp_path, self_state):
+def test_delayed_battle_sync_keeps_observing_without_replay_or_permanent_stop(app, tmp_path, self_state):
     transport = FakeTransport(candidates={'ok': True, 'self_state': self_state})
     feature = build(transport, tmp_path)
     import time
@@ -391,7 +391,45 @@ def test_unconfirmed_challenge_times_out_for_any_nonbattle_state(app, tmp_path, 
     feature._attack_since = time.monotonic() - 61
     asyncio.run(feature._poll_attack({'attack': {'enabled': True}}))
     assert feature._attack_pending
-    assert feature._attack_stopped
+    assert not feature._attack_stopped
+    assert not [c for c in transport.calls if c[0] == 'attack']
+    feature._attack_token = 'late'
+    transport.candidates = {'ok': True, 'self_state': 1, 'self_plan_power': 1000,
+        'attack_observation': {'token': 'late', 'completed': True},
+        'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}]}
+    asyncio.run(feature._poll_attack({'attack': {'enabled': True}}))
+    assert len([c for c in transport.calls if c[0] == 'attack']) == 1
+
+
+@pytest.mark.parametrize('token,completed,self_state,continues', [
+    ('current', True, 1, True), ('old', True, 1, False),
+    ('current', False, 1, False), ('current', True, 2, False),
+    ('current', True, 4, False)])
+def test_native_end_notification_handles_missed_battle_snapshot(app, tmp_path, token, completed, self_state, continues):
+    import time
+    transport = FakeTransport(candidates={'ok': True, 'self_state': self_state,
+        'self_plan_power': 1000, 'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}],
+        'attack_observation': {'token': token, 'completed': completed}})
+    feature = build(transport, tmp_path)
+    feature._attack_pending = True
+    feature._attack_token = 'current'
+    feature._attack_since = time.monotonic()
+    asyncio.run(feature._poll_attack({'attack': {'enabled': True}}))
+    assert bool([c for c in transport.calls if c[0] == 'attack']) == continues
+    assert not feature._attack_stopped
+
+
+def test_raising_battle_limit_resumes_without_resetting_counters(app, tmp_path):
+    transport = FakeTransport(candidates={'ok': True, 'self_state': 1,
+        'self_plan_power': 1000, 'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}]})
+    feature = build(transport, tmp_path)
+    feature._battles = 10
+    asyncio.run(feature._poll_attack({'attack': {'enabled': True, 'max_battles': 10}}))
+    assert not feature._attack_stopped
+    assert not [c for c in transport.calls if c[0] == 'attack']
+    asyncio.run(feature._poll_attack({'attack': {'enabled': True, 'max_battles': 11}}))
+    assert feature._battles == 11
+    assert len([c for c in transport.calls if c[0] == 'attack']) == 1
 
 
 def test_ready_after_battle_attacks_without_legacy_wait(app, tmp_path, monkeypatch):
@@ -495,6 +533,52 @@ def test_new_config_defaults_to_fifteen_speedups(app, tmp_path):
     feature = build(FakeTransport(), tmp_path)
     assert feature.store.snapshot()['bloodmoon']['speed_up']['max_times'] == 15
     assert feature.panel.speed_times.value() == 15
+    assert feature.panel.attack_max.value() == 20
+    assert feature.panel.speed_interval.value() == 0
+    feature.panel.speed_interval.setValue(7)
+    feature.store.set_bloodmoon(feature.panel._speed_patch())
+    assert feature.store.snapshot()['bloodmoon']['speed_up']['interval_seconds'] == 7
+    with pytest.raises(ValueError):
+        feature.store.set_bloodmoon({'speed_up': {'interval_seconds': -1}})
+
+
+@pytest.mark.parametrize('remain', [8000, 9000, 10000])
+def test_final_window_ignores_old_ui_cutoff_and_legacy_margin(app, tmp_path, remain):
+    transport = FakeTransport(march={'ok': True, 'move': {'remain_ms': remain},
+        'speed_up': {'available': True, 'min_remain_seconds': 10}})
+    feature = build(transport, tmp_path)
+    asyncio.run(feature._poll_speed({'speed_up': {'enabled': True,
+        'interval_seconds': 7, 'safety_margin_seconds': 60}}))
+    assert ('march', {'interval_seconds': 7}) in transport.calls
+    assert ('speedUp', {'interval_seconds': 7, 'max_times': 0}) in transport.calls
+
+
+def test_definite_speed_rejection_does_not_latch_session_stop(app, tmp_path):
+    transport = FakeTransport(march={'ok': True, 'move': {'remain_ms': 9000},
+        'speed_up': {'available': True}}, receipts={'speedUp': {'ok': False,
+        'status': 'retry_later', 'request_sent': True, 'message': '本次请求被拒绝'}})
+    feature = build(transport, tmp_path)
+    asyncio.run(feature._poll_speed({'speed_up': {'enabled': True}}))
+    assert not feature._speed_stopped
+
+
+def test_definite_attack_rejection_recovers_after_backoff(app, tmp_path, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr('time.monotonic', lambda: now[0])
+    transport = FakeTransport(candidates={'ok': True, 'self_state': 1,
+        'self_plan_power': 1000, 'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}]},
+        receipts={'attack': {'ok': False, 'status': 'retry_later', 'request_sent': True,
+                             'retry_after_ms': 1000, 'message': '暂不可挑战'}})
+    feature = build(transport, tmp_path)
+    settings = {'attack': {'enabled': True}}
+    asyncio.run(feature._poll_attack(settings))
+    assert not feature._attack_stopped
+    asyncio.run(feature._poll_attack(settings))
+    assert len([c for c in transport.calls if c[0] == 'attack']) == 1
+    now[0] += 1
+    transport.receipts['attack'] = {'ok': True, 'confirmed': True, 'attack_token': 'next'}
+    asyncio.run(feature._poll_attack(settings))
+    assert feature._battles == 1 and feature._attack_token == 'next'
 
 
 
@@ -537,8 +621,8 @@ def test_real_power_display_units_preserve_top_three_order(app, tmp_path):
     assert [row.child(i).text(0) for i in range(4)] == ['玩家0','玩家1','玩家2','玩家3']
 
 
-def test_extra_margin_does_not_attempt_or_latch_stopped(app, tmp_path):
-    transport = FakeTransport(march={'ok': True, 'move': {'remain_ms': 11000},
+def test_below_eight_seconds_does_not_attempt_or_latch_stopped(app, tmp_path):
+    transport = FakeTransport(march={'ok': True, 'move': {'remain_ms': 7999},
         'speed_up': {'available': True, 'min_remain_seconds': 10}})
     feature = build(transport, tmp_path)
     asyncio.run(feature.poll(config()))
@@ -555,11 +639,11 @@ def test_unsent_ui_wait_does_not_permanently_stop_automation(app, tmp_path, acti
             'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}]},
         receipts={action: {'ok': False, 'status': status, 'request_sent': False, 'message': 'UI冷却中'}})
     feature = build(transport, tmp_path)
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert not (feature._speed_stopped if action == 'speedUp' else feature._attack_stopped)
     transport.receipts[action] = {'ok': True, 'confirmed': True, 'times': 1}
     feature._next_speed = feature._attack_wait_until = 0
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert sum(isinstance(c, tuple) and c[0] == action for c in transport.calls) == 2
 
 
@@ -568,10 +652,10 @@ def test_sent_unavailable_is_not_retried(app, tmp_path):
         'speed_up': {'available': True}}, receipts={'speedUp': {'ok': False,
         'status': 'unavailable', 'request_sent': True, 'message': '已发请求'}})
     feature = build(transport, tmp_path)
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert feature._speed_stopped
     feature._next_speed = 0
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert sum(isinstance(c, tuple) and c[0] == 'speedUp' for c in transport.calls) == 1
 
 
@@ -581,12 +665,12 @@ def test_battle_end_window_scans_early_but_sends_only_after_idle(app, tmp_path):
         'battle_end_time': 1000200, 'self_plan_power': 1000,
         'attack': [{'roleId': 6, 'planPower': 500, 'attackable': True}]})
     feature = build(transport, tmp_path)
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert feature.scan_interval_ms == 50
     assert not any(isinstance(c, tuple) and c[0] == 'attack' for c in transport.calls)
     transport.candidates['self_state'] = 1
     transport.candidates['server_now'] = 1000201
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert ('attack', {'roleId': 6, 'power_ratio': 100, 'power_limit': 0}) in transport.calls
     assert feature.scan_interval_ms == 100
 
@@ -599,11 +683,11 @@ def test_moving_target_rejection_defers_only_target_and_keeps_scanning(app, tmp_
         receipts={'attack': {'ok': False, 'status': 'target_unavailable', 'request_sent': True,
             'roleId': 6, 'retry_after_ms': 2000, 'message': '目标行军中'}})
     feature = build(transport, tmp_path)
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     assert not feature._attack_stopped
     assert 6 in feature._deferred_targets
     transport.receipts['attack'] = {'ok': True, 'confirmed': True}
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     attacks = [c for c in transport.calls if isinstance(c,tuple) and c[0]=='attack']
     assert [c[1]['roleId'] for c in attacks] == [6,7]
     assert feature._attack_pending
@@ -625,7 +709,7 @@ def test_attack_runs_before_speed_probe_and_mark_diagnostics(app, tmp_path):
         'attack': [{'roleId': 6, 'planPower': 800, 'attackable': True}]})
     feature = build(transport, tmp_path)
     feature.set_probing(True)
-    asyncio.run(feature.poll(config()))
+    asyncio.run(feature.poll(config(speed_up={"enabled": True}, attack={"enabled": True}, stealth_mark={"enabled": True})))
     names = [c[0] for c in transport.calls if isinstance(c,tuple)]
     assert names.index('attack') < names.index('march')
     assert names.index('attack') < names.index('flags')

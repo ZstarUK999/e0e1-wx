@@ -616,17 +616,28 @@ class DebugEngine:
         is_mac = sys.platform == "darwin"
         platform_dir = "mac" if is_mac else "win"
 
-        if is_mac:
+        androws_config = None
+        channel = getattr(self.options, 'channel', 'wechat')
+        if channel == 'androws':
+            if is_mac:
+                raise RuntimeError('应用宝渠道仅支持 Windows')
+            from package.devtools.androws import find_runtime, load_profile
+            pid, dll = find_runtime(frida.get_local_device().enumerate_processes(scope='metadata'))
+            androws_config = load_profile(dll, tools_root() / 'config')
+            pids, wmpf_version = [pid], int(androws_config['Version'])
+        elif channel != 'wechat':
+            raise RuntimeError('未知 WMPF 渠道')
+        elif is_mac:
             pids, wmpf_version = self._find_wmpf_pids_darwin()
         else:
             pids, wmpf_version = self._find_wmpf_pids_win()
 
-        hook_path = tools_root() / "hook.js"
+        hook_path = tools_root() / ('hook_androws.js' if androws_config is not None else 'hook.js')
         if not hook_path.exists():
             raise RuntimeError("[frida] hook script not found")
 
         config_path = tools_root() / "config" / platform_dir / f"addresses.{wmpf_version}.json"
-        if not config_path.exists():
+        if androws_config is None and not config_path.exists():
             # 兜底：本机出现新版本运行时时，现算偏移并落盘，之后照常从磁盘读。
             if is_mac:
                 raise RuntimeError(
@@ -649,7 +660,8 @@ class DebugEngine:
                 self._notify_status("message", "")
 
         script_content = hook_path.read_text(encoding="utf-8")
-        config_content = json.dumps(json.loads(config_path.read_text(encoding="utf-8")))
+        config_content = json.dumps(androws_config if androws_config is not None
+                                    else json.loads(config_path.read_text(encoding="utf-8")))
         final_script = script_content.replace("@@CONFIG@@", config_content)
         debug_port = getattr(getattr(self, 'options', None), 'debug_port', 9421)
         final_script = render_hook_debug_port(final_script, debug_port)
@@ -666,16 +678,32 @@ class DebugEngine:
             logger.frida_debug("[frida client]", message.get("payload", ""))
 
         for pid in pids:
+            current_session = None
+            current_script = None
             try:
                 current_session = device.attach(pid)
                 current_script = current_session.create_script(final_script)
                 current_script.on("message", on_message)
                 current_script.load()
+                if androws_config is not None:
+                    current_script.exports_sync.install()
                 logger.info(f"[frida] injected pid={pid}, version={wmpf_version}")
                 if session is None:
                     session, script = current_session, current_script
             except Exception as exc:
                 logger.error(f"[frida] failed to inject pid={pid}: {exc}")
+                if androws_config is not None:
+                    if current_script is not None:
+                        try:
+                            current_script.unload()
+                        except Exception:
+                            pass
+                    if current_session is not None:
+                        try:
+                            current_session.detach()
+                        except Exception:
+                            pass
+                    raise RuntimeError(f'应用宝调试挂载失败：{exc}') from exc
 
         if session is None:
             raise RuntimeError("[frida] failed to inject any WeChatAppEx process")

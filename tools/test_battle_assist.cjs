@@ -69,6 +69,9 @@ async function setup({cd=0,period=20,positionless=false,overlay=false,awakened=f
   vm.createContext(ctx);vm.runInContext(source+'\nthis.create=createBattleAssistRuntime;',ctx);
   const api=ctx.create(g),config={enabled:true,shijue:overlay,books:{[id]:{enabled:true,count:5}}};
   await api.configure(config);
+  const resources=api.resourceStatus();
+  assert.equal(typeof resources.worlds,'number');
+  assert.equal(typeof resources.speedWorlds,'number');
   return {api,config,id,logic,world,casts,host,countdowns,spawned,diagnostics,
     manual(){world.battleSignal.useSkill.emit(rootSkill,{x:0,y:0},{x:432,y:10},true,id);},
     tick(t){const dt=t-world.battleTime.battleTime;world.battleTime.battleTime=t;logic.onTick(dt);},

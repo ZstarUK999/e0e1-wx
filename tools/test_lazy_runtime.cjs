@@ -1,0 +1,34 @@
+const fs=require('fs'),vm=require('vm'),assert=require('node:assert/strict');
+const c={console:{info(){}}};vm.createContext(c);
+vm.runInContext(fs.readFileSync('package/plugin_manager/plugin_runtime.js','utf8'),c);
+(async()=>{
+ const loaded=[],created={},g={ROLE:{id:123,userInfo:{name:'角色'},legion:{legionName:'阴司'}}};
+ let release;
+ const r=c.createPluginRuntime(g,'session',async name=>{
+  loaded.push(name);created[name]=(created[name]||0)+1;
+  if(name==='ui')return {dispatch:async op=>op==='wait'?new Promise(resolve=>release=resolve):{status:'ok',value:op}};
+  if(name==='daily'||name==='desire')return ()=>{};
+  if(name==='battle_assist')return {configure:async value=>{g.assist=!!value.enabled;},destroy(){g.assist=false;}};
+  throw Error('unknown');
+ });
+ assert.equal(loaded.length,0,'bootstrap must not execute any feature');
+ await r.dispatch('configure',{battle_assist:{enabled:false}});
+ assert.equal(loaded.length,0,'off config must not load disabled scripts');
+ const identity=await r.dispatch('identity');assert.equal(identity.value.player_id,'123');assert.equal(loaded.length,0);
+ await r.dispatch('player_information');assert.deepEqual(loaded,['ui']);
+ await r.dispatch('desire_bag_stats');assert.deepEqual(loaded,['ui','desire']);
+ await r.dispatch('tomb_state');assert.deepEqual(loaded,['ui','desire','daily']);
+ await r.dispatch('configure',{battle_assist:{enabled:true}});assert.equal(g.assist,true);
+ await r.dispatch('configure',{battle_assist:{enabled:false}});assert.equal(g.assist,false);
+ await r.dispatch('configure',{battle_assist:{enabled:true}});assert.equal(created.battle_assist,1);
+ const job=r.dispatch('wait');assert.equal(r.pending,true);
+ assert.equal((await r.dispatch('sweep')).status,'uncertain');
+ await r.dispatch('configure',{battle_assist:{enabled:false}});assert.equal(r.pending,true);
+ while(!release)await Promise.resolve();release({status:'ok'});await job;assert.equal(r.pending,false);
+ await r.dispatch('stop');assert.equal(g.assist,false);assert.equal((await r.dispatch('sweep')).status,'unavailable');
+ const two=c.createPluginRuntime(g,'next',async()=>{throw Error('not loaded');});
+ assert.equal(Object.keys(two.features).length,0,'new context must have a fresh feature registry');
+ let count=0;two.register('test',async()=>{count++;await Promise.resolve();return {};});
+ await Promise.all([two.ensure('test'),two.ensure('test')]);assert.equal(count,1,'concurrent lazy loads share a single instance');
+ console.log('PASS minimal bootstrap, disabled modules, lazy identity/UI/daily/desire/PVE, toggle cleanup, pending commands, fresh session and concurrent loads');
+})().catch(e=>{console.error(e);process.exitCode=1;});

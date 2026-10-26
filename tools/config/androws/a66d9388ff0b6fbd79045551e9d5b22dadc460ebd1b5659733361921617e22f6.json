@@ -1,0 +1,16 @@
+{
+  "Channel": "androws",
+  "Version": 20121,
+  "FileVersion": "2.4.4.20121",
+  "SHA256": "a66d9388ff0b6fbd79045551e9d5b22dadc460ebd1b5659733361921617e22f6",
+  "TargetAppId": "wx6d5e82c174635a48",
+  "LoadStartHookOffset": "0x25de1d0",
+  "CDPFilterHookOffset": "0x2d8f6b0",
+  "CastToJsonHookOffset": "0x92f39c0",
+  "MiniAppConfigStructOffsets": {
+    "LaunchConfigOffsets": [64, 1480, 8],
+    "RemoteDebugConfigOffsets": [1416, 16],
+    "SceneOffset": 456,
+    "WebSocketURLStringOffset": 600
+  }
+}

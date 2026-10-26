@@ -115,10 +115,10 @@ def test_invalid_saved_config_is_not_overwritten(app, tmp_path):
 
 def test_tree_navigation_and_truthful_unconnected_state(window):
     tree = window.tree
-    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "PVE辅助", "血月战场", "玩家信息透视", "摸金地图", "阴司透视", "拍卖助手", "PVP伤害分析", "三尸合成", "调试信息"]
+    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["全局设置", "日常自动化", "PVE辅助", "血月战场", "血月数据透视", "战旗升级", "玩家信息透视", "摸金地图", "阴司透视", "拍卖助手", "PVP伤害分析", "三尸合成", "调试信息"]
     root = tree.topLevelItem(1)
     assert [root.child(i).text(0) for i in range(root.childCount())] == ["日常扫荡", "鬼仆", "阴墟墓葬", "定时斗法"]
-    assert set(window.pages) == {"global", "daily", "energy", "pet_hatch", "mines", "arena", "battle_assist", "control_chain", "zhongkui", "bloodmoon", "player", "treasure", "legion", "auction", "damage", "desire", "debug"}
+    assert set(window.pages) == {"global", "daily", "energy", "pet_hatch", "mines", "arena", "battle_assist", "control_chain", "zhongkui", "bloodmoon", "season_insight", "flag_upgrade", "player", "treasure", "legion", "auction", "damage", "desire", "debug"}
     assert "未接入" in window.connection_label.text()
     assert not window.game_connected
     # 血月页已接入：有开关，但游戏与插件未就绪时按钮一律不可用。
@@ -133,7 +133,7 @@ def test_tree_navigation_and_truthful_unconnected_state(window):
 
 def test_root_only_switches_and_child_switch_sync(window):
     root = window.pages["daily"]
-    assert len(root.findChildren(QCheckBox)) == 13
+    assert len(root.findChildren(QCheckBox)) == 14
     assert not root.findChildren(QSpinBox)
     root.toggles["energy"].setChecked(True)
     child = window.task_panels["energy"]
@@ -174,6 +174,21 @@ def test_global_settings_edits_ui_delay(window):
     global_panel.save_button.click()
     assert window.store.snapshot()["ui"]["delay_ms"] == 800
     assert "已保存" in global_panel.message.text()
+
+
+def test_global_scan_auto_start_defaults_off_and_persists(window):
+    from package.plugin_manager.store import PluginConfigStore,default_config,validate_config
+    box=window.pages['global'].legion_scan_auto_start
+    assert not box.isChecked()
+    legacy=default_config();legacy['ui'].pop('legion_scan_auto_start')
+    assert validate_config(legacy)['ui']['legion_scan_auto_start'] is False
+    box.click()
+    assert window.store.snapshot()['ui']['legion_scan_auto_start'] is True
+    assert PluginConfigStore(window.store.path).snapshot()['ui']['legion_scan_auto_start'] is True
+    window.store.set_legion_scan_auto_start(False)
+    assert not box.isChecked()
+    invalid=default_config();invalid['ui']['legion_scan_auto_start']=1
+    with pytest.raises(ValueError):validate_config(invalid)
 
 
 def test_ui_delay_rejects_out_of_range_and_non_integers(app, tmp_path):
@@ -586,7 +601,7 @@ def test_launch_entry_does_not_import_old_main_window(app):
     assert "MainWindow" not in assembly
 
 
-@pytest.mark.parametrize("platform", ["wechat", "douyin"])
+@pytest.mark.parametrize("platform", ["wechat", "douyin", "androws"])
 def test_debug_platform_selection_keeps_main_ui_visible(window, monkeypatch, platform):
     from package.plugin_manager.build_info import BuildInfo
     from package.plugin_manager.app import PluginApplication

@@ -1,10 +1,10 @@
-"""血月战场：战旗探测（只读）、自动加速、自动攻击、隐匿状态标注。
+"""血月战场：战旗探测、自动赶路、自动挑战、隐匿头像与行军路线显示。
 
-四条共同边界（与 血月调查与插件设计.md 一致）：
-  1. 加速点击原按钮，挑战调用原模块并保留原生资格、频率与状态限制；
+当前运行规则：
+  1. 赶路与挑战直接调用游戏接口；赶路间隔可调，剩余低于8秒停止；
   2. 请求没有明确回执就是 uncertain，停止本轮自动动作，不重试不重放；
-  3. 被游戏拒绝（rejected）就停下并写明原因，不换目标绕开限制；
-  4. 不读取被隐藏的敌方隐匿行军，隐匿目标不作为自动攻击的选敌来源。
+  3. 临时条件等待恢复；明确拒绝按间隔再检查，结果未知不重发；
+  4. 隐匿显示使用客户端已同步数据；自动挑战仍须满足原生驻留资格。
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def _decision(name: str, payload: dict) -> None:
         _DECISION_LOG[name] = (encoded, now)
 
 ATTACK_PROBE_SECONDS = 0     # 挑战后核对状态同步的间隔
-ATTACK_SYNC_TIMEOUT = 60     # 多久还没进入战斗就当服务端没确认，停止本轮
+ATTACK_SYNC_TIMEOUT = 60     # 同步延迟提示阈值；继续观察，不把迟到通知永久锁死。
 
 SOURCE_TEXT = {
     'season_map': '战场同步数据（含战旗）',
@@ -66,6 +66,7 @@ class SeasonFeature:
         self._attack_stopped = ''      # 攻击停止原因
         self._attack_wait_until = 0.0  # 上一场结束后等待到什么时候
         self._attack_pending = False   # 已发起挑战，等服务端把状态同步成战斗
+        self._attack_token = None
         self._attack_seen_battle = False
         self._attack_since = 0.0
         self._battles = 0
@@ -122,6 +123,7 @@ class SeasonFeature:
             self.panel.set_message(f'血月操作失败：{exc}')
 
     def _reset_local(self) -> None:
+        self._attack_token = None
         self._deferred_targets.clear()
         self._speed_stopped = self._attack_stopped = ''
         self._attack_pending = False
@@ -151,6 +153,7 @@ class SeasonFeature:
 
     def reset(self) -> None:
         """会话结束后丢弃注入标记与运行态。"""
+        self._attack_token = None
         self._injected = False
         self._probing = False
         self._marks = None
@@ -181,13 +184,10 @@ class SeasonFeature:
                     await self.transport.season_call('stop')
                 except Exception as exc:
                     LOG.exception('停止血月脚本失败：%s', exc)
+                    return  # Retry cleanup while the switch remains off.
                 self._injected = False
                 self._marks = None
             return
-        # 兼容旧配置中的子开关字段，统一由总开关决定是否运行。
-        bloodmoon = dict(bloodmoon)
-        for key in ('speed_up', 'attack', 'stealth_mark'):
-            bloodmoon[key] = dict(bloodmoon.get(key) or {}, enabled=True)
         try:
             await self._ensure_injected()
             if self._lock.locked():
@@ -219,7 +219,7 @@ class SeasonFeature:
                 LOG.error('隐匿状态标注设置失败：on=%s receipt=%r', on, result)
                 return
             self._marks = on
-            LOG.info('隐匿标注：%s receipt=%r', '开启（仅原本可见的单位）' if on else '关闭', result)
+            LOG.info('隐匿头像/行军路线显示：%s receipt=%r', '开启' if on else '关闭', result)
         if on and time.monotonic() >= self._next_mark_check:
             self._next_mark_check = time.monotonic() + 30
             info = await self.transport.season_call('diagnose')
@@ -320,8 +320,9 @@ class SeasonFeature:
             return
         if time.monotonic() < self._next_speed:
             return
-        self._next_speed = time.monotonic() + 0.1  # 每轮检查，真实加速间隔由原UI冷却决定
-        state = await self.transport.season_call('march')
+        self._next_speed = time.monotonic() + 0.1  # 扫描频率；请求间隔由JS按游戏配置/自定义值执行。
+        interval_seconds = int(speed.get('interval_seconds') or 0)
+        state = await self.transport.season_call('march', {'interval_seconds': interval_seconds})
         if config_epoch != self._config_epoch or self.state.closing:
             return
         _decision('march_snapshot', {'snapshot': state})
@@ -347,14 +348,12 @@ class SeasonFeature:
             LOG.debug('自动加速等待：%s remain=%s', reason, remain)
             self.panel.set_speed_status(f"等待合法时机：{reason}（剩余 {remain} 秒）")
             return
-        minimum_ms = int((state.get('speed_up') or {}).get('min_remain_seconds') or 0) * 1000
-        margin_ms = int(speed.get('safety_margin_seconds') or 0) * 1000
-        if int(move.get('remain_ms') or 0) < minimum_ms + margin_ms:
-            self.panel.set_speed_status('剩余时间不足（含额外预留时间），不点击加速')
+        if int(move.get('remain_ms') or 0) < 8000:
+            self.panel.set_speed_status('剩余不足8秒，不再赶路')
             return
-        LOG.info('准备行军加速：times=%s limit=%s remain=%s margin=%s', times, limit, remain, speed.get('safety_margin_seconds') or 0)
+        LOG.info('准备直接赶路：times=%s limit=%s remain=%s interval=%s', times, limit, remain, info.get('interval_seconds'))
         try:
-            receipt = await self.transport.season_call('speedUp', {'safety_margin_seconds': speed.get('safety_margin_seconds') or 0, 'max_times': limit})
+            receipt = await self.transport.season_call('speedUp', {'interval_seconds': interval_seconds, 'max_times': limit})
         except Exception as exc:
             LOG.exception('行军加速传输失败，停止自动加速')
             receipt = {'ok': False, 'status': 'uncertain', 'message': f'加速回执未取得：{exc}'}
@@ -363,8 +362,11 @@ class SeasonFeature:
             result = receipt if isinstance(receipt, dict) else {}
             status = result.get('status') or 'uncertain'
             message = result.get('message') or '未取得明确成功回执'
+            if status == 'retry_later' and result.get('request_sent') is True:
+                self.panel.set_speed_status(f'本次赶路被拒绝，等待间隔/下一次行军：{message}')
+                return
             if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
-                self.panel.set_speed_status(f'等待UI可操作：{message}')
+                self.panel.set_speed_status(f'等待赶路条件：{message}')
                 return
             if status == 'uncertain':
                 self._speed_stopped = message
@@ -393,7 +395,7 @@ class SeasonFeature:
             return
         wait = 0  # 不设两场间隔；每次轮询仍核对真实战斗状态与按钮资格。
         self._attack_wait_until = time.monotonic()
-        snapshot = await self.transport.season_call('candidates')
+        snapshot = await self.transport.season_call('candidates', {'compact': True})
         if config_epoch != self._config_epoch or self.state.closing:
             return
         _decision('candidate_snapshot', {'snapshot': snapshot})
@@ -409,9 +411,15 @@ class SeasonFeature:
         if state == 3 and end_time > 0 and server_now > 0:
             # 预计结束前200ms进入高频扫描；只在服务端回到idle后发送。
             self.scan_interval_ms = max(50, min(100, end_time - server_now - 200))
+        observation = snapshot.get('attack_observation') or {}
+        if (self._attack_pending and self._attack_token and
+                observation.get('token') == self._attack_token and observation.get('completed') is True):
+            self._attack_pending = False
+            self._attack_seen_battle = True
+            LOG.info('挑战结算通知已确认：token=%s；按当前状态继续等待/选敌', self._attack_token)
         if self._attack_pending:
             LOG.debug('挑战同步决策：self_state=%r state_name=%r elapsed=%s timeout=%s wait=%s', state, snapshot.get('self_state_name'), time.monotonic() - self._attack_since, ATTACK_SYNC_TIMEOUT, wait)
-            # 只有明确战斗状态确认进入；缺失/行军都不能代替确认。
+            # 无匹配结算通知时，只有明确战斗状态确认进入；缺失/行军不能代替。
             if state == 3:
                 self._attack_pending = False
                 self._attack_seen_battle = True
@@ -419,9 +427,8 @@ class SeasonFeature:
                 self.panel.set_attack_status(f"战斗中（{snapshot.get('self_state_name') or state}），结束后再选目标")
                 return
             if time.monotonic() - self._attack_since > ATTACK_SYNC_TIMEOUT:
-                self._attack_stopped = f'发起挑战后未观察到战斗状态，当前状态={state!r}，服务端未确认进入战斗'
-                LOG.error(self._attack_stopped)
-                self.panel.set_attack_status(f"已停止：{self._attack_stopped}")
+                _decision('attack_sync_delayed', {'token': self._attack_token, 'state': state})
+                self.panel.set_attack_status('挑战已受理，尚未观察到战斗或结算；持续核对同步，避免重复发起')
                 return
             self.panel.set_attack_status('已发起挑战，等待服务端同步战斗状态')
             self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
@@ -447,9 +454,7 @@ class SeasonFeature:
             return
         limit = int(attack.get('max_battles') or 0)
         if limit and self._battles >= limit:
-            self._attack_stopped = f"已达到单轮上限 {limit} 场"
-            LOG.info('自动攻击停止：%s', self._attack_stopped)
-            self.panel.set_attack_status(self._attack_stopped)
+            self.panel.set_attack_status(f"已达到单轮上限 {limit} 场；提高上限或复位后继续")
             return
         now = time.monotonic()
         self._deferred_targets = {role_id:until for role_id,until in self._deferred_targets.items() if until > now}
@@ -478,14 +483,20 @@ class SeasonFeature:
                 self.panel.set_attack_status('目标正在行军，暂缓该目标，继续扫描当前节点')
                 LOG.info('挑战目标暂不可用：roleId=%s，暂缓%s秒，继续节点扫描', target['roleId'], delay)
                 return
+            if status == 'retry_later' and result.get('request_sent') is True:
+                self._attack_wait_until = time.monotonic() + max(1.0, float(result.get('retry_after_ms') or 1000) / 1000)
+                self.panel.set_attack_status(f'本次挑战被拒绝，稍后重新扫描：{message}')
+                LOG.info('挑战明确未成功，短暂退避后继续扫描：%s', message)
+                return
             if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
-                self.panel.set_attack_status(f'等待UI可操作：{message}')
+                self.panel.set_attack_status(f'等待挑战条件：{message}')
                 return
             self._attack_stopped = message
             LOG.error('挑战未成功，停止自动攻击：%s（%s）', message, status)
             self.panel.set_attack_status(f"已停止：{message}")
             return
         self._battles += 1
+        self._attack_token = receipt.get('attack_token')
         self._attack_pending = True
         self._attack_since = time.monotonic()
         self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS

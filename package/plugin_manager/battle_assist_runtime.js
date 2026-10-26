@@ -480,7 +480,7 @@ function createBattleAssistRuntime(g) {
     async configure(value) {
       config=value || {enabled:false,shijue:false,books:{}};
       if(!config.enabled){syncSpeed([]);for(const b of [...bindings.values()])unbind(b);removePanel();if(pveOverlay){pveOverlay.destroy();pveOverlay=null;}if(timer!==null){clearInterval(timer);timer=null;}return;}
-      await load();if(destroyed)return;
+      await load();if(destroyed || !config.enabled)return;
       if(!cc)cc=await g.System.import('cc');
       if(config.auto_speed && !modules.speedUi)modules.speedUi=await g.System.import('chunks:///_virtual/ui-battle-base.ts');
       if(typeof createPveAssistOverlay==='function' && !modules.context) {
@@ -491,9 +491,10 @@ function createBattleAssistRuntime(g) {
         if(!config.shijue)b.shijue=false;
         for(const [id,s] of b.chains)if(!enabled(id) && s.active)finish(s,'控制链已关闭');
       }
+      if(destroyed || !config.enabled)return;
       discover();if(timer===null)timer=setInterval(()=>{try{discover();}catch(e){console.error('[对战辅助]',e);}},250);
     },
-    resourceStatus(){const o=pveOverlay && pveOverlay.snapshot();return {worlds:bindings.size,chains:[...bindings.values()].reduce((n,b)=>n+b.chains.size,0),timer:timer!==null,speedWorlds:speedWorlds.size,overlayNodes:o?o.nodeCount:0};},
+    resourceStatus(){const o=pveOverlay && pveOverlay.snapshot();return {worlds:bindings.size,chains:[...bindings.values()].reduce((n,b)=>n+b.chains.size,0),timer:timer!==null,speedWorlds:speedViews.size,overlayNodes:o?o.nodeCount:0};},
     pveStatus(){return pveOverlay?pveOverlay.snapshot():null;},
     timingPreview(){
       if(!modules || destroyed)return [];

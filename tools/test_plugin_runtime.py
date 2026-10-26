@@ -108,6 +108,49 @@ async def ready(controller, service):
     await controller.poll()
 
 
+def test_bloodmoon_fast_poll_does_not_refresh_other_features(app, tmp_path):
+    async def run():
+        c, s, t, w = make_controller(tmp_path)
+        try:
+            await ready(c, s)
+            w.store.set_bloodmoon({'enabled': True})
+            config = w.store.snapshot()
+            c.state.configured = copy.deepcopy(config)
+            c._feature_ready_session = c.state.installed
+            c._next_full_poll = float('inf')
+            scans = []
+            async def scan(config): scans.append(True)
+            c.season.poll = scan
+            before = list(t.calls)
+            for _ in range(10): await c.poll()
+            assert len(scans) == 10
+            assert t.calls == before
+            c._next_full_poll = 0
+            await c.poll()
+            assert len(t.calls) > len(before)
+        finally:
+            await c.shutdown(); w.close()
+    asyncio.run(run())
+
+
+def test_shutdown_stops_game_collectors_before_disconnecting(app, tmp_path):
+    async def run():
+        c, s, t, w = make_controller(tmp_path)
+        await ready(c, s)
+        async def damage_stop(): t.calls.append(('damage_stop', None))
+        async def season_call(op): t.calls.append(('season_' + op, None))
+        t.damage_stop = damage_stop
+        t.season_call = season_call
+        try:
+            await c.shutdown()
+            ops = [op for op, _ in t.calls]
+            assert ops.index('wait_idle') < ops.index('damage_stop') < ops.index('close')
+            assert ops.index('season_stop') < ops.index('close')
+        finally:
+            w.close()
+    asyncio.run(run())
+
+
 def test_startup_activity_cleanup_gates_feature_configuration(app, tmp_path):
     async def run():
         controller, service, transport, window = make_controller(tmp_path)
@@ -124,6 +167,39 @@ def test_startup_activity_cleanup_gates_feature_configuration(app, tmp_path):
             cleared[0] = True
             await controller.poll()
             assert any(op == 'configure' for op, _ in transport.calls)
+        finally:
+            await controller.shutdown()
+            window.close()
+    asyncio.run(run())
+
+
+def test_late_startup_page_checked_after_initial_hall_handoff(app, tmp_path):
+    async def run():
+        controller, service, transport, window = make_controller(tmp_path)
+        response = [{'ready': True}]
+        calls = []
+        async def cleanup():
+            calls.append(True)
+            return response[0]
+        transport.dismiss_startup = cleanup
+        try:
+            await ready(controller, service)
+            initial = len(calls)
+            controller._next_full_poll = 0
+            response[0] = {'ready': False, 'pendingStartup': True, 'message': '已点击开屏页关闭按钮：LateFirstFaceUI'}
+            await controller.poll()
+            assert len(calls) > initial
+            assert 'LateFirstFaceUI' in window.action_label.text()
+            response[0] = {'ready': False, 'message': '待手动关闭的开屏页面：LegionUI'}
+            controller._next_full_poll = 0
+            controller._feature_ready_session = None
+            await controller.poll()
+            assert controller._feature_ready_session == controller.state.installed
+            controller._startup_watch_until = 0
+            controller._next_full_poll = 0
+            before = len(calls)
+            await controller.poll()
+            assert len(calls) == before
         finally:
             await controller.shutdown()
             window.close()
@@ -424,8 +500,9 @@ class FakeCdp:
         if expression==m.LOCATION_PROBE:value=f'https://servicewechat.com/{self.appid}/65/page-frame.html'
         elif expression==m.GAME_PROBE:
             value={'game':params.get('contextId')==self.context,'hall':self.hall,'resident_id':self.resident}
-        elif 'createEnergyRuntime' in expression:
-            self.resident='injected';value={'resident_id':'injected','capabilities':['energy']}
+        elif 'createPluginRuntime' in expression:
+            self.resident='injected';value={'resident_id':'injected','capabilities':['lazy-v1']}
+        elif 'r.register(' in expression:value=True
         elif expression.startswith('globalThis.__e0e1PluginRuntime'):
             value={'status':'ok','value':{'energy':30,'maximum':100,'safe':True}}
         else:raise AssertionError(expression)
@@ -460,7 +537,7 @@ def test_injection_during_context_destruction_cannot_mark_runtime_ready():
         original=fake.send
         async def send(method, params=None, **kwargs):
             response=await original(method,params,**kwargs)
-            if method=='Runtime.evaluate' and 'createEnergyRuntime' in params['expression']:
+            if method=='Runtime.evaluate' and 'createPluginRuntime' in params['expression']:
                 fake.handlers['Runtime.executionContextDestroyed']({'params':{'executionContextId':7}})
             return response
         fake.send=send
@@ -609,7 +686,7 @@ def test_reconnect_to_same_live_context_recognizes_own_resident_without_reinject
         probe=await transport.probe()
         assert probe['resident_id']=='injected'
         assert transport.session_id=='injected'
-        assert sum('createEnergyRuntime' in p.get('expression','') for method,p in fake.messages if p)==1
+        assert sum('createPluginRuntime' in p.get('expression','') for method,p in fake.messages if p)==1
         await transport.close()
     asyncio.run(run())
 
@@ -628,7 +705,7 @@ def test_unconfirmed_command_waits_for_js_terminal_state_without_replay():
             if method=='Runtime.evaluate' and params['expression'].startswith('globalThis.__e0e1PluginRuntime'):
                 actions.append(params['expression'])
                 raise asyncio.TimeoutError
-            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression']:
+            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression'] and 'r.register(' not in params['expression']:
                 reads+=1
                 return {'result':{'result':{'value':{'id':'injected','pending':reads<2}}}}
             return await original(method,params,**kwargs)
@@ -652,10 +729,9 @@ def test_resident_script_tracks_pending_operation_and_small_config_messages():
         fake=FakeCdp();transport=m.PluginTransport(cdp=fake)
         await transport.connect(62000)
         transport.session_id='injected';await transport.install()
-        source=next(params['expression'] for method,params in fake.messages if params and 'createEnergyRuntime' in params.get('expression',''))
+        source=next(params['expression'] for method,params in fake.messages if params and 'createPluginRuntime' in params.get('expression',''))
         # 用Node假运行api，仅验证生成的驻留容器，不操作任何游戏数据。
-        split=source.index('const id =')
-        source=source[:source.index('function createEnergyRuntime')]+'function createEnergyRuntime(g){return {dispatch:async()=>await g.release};}\nfunction createBattleAssistRuntime(){return {configure:async()=>{},destroy(){}};}\n'+__import__('pathlib').Path('package/plugin_manager/automation_overlay.js').read_text(encoding='utf-8')+'\n'+source[split:]
+        source+="\nglobalThis.__e0e1PluginRuntime.register('ui',()=>({dispatch:async()=>await globalThis.release}));"
         code='''const assert=require('node:assert/strict'); const vm=require('node:vm');
 const source=require('fs').readFileSync(process.argv[1],'utf8'); const g={};let resolve;g.release=new Promise(r=>resolve=r);vm.createContext(g);vm.runInContext(source,g);
 (async()=>{const r=g.__e0e1PluginRuntime;const job=r.dispatch('sweep',{});assert.equal(r.pending,true);const blocked=await r.dispatch('eye',{});assert.equal(blocked.status,'uncertain');await r.dispatch('configure',{daily:{enabled:false}});assert.equal(r.pending,true);resolve({status:'ok',value:1});await job;assert.equal(r.pending,false);await r.dispatch('stop',{});assert.equal((await r.dispatch('sweep',{})).status,'unavailable');})().catch(e=>{console.error(e);process.exit(1)});'''
@@ -689,7 +765,7 @@ def test_context_id_reuse_does_not_skip_new_request_terminal_check():
         async def send(method,params=None,**kwargs):
             if method=='Runtime.evaluate' and params['expression'].startswith('globalThis.__e0e1PluginRuntime'):
                 raise asyncio.TimeoutError
-            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression']:
+            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression'] and 'r.register(' not in params['expression']:
                 reads.append(True)
                 return {'result':{'result':{'value':{'id':'injected','pending':False}}}}
             return await original(method,params,**kwargs)
@@ -848,7 +924,7 @@ def test_wait_idle_reconnect_recognizes_confirmed_destroyed_context():
         transport._inflight={'id':'injected','context':7};fake.live=False
         original=fake.send
         async def send(method,params=None,**kwargs):
-            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression']:
+            if method=='Runtime.evaluate' and 'const r=globalThis.__e0e1PluginRuntime' in params['expression'] and 'r.register(' not in params['expression']:
                 raise RuntimeError(json.dumps({'code':-32000,'message':'Cannot find context with specified id'}))
             return await original(method,params,**kwargs)
         fake.send=send
@@ -1017,6 +1093,7 @@ def test_douyin_shutdown_has_deadline_when_game_never_replies(app,tmp_path):
 def test_game_stop_button_is_polled_while_a_task_is_waiting_and_finishes_at_home(app,tmp_path):
     async def run():
         c,s,t,w=make_controller(tmp_path)
+        w.store.set_ui_flag("automation_overlay", True)
         try:
             await ready(c,s)
             c.automation.set_automation(True)
@@ -1051,6 +1128,7 @@ def test_overlay_state_channel_does_not_wait_for_the_game_action_lock():
         transport.connected=True;transport.session_id='owned';transport.context_id=7
         marker={'id':'game-action'};transport._inflight=marker
         async def evaluate(expression,context_id=None,timeout_ms=0):
+            if 'r.register(' in expression:return True
             assert 'await o.update' in expression and 'owned' in expression
             return {'run_id':'run','stop_requested':True}
         transport._evaluate=evaluate
@@ -1087,6 +1165,7 @@ def test_next_check_countdown_respects_task_delay_disabled_tasks_and_daily_windo
 def test_idle_overlay_reports_waiting_and_next_check_timestamp(app,tmp_path):
     async def run():
         c,s,t,w=make_controller(tmp_path)
+        w.store.set_ui_flag("automation_overlay", True)
         try:
             await ready(c,s)
             for key in w.store.snapshot()['daily']['tasks']:w.store.set_task_enabled(key,False)

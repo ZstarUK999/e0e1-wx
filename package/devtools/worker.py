@@ -879,6 +879,7 @@ class AsyncDevtoolsWorker:
             "cdp_port_start": normalize_devtools_port(self.state.get("cdp_port"), DEFAULT_DEVTOOLS_CDP_PORT),
             "automatic": True,
             "auto_restore": True,
+            "channel": self.state.get('channel', 'wechat'),
         }
         for candidate in build_auto_restore_candidates(
             self.js_injection_states,
@@ -2150,6 +2151,7 @@ class AsyncDevtoolsWorker:
             "record_id": int(command.get("record_id") or 0),
             "owner_key": str(command.get("owner_key") or "").strip(),
             "display_name": str(command.get("display_name") or "").strip(),
+            "channel": str(command.get('channel') or 'wechat'),
         }
         if not session["owner_key"]:
             fallback_id = int(session["record_id"] or 0)
@@ -2268,6 +2270,7 @@ class AsyncDevtoolsWorker:
                 "owner_key": str(session.get("owner_key") or ""),
                 "display_name": str(session.get("display_name") or ""),
                 "record_id": int(session.get("record_id") or 0),
+                "channel": session.get('channel', 'wechat'),
                 "debug_port": normalize_devtools_port(debug_port, DEFAULT_MINIAPP_DEBUG_PORT),
                 "cdp_port": int(cdp_port or 0),
                 "link": link,

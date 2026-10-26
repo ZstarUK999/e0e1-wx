@@ -22,6 +22,8 @@ from .feature_flags import panel_enabled, task_enabled
 from .panels import BloodmoonPanel, DailyPanel, DamagePanel, DebugPanel, DesirePanel, GlobalPanel, PlayerPanel, TaskPanel, TreasurePanel
 from .store import PluginConfigStore
 from .legion import LegionPanel
+from .season_insight import SeasonInsightPanel
+from .flag_upgrade import FlagUpgradePanel
 from .auction import AuctionPanel
 from .battle_assist import create_battle_assist_panel, create_zhongkui_panel
 
@@ -129,6 +131,8 @@ class PluginWindow(QMainWindow):
         self._add_page("control_chain", create_battle_assist_panel(self.store))
         self._add_page("zhongkui", create_zhongkui_panel(self.store))
         self._add_page("bloodmoon", BloodmoonPanel(self.store))
+        self._add_page("season_insight", SeasonInsightPanel(self.store))
+        self._add_page("flag_upgrade", FlagUpgradePanel(self.store))
         self._add_page("player", PlayerPanel(self.store))
         self._add_page("treasure", TreasurePanel(self.store))
         self._add_page("legion", LegionPanel(self.store))
@@ -137,7 +141,9 @@ class PluginWindow(QMainWindow):
         self._add_page("damage", DamagePanel(self.store))
         self._add_page("desire", DesirePanel(self.store))
         self._add_page("debug", DebugPanel())
-        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("battle_assist", "PVE辅助"), ("bloodmoon", "血月战场"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("legion", "阴司透视"), ("auction", "拍卖助手"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
+        from .polling_controls import install_switches
+        install_switches(self.pages, self.store)
+        for key, title in (("global", "全局设置"), ("daily", "日常自动化"), ("battle_assist", "PVE辅助"), ("bloodmoon", "血月战场"), ("season_insight", "血月数据透视"), ("flag_upgrade", "战旗升级"), ("player", "玩家信息透视"), ("treasure", "摸金地图"), ("legion", "阴司透视"), ("auction", "拍卖助手"), ("damage", "PVP伤害分析"), ("desire", "三尸合成"), ("debug", "调试信息")):
             if key == "auction" and build_info().is_release:
                 continue
             if not panel_enabled(key):
@@ -236,7 +242,7 @@ class PluginWindow(QMainWindow):
                 button.setEnabled(False)
             self._root.setCurrentWidget(self.gate)
             callback(platform)
-        for platform, label in (('wechat', '微信小游戏'), ('douyin', '抖音 PC 小游戏')):
+        for platform, label in (('wechat', '微信小游戏'), ('douyin', '抖音 PC 小游戏'), ('androws', '应用宝小游戏')):
             button = QPushButton(label)
             button.setMinimumSize(180, 52)
             button.clicked.connect(lambda checked=False, key=platform: choose(key))
@@ -245,7 +251,7 @@ class PluginWindow(QMainWindow):
         row.addStretch()
         layout.addLayout(row)
         layout.addStretch()
-        self.platform_buttons = dict(zip(('wechat', 'douyin'), buttons))
+        self.platform_buttons = dict(zip(('wechat', 'douyin', 'androws'), buttons))
         self._root.addWidget(page)
         self._root.setCurrentWidget(page)
 
@@ -524,6 +530,8 @@ class PluginWindow(QMainWindow):
         self.game_connected = self.runtime_ready = False
         self._busy_task = None
         self.set_automation_ready(False)
+        self.pages['season_insight'].set_ready(False)
+        self.pages['flag_upgrade'].clear_session()
         treasure = self.pages["treasure"]
         treasure.set_enabled(False)
         bloodmoon = self.pages["bloodmoon"]

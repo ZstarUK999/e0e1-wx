@@ -70,6 +70,9 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   assert.equal(files.has(base+'response.json'),false,'ack releases platform file');
   assert.equal(context.executed,1,'transfer never replays game operations');
   responseLimit=Infinity;
+  context.damageCurveJson=cursor=>({cursor});
+  command('damage-delta','damage-snapshot',{cursor:{stream:7,includeCatalog:false,self:{instanceId:1,events:10,hits:3}}});await tick();
+  assert.deepEqual(JSON.parse(JSON.stringify(response().value.cursor)),{stream:7,includeCatalog:false,self:{instanceId:1,events:10,hits:3}});
   context.tt.setKeepScreenOn({keepScreenOn:false});
   files.set(base+'lease.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now()}));
   pulse();for(let i=0;i<12;i++)await Promise.resolve();
@@ -99,6 +102,7 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
     assert.equal(overlayUpdates,0);
   }
   files.set(base+'automation.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',at:Date.now(),payload:{active:true}}));pulse();
+  await Promise.resolve(); // Overlay updates also pass through the lazy loader's promise.
   assert.equal(overlayUpdates,1);assert.equal(state().automation.stop_requested,true);
   for(const patch of [{token:'other'},{runtime:'old'},{resident:'someone-else'}]){
     files.set(base+'shutdown.json',JSON.stringify({token:'fixture-token',runtime:state().runtime,resident:'resident',...patch}));pulse();assert.equal(marksStopped,0);

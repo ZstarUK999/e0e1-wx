@@ -85,15 +85,20 @@ def estimate_pvp(stats,history=None):
     magic=max(0,float(stats.get('magic',{}).get('best') or 0)-float(stats.get('magic',{}).get('current') or 0))
     low=high=base+desire+magic
     kind=stats.get('face_kind')
-    if kind=='wukong':
-        low-=float(stats.get('face_pvp') or 0);high=low
+    if kind!='erlang':
+        # Sum available pieces even for empty slots, mixed sets and partial sets.
+        # Keep the aggregate fallback for older stored inputs without piece data.
+        faces=stats.get('faces')
+        face_pvp=(sum(float(face.get('pvp') or 0) for face in faces if isinstance(face,dict))
+                  if isinstance(faces,list) else float(stats.get('face_pvp') or 0))
+        low-=face_pvp;high=low
+        face_label='悟空脸谱' if kind=='wukong' else '当前已穿脸谱（逐件合计）'
         if history:
             bonus=float(history.get('set_bonus',ERLANG_SET_BONUS))
             low+=float(history['pvp'])+bonus;high=low
-            note='悟空脸谱扣除 '+percent(stats['face_pvp'])+'，替换为历史二郎脸谱 '+percent(history['pvp'])+'＋套装 '+percent(bonus)
+            note=face_label+'扣除 '+percent(face_pvp)+'，替换为历史二郎脸谱 '+percent(history['pvp'])+'＋套装 '+percent(bonus)
         else:
             low+=40+ERLANG_SET_BONUS;high+=50+ERLANG_SET_BONUS
-            note='悟空脸谱扣除 '+percent(stats['face_pvp'])+'；无二郎历史，脸谱40%–50%＋套装10%，按50%–60%补入'
+            note=face_label+'扣除 '+percent(face_pvp)+'；无二郎历史，脸谱40%–50%＋套装10%，按50%–60%补入'
     elif kind=='erlang':note='当前穿二郎：保留属性中的脸谱及套装10%加成，不作扣除、不重复添加'
-    else:note='当前不是完整二郎／悟空套装：保留当前脸谱，不作替换'
     return {'low':round(low,6),'high':round(high,6),'base':base,'desire_extra':desire,'magic_extra':magic,'face_note':note,'missing':missing}

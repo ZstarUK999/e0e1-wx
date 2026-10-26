@@ -104,8 +104,8 @@ class RealDebugEngineBridge:
         status_callback: Callable[[dict], None],
     ) -> None:
         """启动真实 DebugEngine 并注册状态回调。"""
-        del session
         options = BridgeOptions(cdp_port=cdp_port, debug_port=debug_port)
+        options.channel = session.get('channel', 'wechat')
         engine = DebugEngine(options, WorkerLogger())
         engine.on_status_change(lambda state: status_callback(dict(state)))
         try:

@@ -129,7 +129,7 @@ def test_selector_defers_services_until_choice(tmp_path, monkeypatch):
     instance = assembly.PluginApplication(tmp_path/'config.json', platform=None)
     window = instance._create_window()
     assert not calls
-    assert set(window.platform_buttons) == {'wechat','douyin'}
+    assert set(window.platform_buttons) == {'wechat','douyin','androws'}
     window.platform_buttons['douyin'].click()
     assert isinstance(calls[0]['transport'], module.DouyinTransport)
     assert isinstance(calls[0]['service'], module.DouyinService)
@@ -176,6 +176,10 @@ def test_real_node_python_bridge_reuses_resident_and_damage_script(tmp_path):
             batch=await transport.legion_scan_call('players',['12000100','12000101'])
             assert [row['value']['id'] for row in batch]==['12000100','12000101']
             assert (await transport.legion_scan_call('search','测试阴司'))['id'] == '42'
+            insight=await transport.season_insight('history')
+            assert insight['rows'][0]['warId']=='fixture-war'
+            ranks=await transport.season_insight('ranks',{'warId':'fixture-war'})
+            assert ranks=={'warId':'fixture-war','legions':[],'roles':[]}
             result = await transport._rpc('damage-debug', timeout_ms=30000)
             assert result == {'text':'中文😀'*100000}
             for _ in range(30):
@@ -192,7 +196,10 @@ def test_real_node_python_bridge_reuses_resident_and_damage_script(tmp_path):
             assert enabled['enabled'] is True
             status = await transport.damage_status()
             assert status['running'] and status['hasCfg'] and status['hasBattleManager']
-            assert isinstance(await transport.damage_snapshot(), dict)
+            packet=await transport.damage_snapshot()
+            assert packet['recordingSchema']==1 and 'catalog' in packet
+            delta=await transport.damage_snapshot(cursor=dict(stream=packet['stream'],includeCatalog=False,pair=packet['pvp']['instanceKey']))
+            assert 'catalog' not in delta
             assert (await transport.damage_stop())['enabled'] is False
             assert (await transport.damage_status())['running'] is False
             assert await transport.call('stop') is True

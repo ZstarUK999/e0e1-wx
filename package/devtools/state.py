@@ -22,6 +22,7 @@ def default_state(*, worker_alive: bool = False, message: str = "未启动调试
         "owner_key": "",
         "display_name": "",
         "record_id": 0,
+        "channel": "wechat",
         "debug_port": DEBUG_PORT,
         "cdp_port": 0,
         "link": "",

@@ -1,4 +1,5 @@
 from copy import deepcopy
+import pytest
 
 from package.plugin_manager.player_pvp import PlayerPvpHistory,estimate_pvp
 
@@ -29,6 +30,30 @@ def test_wukong_range_and_history_only_replace_face_contribution():
     assert '套装 10%' in value['face_note']
     # Explicitly recorded bonus is used once, not added on top of the default.
     assert estimate_pvp(stats('wukong'),{'pvp':60,'set_bonus':10})['low']==222
+
+
+@pytest.mark.parametrize('pieces', [[], [6], [6, 4, 2], [6] * 7, [6] * 8])
+@pytest.mark.parametrize('history', [None, {'pvp':60,'set_bonus':10}])
+def test_empty_partial_and_mixed_sets_replace_each_available_piece(pieces, history):
+    current=stats('other')
+    current['face_complete']=False
+    current['faces']=[{'slot':i+1,'pvp':value} for i,value in enumerate(pieces)]
+    current['face_pvp']=999  # Per-piece observations determine the deduction.
+    value=estimate_pvp(current,history)
+    expected=200-sum(pieces)
+    assert value['low']==expected+(70 if history else 50)
+    assert value['high']==expected+(70 if history else 60)
+    assert '逐件合计' in value['face_note']
+
+
+def test_partial_erlang_never_overwrites_full_history(tmp_path):
+    store=PlayerPvpHistory(tmp_path/'scan.db','wechat')
+    history=store.observe(stats())
+    current=stats('other');current['faces']=current['faces'][:3]
+    current['face_complete']=False;current['face_pvp']=18
+    result=store.decorate({'text':'正文','pvp_estimate':current})
+    assert result['pvp_result']['low']==200-18+48+10
+    assert store.observe(current)==history
 
 
 def test_full_snapshot_history_persists_and_is_platform_and_player_isolated(tmp_path):

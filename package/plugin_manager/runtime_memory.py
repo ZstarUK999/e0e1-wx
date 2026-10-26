@@ -10,7 +10,8 @@ LOG=logging.getLogger('plugin_manager.memory')
 LOG.propagate=False  # 文件日志单独接入此 logger，不传到父级或控制台。
 HEALTH_EXPRESSION=r"""(() => {
  const g=globalThis,out={overlays:g.__e0e1GameOverlaysEnabled!==false};
- function read(key,fn){try{out[key]=fn();}catch(e){out[key]={unavailable:true};}}
+ out.loadedFeatures=g.__e0e1PluginRuntime && g.__e0e1PluginRuntime.features?Object.keys(g.__e0e1PluginRuntime.features):[];
+ function read(key,fn){try{out[key]=fn();}catch(e){out[key]={unavailable:true,error:String(e && (e.stack || e.message) || e).slice(0,1200)};}}
  read('battle',()=>g.__e0e1BattleAssist && g.__e0e1BattleAssist.resourceStatus?g.__e0e1BattleAssist.resourceStatus():null);
  read('automation',()=>g.__e0e1AutomationOverlay && g.__e0e1AutomationOverlay.resourceStatus?g.__e0e1AutomationOverlay.resourceStatus():null);
  read('treasure',()=>typeof g.treasureMapOverlayStatus==='function'?g.treasureMapOverlayStatus():null);

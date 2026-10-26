@@ -1,6 +1,7 @@
 """载荷压缩与 CSV：决定 HTML 报告里带哪些字段。"""
 
 from __future__ import annotations
+from .analysis import analyze_recording
 
 # ── 载荷压缩 ──
 
@@ -8,7 +9,7 @@ from __future__ import annotations
 _KEEP_FIELDS = (
     "side replay instanceId battleType seed bucketSeconds duration buckets eventCount truncated "
     "totalDamage bossDamage categories curves skills books branches activeBranches players"
-    " perSecondTop perSecondBossTop factorRows factorSnapshots factorSources factorsTruncated"
+    " perSecondTop perSecondBossTop factorRows factorSnapshots factorSources factorsTruncated initialAttributes diagnostics recordingOnly analysisNotes"
 ).split()
 
 
@@ -26,6 +27,7 @@ def slim(data: dict, keep_events: bool) -> dict:
 
     PVP 时主视图取我方（self），并带上 pvp 分数与敌方汇总（不含原始事件）。
     """
+    data=analyze_recording(data)
     if "self" not in data and "other" not in data:
         return _slim_side(data, keep_events) or {}
     out = _slim_side(data.get("self"), keep_events) or {}
@@ -68,6 +70,7 @@ def _csv_cell(value) -> str:
 
 def render_csv(data: dict) -> str:
     """逐条伤害事件 CSV，双方合一，第一列 side 区分敌我。"""
+    data=analyze_recording(data)
     rows = [CSV_COLUMNS]
     sides = [(key, data[key]) for key in ("self", "other") if data.get(key)]
     if not sides:

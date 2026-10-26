@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..damage_report import write_outputs
+from ..damage_report.analysis import RecordingStream, analyze_recording
 
 LOG = logging.getLogger('plugin_manager')
 
@@ -27,6 +28,7 @@ class DamageFeature:
         self.panel = panel
         self.store = store
         self._injected = False
+        self.forced_replay = False
         self._pending = None      # 当前（或刚结束）这一场最后一次快照
         self._last = None         # 最近一次取到的快照，仅用于展示
         self._battle_key = None   # 当前这一场的标识，变了就是新一场
@@ -37,6 +39,8 @@ class DamageFeature:
         self._take_lock = asyncio.Lock()
         self._snapshot_signature = None
         self._next_snapshot = 0.0
+        self._recording_stream=RecordingStream()
+        self._capture_generation=0
         self.panel.set_report_directory(REPORT_DIR)
 
     # ── 面板操作 ──
@@ -64,6 +68,7 @@ class DamageFeature:
                     self.panel.set_summary(json.dumps(info, ensure_ascii=False, indent=2))
                 self.panel.message.setText('诊断信息已显示在上方，可直接复制发给我')
             elif op == 'reset':
+                self._capture_generation+=1
                 message = await self.transport.damage_reset()
                 self._last = None
                 self._pending = None
@@ -74,6 +79,7 @@ class DamageFeature:
                 self.panel.set_status(str(message))
                 self.panel.set_summary('已清空，进入下一场 PVP 会重新开始采集')
             elif op == 'stop':
+                self._capture_generation+=1
                 message = await self.transport.damage_stop()
                 self._injected = False
                 self.panel.set_status('已停止采集')
@@ -116,6 +122,8 @@ class DamageFeature:
         result = await self.transport.damage_inject()
         self._injected = True
         LOG.info('伤害采集脚本已持久注入：%s', result.get('message') or '')
+        if result.get('log'):
+            LOG.info('%s', result['log'])
 
     # ── 每秒轮询 ──
 
@@ -125,13 +133,15 @@ class DamageFeature:
         self.panel.set_ready(ready)
         if not ready:
             return
-        if not damage.get('enabled'):
+        if not damage.get('enabled') and not self.forced_replay:
             if self._injected:
+                self._capture_generation+=1
                 # 关掉开关就顺手停掉，避免继续在页面里跑
                 try:
                     await self.transport.damage_stop()
                 except Exception as exc:
                     LOG.warning('停止伤害采集失败：%s', exc)
+                    return  # Preserve injected state so the next poll retries cleanup.
                 self._injected = False
                 self._pending = None
                 self._battle_key = None
@@ -160,7 +170,13 @@ class DamageFeature:
             await self._take(force=force)
 
     async def _take(self, *, force: bool = False) -> None:
+        capture_generation=self._capture_generation
+        capture_context=getattr(self.transport,'context_id',None)
+        def current():
+            return (capture_generation==self._capture_generation and not self.state.closing
+                    and capture_context==getattr(self.transport,'context_id',None))
         status = await self.transport.damage_status()
+        if not current():return
         hooked = int(status.get('hooked') or 0) if isinstance(status, dict) else 0
         sides = (status.get('sides') or {}) if isinstance(status, dict) else {}
         signature = (getattr(self.transport, 'context_id', None), json.dumps({
@@ -172,12 +188,25 @@ class DamageFeature:
         has_retained = any(isinstance(side, dict) and side.get('eventCount') for side in sides.values())
         # The JS collector retains the final pure-data snapshot after World detach.
         # Fetch it once when its revision differs, before writing the final report.
-        fetch = force or changed and (hooked > 0 or has_retained or self._pending is not None)
+        needs_catalog=(isinstance(status,dict) and status.get('recordOnly')
+                       and self._recording_stream.cursor(capture_context) is None)
+        fetch = force or needs_catalog or changed and (hooked > 0 or has_retained or self._pending is not None)
         if fetch and hooked > 0 and not force and identities == previous_ids and time.monotonic() < self._next_snapshot:
             fetch = False
         if fetch:
             started = time.monotonic()
-            data = await self.transport.damage_snapshot()
+            if isinstance(status,dict) and status.get('recordOnly'):
+                context=getattr(self.transport,'context_id',None)
+                packet=await self.transport.damage_snapshot(cursor=self._recording_stream.cursor(context))
+                if not current():return
+                if isinstance(packet,dict):
+                    def process():
+                        return analyze_recording(self._recording_stream.merge(packet,context))
+                    data=await asyncio.to_thread(process)
+                else:data=None
+            else:
+                data = await self.transport.damage_snapshot()
+            if not current():return
             if isinstance(data, dict) and self._has_data(data):
                 self._snapshot_signature = signature
                 self._snapshot_ids = identities
@@ -187,8 +216,10 @@ class DamageFeature:
                 if key != self._battle_key:
                     if self._pending is not None and not self._written:
                         await self.write_report(self._pending, '上一场')
+                        if not current():return
                     self._battle_key = key
                     self._written = False
+                    self._log_diagnostics(data, '开始')
                 self._pending = data
                 self._written = False
                 self.panel.set_status(self.status_text(data))
@@ -222,6 +253,7 @@ class DamageFeature:
             self.panel.refresh_report_history(preferred=html)
             self.panel.message.setText('伤害报告已生成')
             LOG.info('%s伤害报告已生成：%s（后台耗时 %.2f秒）', label, html, time.monotonic()-started)
+            self._log_diagnostics(data, '报告')
             return True
         except OSError as exc:
             LOG.error('伤害报告写入失败：%s', exc)
@@ -229,6 +261,26 @@ class DamageFeature:
             return False
 
     # ── 渲染 ──
+
+    @staticmethod
+    def _log_diagnostics(data: dict, phase: str) -> None:
+        for key in ('self', 'other'):
+            side = data.get(key) or {}
+            diag = side.get('diagnostics') or {}
+            if not diag:
+                continue
+            rows, samples = side.get('factorRows') or [], side.get('factorSnapshots') or []
+            LOG.info('伤害采集探针[%s/%s] 版本=%s World=%s 类型=%s 事件=%s 命中乘区=%s 每秒快照=%s 初始属性=%s 模块=%s 计数=%s 样本=%s',
+                     phase, key, diag.get('version'), side.get('instanceId'), side.get('battleType'),
+                     side.get('eventCount'), len(rows), len(samples),
+                     (side.get('initialAttributes') or {}).get('status'),
+                     json.dumps(diag.get('modules') or {}, ensure_ascii=False),
+                     json.dumps(diag.get('counts') or {}, ensure_ascii=False),
+                     json.dumps([s for s in diag.get('samples') or []
+                                 if any(word in s.get('reason', '') for word in ('skip', 'missing', 'exception', 'filtered'))][:8]
+                                if phase == '报告' else [], ensure_ascii=False))
+            if side.get('eventCount') and not rows:
+                LOG.warning('伤害采集异常[%s]：有伤害事件但无实际命中乘区；完整探针见同名 JSON 的 diagnostics 字段', key)
 
     @staticmethod
     def _battle_key_of(data) -> tuple | None:
@@ -252,6 +304,8 @@ class DamageFeature:
             return False
         for side in (data.get('self'), data.get('other')):
             if isinstance(side, dict) and side.get('eventCount'):
+                return True
+            if isinstance(side, dict) and (side.get('initialAttributes') or {}).get('status')=='captured':
                 return True
         return bool(data.get('pvp'))
 
@@ -394,6 +448,7 @@ class DamageFeature:
                          f" · 事件 {side.get('eventCount')} 条")
             lines.append(f"   总伤害 {side.get('totalDamage')} · 对敌方英雄 {side.get('bossDamage')}")
             total = side.get('totalDamage') or 0
+            lines.extend('   '+note for note in side.get('analysisNotes',[]))
             for cat in (side.get('categories') or []):
                 pct = f"{cat['dmg'] / total * 100:.1f}%" if total else '-'
                 lines.append(f"   {cat.get('label')}\t{cat.get('dmg')}\t{pct}")

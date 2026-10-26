@@ -296,6 +296,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="players" id="players"></div>
     </section>
 
+    <section class="card" id="initial-attrs-card">
+      <h2>开战初始属性对比</h2>
+      <p class="note" id="initial-attrs-note">读取首次伤害前的双方属性快照。</p>
+      <div class="formula-comparison-body" id="initial-attrs-table"></div>
+    </section>
+
     <section class="card" id="attr-card" hidden>
       <h2>伤害乘区趋势</h2>
       <div class="filters">
@@ -1460,6 +1466,40 @@ HTML_TEMPLATE = r"""<!doctype html>
     return row;
   }
   function formulaTableHead(table){var head=el('tr');['我方','差值（我方 − 敌方）','敌方'].forEach(function(label){head.appendChild(el('th',null,label));});table.appendChild(head);}
+  function renderInitialAttributes(){
+    var left=DATA.initialAttributes,right=DATA.other && DATA.other.initialAttributes;
+    function valid(snapshot){return snapshot && snapshot.status==='captured' && snapshot.attributes;}
+    var a=valid(left)?left.attributes:{},b=valid(right)?right.attributes:{};
+    var note=document.getElementById('initial-attrs-note'),box=document.getElementById('initial-attrs-table');
+    while(box.firstChild)box.removeChild(box.firstChild);
+    if(!valid(left) && !valid(right)){
+      note.textContent='未采集到开战初始属性。旧报告或开战后才开启的采集无法补齐，需在下一场开始前开启分析。';return;
+    }
+    note.textContent='战斗初始化完成、首次伤害前的面板属性；不依赖伤害命中记录。'
+      +(valid(left)?' 我方 '+Number(left.time||0).toFixed(2)+'s。':' 我方初始快照缺失。')
+      +(valid(right)?' 敌方 '+Number(right.time||0).toFixed(2)+'s。':' 敌方初始快照缺失。')
+      +' 差值为我方减敌方；百分比属性的差值单位为百分点。';
+    a=Object.assign({},a);b=Object.assign({},b);
+    var selfRed=left && left.context && left.context.opponentPvpRed;
+    var otherRed=right && right.context && right.context.opponentPvpRed;
+    if(a[117]!==undefined && (selfRed!==undefined || b[118]!==undefined))a.finalPvp=a[117]-(selfRed===undefined?b[118]:selfRed);
+    if(b[117]!==undefined && (otherRed!==undefined || a[118]!==undefined))b.finalPvp=b[117]-(otherRed===undefined?a[118]:otherRed);
+    var metadata=((left && left.attrMeta) || (right && right.attrMeta) || []),keys=Object.keys(a);
+    Object.keys(b).forEach(function(key){if(keys.indexOf(key)<0)keys.push(key);});
+    keys.sort(function(x,y){return x==='finalPvp'?1:y==='finalPvp'?-1:Number(x)-Number(y);});
+    var table=el('table','bonus-compare'),head=el('tr');
+    ['属性','我方','差值（我方 − 敌方）','敌方'].forEach(function(label){head.appendChild(el('th',null,label));});table.appendChild(head);
+    keys.forEach(function(key){
+      var meta=metadata.find(function(row){return String(row.key)===key;}) || {label:key,percent:false};
+      var va=bonusValue(a,key),vb=bonusValue(b,key),delta=va===null || vb===null?null:va-vb;
+      var row=el('tr');row.appendChild(el('td',null,meta.label || meta.note || key));
+      row.appendChild(el('td',delta>0?'bonus-winner':delta<0?'bonus-lower':'',fmtAttr(meta,va)));
+      row.appendChild(el('td','bonus-diff',formulaDifference(va,vb,meta.percent,true)));
+      row.appendChild(el('td',delta<0?'bonus-winner':delta>0?'bonus-lower':'',fmtAttr(meta,vb)));
+      table.appendChild(row);
+    });
+    box.appendChild(table);
+  }
   function renderFormulaComparison(){
     var panel=document.getElementById('formula-comparison'),box=document.getElementById('bonus-summary');
     if(formulaState.sec===null){panel.hidden=true;return;}
@@ -1587,7 +1627,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       var valid=pair[1].filter(function(row){return Number.isFinite(formulaFactorValue(row,zone.key));});
       return pair[0]+(valid.length ? '起始记录 '+Math.min.apply(null,valid.map(function(row){return row.sec;}))+'s' : '暂无该类型命中');
     }).join('，');
-    document.getElementById('formula-chart-note').textContent=seconds.length ? zone.label+' · '+firstHits+'；首次命中前暂无实测倍率。曲线显示本秒最高值，悬停数值查看加权贡献；独立/特殊结算另列，虚线连接无命中间隔（非逐秒实测）。BOSS扣血结算为独立观测项。点击某秒查看真实记录、属性与来源。' : '暂无该攻击类型的 BOSS 实际乘区记录，请切换类型；旧版未采集的报告需要重新采集。';
+    document.getElementById('formula-chart-note').textContent=seconds.length ? zone.label+' · '+firstHits+'；首次命中前暂无实测倍率。曲线显示本秒最高值，悬停数值查看加权贡献；独立/特殊结算另列，虚线连接无命中间隔（非逐秒实测）。BOSS扣血结算为独立观测项。点击某秒查看真实记录、属性与来源。' : '该类型没有可用的乘区记录；即使伤害统计中有命中，也可能未采集到对应乘区。已有报告无法补回缺失的快照，请在更新采集器后重新进行战斗或重放。';
     if(aRows.concat(bRows).some(function(row){return row.sampleKind==='second';}))document.getElementById('formula-chart-note').textContent=zone.label+' · 每秒读取当前属性，曲线和表格显示本秒最高值；变化时悬停数字查看快照均值及逐条依据；未暴击/未触发随机效果。技能系数不在快照中推测，实际命中保留在底部。总乘积含攻击值，不含基础技能系数、扣血观测比与取整。缺少角色或BOSS时留空，不补造数据。';
   }
   function renderFormulaFilters(){
@@ -1813,7 +1853,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     var sideName = state.side === "other" ? "敌方" : "我方";
     document.getElementById("chart-title").textContent = sideName + " · " + viewName + scopeName;
     document.getElementById("chart-sub").textContent =
-      "每格 1s，共 " + shown.length + " 条曲线" + (side.truncated ? "；原始事件已截断，曲线仍完整" : "");
+      "每格 1s，共 " + shown.length + " 条曲线" + (side.truncated ? (side.recordingOnly ? "；原始事件已截断，曲线仅覆盖已保存事件" : "；原始事件已截断，曲线仍完整") : "");
 
     drawLine(document.getElementById("svg-main"), document.getElementById("tip-main"), shown, { height: 320, showPercent:state.view==='dps', percentTotals:((side.curves || []).find(function(c){return c.key==='__total';}) || {})[state.scope==='boss' ? 'bossPerSecond' : 'perSecond'] });
 
@@ -1985,6 +2025,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     renderPvp();
     renderAttrs();
     renderPlayers();
+    renderInitialAttributes();
     selectLevelAll();
     renderTree();
 
