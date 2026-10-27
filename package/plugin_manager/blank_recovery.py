@@ -24,6 +24,7 @@ class BlankScreenRecovery:
         self.next_restart = 0
         self.restarting = False
         self.disconnected = False
+        self.reason = "持续白屏／黑屏"
 
     async def _capture(self):
         from .wechat_image_launch import WechatImageLauncher
@@ -33,7 +34,7 @@ class BlankScreenRecovery:
         if active:
             self.last_active = self.clock()
 
-    async def poll(self, *, active, disconnected, kicked, closing):
+    async def poll(self, *, active, disconnected, kicked, closing, unresponsive=False):
         self.observe(active)
         now = self.clock()
         eligible = active or self.last_active is not None and now-self.last_active <= 120
@@ -46,7 +47,7 @@ class BlankScreenRecovery:
         self.next_check = now + 5
         self.disconnected = disconnected
         try:
-            result = await self.capture()
+            result = (0, 'unresponsive') if unresponsive else await self.capture()
         except Exception:
             self.candidate, self.samples = None, 0
             raise
@@ -55,20 +56,24 @@ class BlankScreenRecovery:
             self.candidate = None
             self.samples = 0
             return
+        stalled = result[1] == 'unresponsive'
+        threshold = 60 if stalled else 15
+        description = '游戏调试上下文持续无响应' if stalled else '游戏客户区纯' + {'white':'白','black':'黑'}.get(result[1],result[1])
         if result != self.candidate:
             self.candidate, self.since, self.samples = result, now, 1
-            LOG.info('检测到游戏客户区纯%s，开始连续15秒确认：窗口=%s，断线=%s',
-                     {'white': '白', 'black': '黑'}.get(result[1], result[1]), result[0], disconnected)
+            LOG.info('检测到%s，开始连续%d秒确认：窗口=%s，断线=%s',
+                     description, threshold, result[0], disconnected)
             return
         self.samples += 1
-        if self.samples < 3 or now-self.since < 15:
+        if self.samples < 3 or now-self.since < threshold:
             return
         # 同一轮恢复失败后继续完整重开，不依赖已消失的旧窗口再次触发。
         self.candidate, self.samples = None, 0
+        self.reason = description
         self.restarting = True
         try:
-            LOG.warning('游戏客户区持续纯%s %.1f秒，开始图像重开：窗口=%s，断线=%s',
-                        {'white': '白', 'black': '黑'}.get(result[1], result[1]), now-self.since, result[0], disconnected)
+            LOG.warning('%s已确认 %.1f秒，开始重开游戏：窗口=%s，断线=%s',
+                        description, now-self.since, result[0], disconnected)
             for attempt in range(RESTART_MAX_RETRIES + 1):
                 try:
                     await self.restart()

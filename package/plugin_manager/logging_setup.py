@@ -8,6 +8,31 @@ import sys
 from pathlib import Path
 
 
+class BoundedQueueHandler(logging.handlers.QueueHandler):
+    """Drop excess records rather than blocking Qt or growing memory without bound."""
+    def __init__(self, records):
+        super().__init__(records)
+        self.dropped = 0
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            self.dropped += 1
+
+
+class BoundedQueueListener(logging.handlers.QueueListener):
+    def enqueue_sentinel(self):
+        # Producers are detached before stop; make room without blocking the GUI.
+        while True:
+            try:
+                self.queue.put_nowait(self._sentinel)
+                return
+            except queue.Full:
+                try: self.queue.get_nowait(); self.queue.task_done()
+                except queue.Empty: pass
+
+
 class FileLogging:
     def __init__(self, path: Path):
         self.path=Path(path)
@@ -15,10 +40,10 @@ class FileLogging:
         self.logger=logging.getLogger('plugin_manager')
         self.original_level=self.logger.level
         self.logger.setLevel(logging.INFO)
-        self.queue_handler=logging.handlers.QueueHandler(queue.Queue())
+        self.queue_handler=BoundedQueueHandler(queue.Queue(maxsize=4096))
         self.file_handler=logging.handlers.RotatingFileHandler(self.path,maxBytes=5*1024*1024,backupCount=3,encoding='utf-8')
         self.file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s',datefmt='%Y-%m-%d %H:%M:%S'))
-        self.listener=logging.handlers.QueueListener(self.queue_handler.queue,self.file_handler)
+        self.listener=BoundedQueueListener(self.queue_handler.queue,self.file_handler)
         self.logger.addHandler(self.queue_handler)
         self.memory_logger=logging.getLogger('plugin_manager.memory')
         self.memory_logger.propagate=False
@@ -32,6 +57,10 @@ class FileLogging:
         self.logger.removeHandler(self.queue_handler)
         self.memory_logger.removeHandler(self.queue_handler)
         self.listener.stop()
+        if self.queue_handler.dropped:
+            record=self.logger.makeRecord(self.logger.name,logging.WARNING,__file__,0,
+                '日志写入积压，已丢弃 %d 条记录', (self.queue_handler.dropped,),None)
+            self.file_handler.handle(record)
         self.file_handler.close()
         self.logger.setLevel(self.original_level)
 

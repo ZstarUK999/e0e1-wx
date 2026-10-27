@@ -370,7 +370,7 @@ return {{resident_id:id,capabilities:['lazy-v1']}};
             # 三尸合成要等 spine 动画 + 确认框 + 奖励弹窗，30 秒会被误判成超时。
             if op in ('tomb_raid','tomb_targets','arena_challenge','free_summon'):
                 timeout=150000
-            elif op in ('desire_compose_once','desire_compose_open','desire_compose_close','pet_fodder_merge'):
+            elif op in ('desire_compose_once','desire_compose_open','desire_compose_close','pet_fodder_merge','pet_hatch_claim'):
                 timeout=60000
             else:
                 timeout=30000
@@ -640,6 +640,14 @@ return {{resident_id:id,capabilities:['lazy-v1']}};
     async def wechat_reconnect_status(self, enabled):
         if not self.connected or self.context_id is None:
             return None
+        # Poll with a tiny expression; reload only when the hook is absent/replaced.
+        if enabled:
+            status = await self._evaluate(
+                '(()=>{const s=globalThis.__e0e1WechatReconnect;'
+                'return s&&s.owner.showModal===s.wrapper?'
+                '{kicked:!!s.event,event:s.event,restarted:s.restarted}:null;})()',
+                self.context_id, timeout_ms=2000)
+            if isinstance(status, dict):return status
         source = Path(__file__).with_name('wechat_reconnect.js').read_text(encoding='utf-8')
         expression = '(async()=>{' + source + '\nreturn await configureWechatReconnect(globalThis,' + ('true' if enabled else 'false') + ');})()'
         return await self._evaluate(expression, self.context_id, timeout_ms=2000)

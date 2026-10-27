@@ -32,7 +32,7 @@ def install_switches(pages, store):
         ('auction', 'auction_poll', '启用拍卖助手与自动读取（关闭即停止购买）'),
         ('desire', 'desire_poll', '自动读取三尸库存（关闭后仍可手动操作）'),
         ('debug', 'memory_poll', '定期采集运行内存诊断（每5分钟）'),
-        ('global', 'blank_recovery', '检测持续白屏／黑屏并自动重开（仅微信）'),
+        ('global', 'blank_recovery', '检测持续白屏／黑屏或无响应并自动重开（仅微信）'),
         ('daily', 'automation_overlay', '同步游戏内托管状态与浮层（关闭后停止同步及浮层定时器）'),
     ):
         if page in pages:

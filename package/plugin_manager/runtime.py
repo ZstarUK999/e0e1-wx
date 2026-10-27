@@ -213,8 +213,22 @@ class PluginRuntime(QObject):
 
     async def _check_blank_game(self, active):
         try:
+            # Recheck the game context, not a stale timeout flag or screenshot.
+            unresponsive = bool(getattr(self.transport, 'unresponsive', False))
+            context = getattr(self.transport, 'context_id', None)
+            if unresponsive and self.transport.connected and context is not None:
+                try:
+                    await self.transport._evaluate('true', context, timeout_ms=1000)
+                    unresponsive = False
+                except (TimeoutError, ConnectionError, OSError):
+                    pass
+                except Exception:
+                    # A destroyed/changed context is handled by session recovery.
+                    unresponsive = False
+
             await self.blank_recovery.poll(
                 active=active,
+                unresponsive=unresponsive,
                 disconnected=bool(getattr(self.transport, 'unresponsive', False) or not self.transport.connected),
                 kicked=bool(self.wechat_reconnect and self.wechat_reconnect.event),
                 closing=self.state.closing)
@@ -229,12 +243,13 @@ class PluginRuntime(QObject):
         self.restart_resume.arm()
         await prepare_wechat_game()
         self.state.stop_operation = True
-        self.state.blocked = '正在重启白屏／黑屏游戏'
+        reason = self.blank_recovery.reason
+        self.state.blocked = '正在重启游戏：' + reason
         self.state.blocked_session = self.state.installed
         if self.automation.running:
             self.automation.set_automation(False)
         self.desire.request('stop')
-        self.window.action_label.setText('检测到持续白屏／黑屏，正在重新打开游戏')
+        self.window.action_label.setText(reason + '，正在重新打开游戏')
         await reopen_wechat_game(before_open=self.session.prepare_reopen)
         self._mark_reopened()
 
@@ -657,7 +672,13 @@ class PluginRuntime(QObject):
                 if self.state.closing or self.session.stale(epoch):
                     return
                 if time.monotonic() >= self._next_summary:
-                    LOG.info('插件日常摘要：%s', self.window.task_panels['energy'].runtime_message.text())
+                    if self.state.blocked:
+                        summary = '任务已暂停：' + self.state.blocked
+                    elif self.automation.busy:
+                        summary = '正在执行：' + str(self.automation.active)
+                    else:
+                        summary = '自动化运行中，等待下次任务' if self.automation.running else '自动化未启动'
+                    LOG.info('插件日常摘要：%s', summary)
                     self._next_summary = time.monotonic() + config['daily']['summary_interval_seconds']
                 if self._resume_restarted_tasks():
                     return
@@ -856,6 +877,8 @@ class PluginRuntime(QObject):
         self.state.closing = True
         self.state.stop_operation = True
         self.timer.stop()
+        from .wechat_launch import cancel_position_refresh
+        await cancel_position_refresh()
         await self.season_insight.close()
         await self.flag_upgrade.close()
         if self._controls_job and not self._controls_job.done():
@@ -900,6 +923,7 @@ class PluginRuntime(QObject):
             await self.transport.close()
             # 插件操作全部收尾后才停止内部调试worker；不停止微信进程。
         finally:
+            await cancel_position_refresh()
             # 前面的游戏清理失败时也必须回收监听 9421 的 worker。
             self.service.shutdown(wait=True)
             self.state.installed = self.state.configured = None

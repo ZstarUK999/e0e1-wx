@@ -298,3 +298,11 @@ test('a released MineOtherUI during PageTurning is observed without dereferencin
  f.h.wait=async predicate=>{for(let i=0;i<30;i++){const v=predicate();if(v)return v;await new Promise(r=>setTimeout(r,3));}throw Error('wait failed');};
  await f.api.dispatch('tomb_fill',{kind:'artifact',id:11});assert.equal(f.ROLE.artifactMine.helpNumDay,1);
 });
+
+test('arena retries result dismissal without repeating the challenge',async()=>{
+  const f=fixture(),click=f.h.click;let closes=0;
+  f.h.click=async b=>{if(b.name==='close-result' && ++closes===1)return;return click(b);};
+  const result=await f.api.dispatch('arena_challenge',{id:10});
+  assert(result.confirmed);assert.equal(closes,2);
+  assert.equal(f.events.filter(x=>x==='confirm-challenge').length,1);assert.equal(f.ROLE.arena.dayBattleNum,1);
+});

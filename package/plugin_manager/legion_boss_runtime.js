@@ -80,8 +80,69 @@ async function readLegionCrossBoss(g) {
   const own=theater && typeof theater.getRoleInfo==='function'?theater.getRoleInfo(bfId,Number(roleId)):null;
   const selfDamage=own && String(own.id)===roleId && Number.isFinite(own.bossDmgMax)?own.bossDmgMax:
     Number.isFinite(fieldInfo.bossDmgMax)?fieldInfo.bossDmgMax:null;
+  const cfg=await chunk('configs.ts');
+  const notes=[];
+  async function readOptional(name,params){
+    if(typeof BattlefieldService[name]!=='function'){notes.push('当前版本没有接口：'+name);return null;}
+    try{
+      const reply=await BattlefieldService[name](params);check();
+      return readReply(reply,'读取'+name+'失败');
+    }catch(e){check();notes.push(String(e.message||e));return null;}
+  }
+  const contributionReply=await readOptional('getBattlefieldRoleRank',{bfId});
+  const contributions=contributionReply && Array.isArray(contributionReply.rankList)?
+    contributionReply.rankList.map(packRank):null;
+  if(contributionReply && !contributions)notes.push('贡献榜返回结构异常');
+  const logs=[];let logTotal=null,logComplete=false,previousPage=null;
+  // Native UI uses one-based inclusive log ranges. Preserve identical events:
+  // two real attacks can share every field, so content is not an event ID.
+  for(let start=1;start<=20000;start+=100){
+    const page=await readOptional('getLegionBattleLog',{bfId,start,end:start+99});
+    if(!page)break;
+    if(!Array.isArray(page.logList)||!Number.isInteger(page.totalCount)||page.totalCount<0){
+      notes.push('战场日志返回结构异常');break;
+    }
+    if(logTotal===null)logTotal=page.totalCount;
+    else if(logTotal!==page.totalCount){notes.push('查询期间战场日志数量变化，请刷新后重试');break;}
+    const signature=JSON.stringify(page.logList);
+    if(page.logList.length && signature===previousPage){notes.push('日志分页重复，结果未标为完整');break;}
+    previousPage=signature;
+    for(const r of page.logList){
+      const monster=cfg.TheaterMonsterCfg.getById(r.monsterId);
+      logs.push({roleId:String(r.roleId),monsterId:r.monsterId,roundId:r.roundId,
+        targetRoleId:String(r.targetRoleId||0),targetLegionId:String(r.targetLegionId||0),
+        isWin:r.isWin,wave:r.wave,point:r.point,timeAt:r.timeAt,
+        kind:monster?monster.type===cfg.TheaterMonsterType.EIGHT?'player':
+          monster.type===cfg.TheaterMonsterType.NINE?'boss':'monster':'unknown'});
+    }
+    if(logs.length>=logTotal){logComplete=logs.length===logTotal;break;}
+    if(page.logList.length<100){notes.push('日志提前结束，结果未标为完整');break;}
+  }
+  if(!logComplete)notes.push('日志统计仅覆盖已读取记录，不能把缺失记录视为零次');
+  const currentField=theater && typeof theater.getBattleField==='function'?theater.getBattleField(bfId):null;
+  const memberBoss={};
+  if(currentField && currentField.roles && typeof currentField.roles.forEach==='function')
+    currentField.roles.forEach((r,id)=>{
+      if(ids.has(String(id)) && Number.isFinite(r.bossDmgMax))
+        memberBoss[String(id)]={damage:r.bossDmgMax,count:r.bossBattleCnt};
+    });
+  // isBossStage is a native calendar/config check and works before scene entry.
+  const bossOngoing=!!(typeof theater.isBossStage==='function' && theater.isBossStage());
+  let bossRewardRules=[];
+  if(bossOngoing){
+    const theaterCfg=cfg.TheaterCfg.getById(currentField && currentField.level || info.bfLevel);
+    const boss=theaterCfg && cfg.TheaterMonsterCfg.list.find(r=>r.group===theaterCfg.monster &&
+      r.type===cfg.TheaterMonsterType.NINE);
+    const final=boss && cfg.FinalDayCfg.getById(boss.stageId);
+    if(final)bossRewardRules=cfg.RankRewardCfg.list.filter(r=>r.group===final.rankReward).map(r=>({
+      from:r.num[0],to:r.num[1],points:r.reward.filter(x=>x.item===10035).reduce((n,x)=>n+x.num,0)}));
+    else notes.push('未找到当前战场Boss排名积分配置，预估贡献留空');
+  }
+  const unknownLogs=logs.filter(r=>r.kind==='unknown').length;
+  if(unknownLogs)notes.push(unknownLogs+'条日志的怪物类型配置缺失，未纳入进攻折算');
   check();
   return {roleId,legionId,legionName:String(info.name || ''),bfId,source:'legion-theater',
     bossName:'跨服战场 Boss',members,ranks,me,selfDamage,
-    rankLimit:500,stop,fetchedAt:new Date().toISOString()};
+    rankLimit:500,stop,contributions,logs,logTotal,logComplete,memberBoss,bossOngoing,
+    bossRewardRules,notes,fetchedAt:new Date().toISOString()};
 }

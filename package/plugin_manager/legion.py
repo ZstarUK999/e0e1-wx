@@ -153,7 +153,7 @@ class LegionFeature:
             self.panel.boss.message.setText('阴司查询正在进行，请稍后刷新');return
         self.job=asyncio.create_task(self.fetch_boss())
     async def fetch_boss(self):
-        panel=self.panel.boss;panel.refresh.setEnabled(False);panel.message.setText('正在拉取跨服 Boss 排名及本阴司完整成员…');session=self.state.installed
+        panel=self.panel.boss;panel.refresh.setEnabled(False);panel.message.setText('正在拉取贡献排名、完整战场日志、Boss伤害及本阴司成员…');session=self.state.installed
         try:
             await self.scanner.wait_operation()
             if self.state.closing or session!=self.state.installed:return

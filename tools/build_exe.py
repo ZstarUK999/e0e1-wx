@@ -69,6 +69,7 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/plugin_manager/flag_upgrade_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/wechat_reconnect.js", "package/plugin_manager"),
     ("package/plugin_manager/startup_cleanup.js", "package/plugin_manager"),
+    ("package/plugin_manager/wechat_native_controls.js", "package/plugin_manager"),
     ("package/plugin_manager/wechat_recent.ps1", "package/plugin_manager"),
     ("package/plugin_manager/wechat_images", "package/plugin_manager/wechat_images"),
     ("package/plugin_manager/douyin_images", "package/plugin_manager/douyin_images"),

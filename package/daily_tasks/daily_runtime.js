@@ -2,6 +2,20 @@
 function createDailyRuntime(g,h) {
   const fail=(message,status)=>Object.assign(new Error(message),{status:status||'unavailable'});
   const config=()=>h.configuration();
+  // Retry only local UI transitions, never the enclosing claim/purchase/battle.
+  async function retryUI(action,ready,message) {
+    for(let attempt=1;attempt<=3;attempt++) {
+      if(ready())return ready();
+      try {await action();return await h.wait(ready,message);}
+      catch(e) {
+        const guard=g.__e0e1EnergyGuard || {};
+        if(guard.pending || guard.callback_count || guard.uncertain)throw e;
+        if(ready())return ready();
+        if(attempt===3)throw fail(message+'（已尝试3次）','uncertain');
+        if(g.console?.warn)g.console.warn('[plugin.ui]',message+'，重试 '+(attempt+1)+'/3');
+      }
+    }
+  }
   // 战斗界面 id 在 BattleUICfgId（不是 CommonUICfgId），取不到就退回到 CommonUICfgId 的同名字段。
   async function battle(which) {
     const cfg=config().cfg;
@@ -16,9 +30,9 @@ function createDailyRuntime(g,h) {
     const {cfg}=config(), index=kindNumber(kind), root=await h.open(cfg.MineUI);
     const view=h.ui().find(cfg.MineUI);
     if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏页面打开尚未完成');
-    if (root._mineType!==index) await h.click(index===0?root.view.btn_sanshi:root.view.btn_magic_artifact);
     const page=index===0?root.view.mine_sanshi:root.view.mine_magic_artifact;
-    await h.wait(()=>root._mineType===index && page && page.node.activeInHierarchy!==false,'墓藏页面未就绪');
+    await retryUI(()=>h.click(index===0?root.view.btn_sanshi:root.view.btn_magic_artifact),
+      ()=>root._mineType===index && page && page.node.activeInHierarchy!==false,'墓藏页面未就绪');
     return page;
   }
   async function items(page) {
@@ -89,9 +103,11 @@ function createDailyRuntime(g,h) {
     if(!screen.view)throw fail('页面正在释放，未点击关闭或导航按钮','uncertain');
     const button=screen.view.btn_close || screen.view.button_close || screen.view.btn_back;
     if (!button) throw fail('页面关闭按钮未核实');
-    await h.click(button);
+    await retryUI(async()=>{
+      const current=h.ui().findOpen(which);
+      if(current)await h.click(current.view.btn_close || current.view.button_close || current.view.btn_back);
+    },()=>!h.ui().findOpen(which),'页面关闭未完成');
     if (view.waitAfterClose) await h.bounded(view.waitAfterClose,'页面关闭未完成');
-    await h.wait(()=>!h.ui().findOpen(which),'页面关闭未完成');
   }
   async function recruit(kind) {
     if (!(g.ROLE.legion && g.ROLE.legion.legionId>0)) throw fail('未加入阴司，无法正常招募','rejected');
@@ -281,9 +297,8 @@ function createDailyRuntime(g,h) {
     const node=root && root.node;
     if (!node || typeof node.emit!=='function') return false;
     const type=cc && cc.Node && cc.Node.EventType ? cc.Node.EventType.TOUCH_END : 'touch-end';
-    node.emit(type,{type});
     try {
-      await h.wait(()=>!h.ui().findOpen(which),'结算页点击空白处未关闭');
+      await retryUI(()=>node.emit(type,{type}),()=>!h.ui().findOpen(which),'结算页点击空白处未关闭');
     } catch (e) { return false; }
     return true;
   }
@@ -298,7 +313,7 @@ function createDailyRuntime(g,h) {
       ? root.node.getComponentsInChildren(config().cc.Button) || [] : [];
     const close=buttons.find(b=>(b.clickEvents||[]).some(e=>e.handler==='close') || b.clickCallback===root.close);
     const control=root.view.btn_close || root.view.button_close || close;
-    if (control) await h.click(control);
+    if (control) await retryUI(()=>h.click(control),()=>!h.ui().findOpen(which),'战斗结算页面仍未关闭');
     else if (!await dismissByBlank(which,root)) throw fail('战斗结算页未能正常退出','uncertain');
     if (view.waitAfterClose) await h.bounded(view.waitAfterClose,'战斗结算关闭未完成');
     await h.wait(()=>!h.ui().findOpen(which),'战斗结算页面仍未关闭');
@@ -374,8 +389,8 @@ function createDailyRuntime(g,h) {
     const {cfg}=config(),screen=await h.open(cfg.Draw);
     const index=screen.drawTypeInfos.findIndex(x=>x.cfgId===1 && x.eType===1);
     if(index<0)throw fail('常规免费召唤入口未解锁');
-    if(screen.curSelectPage!==index)await h.click(screen.view.node_pages[index].getComponent(config().Button));
-    await h.wait(()=>screen.curSelectPage===index && !screen.inDrawing,'召唤页尚未就绪');
+    await retryUI(()=>h.click(screen.view.node_pages[index].getComponent(config().Button)),
+      ()=>screen.curSelectPage===index && !screen.inDrawing,'召唤页尚未就绪');
     return screen;
   }
   async function summonState() {
@@ -389,8 +404,29 @@ function createDailyRuntime(g,h) {
   async function closeReward(which,handler) {
     const screen=await h.wait(()=>h.ui().findOpen(which),'奖励页面尚未打开');
     if('isFinish' in screen)await h.wait(()=>screen.isFinish,'奖励动画尚未完成');
-    await h.click(h.closeControl(screen,handler));
-    await h.wait(()=>!h.ui().find(which),'奖励页面尚未关闭');
+    await retryUI(async()=>{
+      const current=h.ui().findOpen(which);
+      if(current) {
+        if('isFinish' in current)await h.wait(()=>current.isFinish,'奖励动画尚未完成');
+        await h.click(h.closeControl(current,handler));
+      }
+    },()=>!h.ui().find(which),'奖励页面尚未关闭');
+  }
+  async function closeDrawRewards(cfg) {
+    // A great reward opens DrawSpecialBook first; DrawReward only opens after it closes.
+    await h.wait(()=>h.ui().findOpen(cfg.DrawReward) ||
+      (cfg.DrawSpecialBook && h.ui().findOpen(cfg.DrawSpecialBook)),'召唤奖励或特殊秘籍展示页尚未打开');
+    for(let count=0;cfg.DrawSpecialBook && h.ui().findOpen(cfg.DrawSpecialBook);count++) {
+      if(count>=100)throw fail('特殊秘籍展示次数异常','uncertain');
+      const screen=h.ui().findOpen(cfg.DrawSpecialBook);
+      await h.wait(()=>!screen.inAni,'特殊秘籍展示动画尚未完成');
+      const before=screen.drawCardId,remaining=screen.allDrawCardIds?.length;
+      await retryUI(()=>h.click(h.closeControl(screen,'closeSelf')),
+        ()=>!h.ui().findOpen(cfg.DrawSpecialBook) || screen.inAni ||
+          screen.drawCardId!==before || screen.allDrawCardIds?.length!==remaining,
+        '特殊秘籍展示页尚未推进或关闭');
+    }
+    await closeReward(cfg.DrawReward,'onClickClose');
   }
   async function freeSummon() {
     const info=await summonState();
@@ -405,7 +441,7 @@ function createDailyRuntime(g,h) {
       if(error.status!=='rejected')error.status='uncertain';
       throw error;
     }
-    if((result.baseItems || []).length || (result.coinItems || []).length)await closeReward(cfg.DrawReward,'onClickClose');
+    if((result.baseItems || []).length || (result.coinItems || []).length)await closeDrawRewards(cfg);
     await h.wait(()=>!screen.inDrawing,'免费召唤动画尚未收尾');
     return {confirmed:true,cooldown_seconds:info.cooldown_seconds};
   }
@@ -413,8 +449,8 @@ function createDailyRuntime(g,h) {
     const {cfg,Button}=config(),screen=await h.open(cfg.PetUI);
     const {PetPageType}=await g.System.import('chunks:///_virtual/ui-pet.ts');
     if(!PetPageType || !Number.isInteger(PetPageType.Hatch))throw fail('阴契页签枚举未解析');
-    if(screen.curPage!==PetPageType.Hatch)await h.click(screen.view.node_pageList[PetPageType.Hatch].getComponent(Button));
-    return await h.wait(()=>screen.curPage===PetPageType.Hatch && screen.view.node_page_hatch,'阴契页面尚未加载');
+    return await retryUI(()=>h.click(screen.view.node_pageList[PetPageType.Hatch].getComponent(Button)),
+      ()=>screen.curPage===PetPageType.Hatch && screen.view.node_page_hatch,'阴契页面尚未加载');
   }
   async function petState(ids) {
     await petPage();
@@ -493,8 +529,8 @@ function createDailyRuntime(g,h) {
     const {cfg,Button}=config(),screen=await h.open(cfg.PetUI);
     const {PetPageType}=await g.System.import('chunks:///_virtual/ui-pet.ts');
     if(!Number.isInteger(PetPageType?.QualityUp))throw fail('献祭页签枚举未解析');
-    if(screen.curPage!==PetPageType.QualityUp)await h.click(screen.view.node_pageList[PetPageType.QualityUp].getComponent(Button));
-    const page=await h.wait(()=>screen.curPage===PetPageType.QualityUp && screen.view.node_page_qualityUp,'献祭页面尚未加载');
+    const page=await retryUI(()=>h.click(screen.view.node_pageList[PetPageType.QualityUp].getComponent(Button)),
+      ()=>screen.curPage===PetPageType.QualityUp && screen.view.node_page_qualityUp,'献祭页面尚未加载');
     return {screen,page};
   }
   async function fodderMerge(pair) {
@@ -525,8 +561,7 @@ function createDailyRuntime(g,h) {
     if(current?.type!=='pet' || current.id!==pair.material_id)await h.click(await h.listNode(page.list_selectItem,mi));
     const chosen=page.curUseInfos.filter(Boolean);
     if(chosen.length!==1 || chosen[0].type!=='pet' || chosen[0].id!==pair.material_id)throw fail('献祭材料选择未确认','rejected');
-    await h.click(page.btn_closeSelect2);
-    await h.wait(()=>!page.node_selectRoot.active,'献祭材料列表尚未关闭');
+    await retryUI(()=>h.click(page.btn_closeSelect2),()=>!page.node_selectRoot.active,'献祭材料列表尚未关闭');
     const {target,material}=await validate();
     const minimum=Number(data.PetQualityCfg.getById(target.quality)?.minNum);
     if(!Number.isFinite(minimum) || minimum<=0)throw fail('献祭进阶配置未同步');

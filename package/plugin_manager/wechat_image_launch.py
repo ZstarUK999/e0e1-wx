@@ -41,6 +41,7 @@ class WechatImageLauncher:
         self.clock, self.sleep = clock, sleep
         self.cancel = cancel or threading.Event()
         self.templates = {}
+        self._scaled_templates = {}
         from PIL import Image
         for name in self.template_names:
             with Image.open(self.images / (name + '.png')) as image:
@@ -103,15 +104,42 @@ class WechatImageLauncher:
             raise RuntimeError('微信窗口无法置前，停止图像点击')
 
     def locate(self, name, window):
+        return self.locate_many((name,), window).get(name)
+
+    def locate_many(self, names, window):
+        """Compare navigation states on one frame, at each DPI scale together."""
         self.focus(window)
         region = (window.left, window.top, window.width, window.height)
         shot = self.gui.screenshot(region=region)
-        variants=[self.templates[name]]
-        if name+'_red_dot' in self.templates:
-            variants.append(self.templates[name+'_red_dot'])
-        for image in variants:
-            point=self._locate_image(image,shot,window)
-            if point:return point
+        variants = [(name, variant) for name in names
+                    for variant in (name, name + '_red_dot') if variant in self.templates]
+        for scale in (1, .8, 1.25, 1.5, 2, 2/3):
+            self.check_cancel()
+            matches = {}
+            for name, variant in variants:
+                if name in matches:
+                    continue
+                key = (variant, scale)
+                if key not in self._scaled_templates:
+                    image = self.templates[variant]
+                    self._scaled_templates[key] = image if scale == 1 else image.resize(
+                        (round(image.width * scale), round(image.height * scale)))
+                point = self._match_template(self._scaled_templates[key], shot, window)
+                if point:
+                    matches[name] = point
+            if matches:
+                return matches
+        return {}
+
+    def _match_template(self, template, shot, window):
+        if template.width > shot.width or template.height > shot.height:
+            return None
+        try:
+            box = self.gui.locate(template, shot, confidence=.94, grayscale=False)
+        except self.gui.ImageNotFoundException:
+            box = None
+        if box is not None:
+            return (window.left + box.left + box.width//2, window.top + box.top + box.height//2)
         return None
 
     def _locate_image(self, image, shot, window):
@@ -132,11 +160,12 @@ class WechatImageLauncher:
         deadline, clicked = self.clock() + 12, False
         while self.clock() < deadline:
             self.check_cancel()
-            if self.locate(active, window):
+            matches = self.locate_many((active,) if clicked else (active, inactive), window)
+            if matches.get(active):
                 LOG.info('微信图像导航已确认：%s', label)
                 return
             if not clicked:
-                point = self.locate(inactive, window)
+                point = matches.get(inactive)
                 if point:
                     self.focus(window)
                     self.gui.click(*point)

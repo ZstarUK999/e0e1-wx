@@ -44,6 +44,19 @@ function createEnergyRuntime(g, timing) {
       await new Promise(resolve => setTimeout(resolve, Math.min(stepDelay(), remaining)));
     }
   }
+  // Retry only local UI transitions, never the enclosing claim/purchase/battle.
+  async function retryUI(action,ready,message) {
+    for(let attempt=1;attempt<=3;attempt++) {
+      if(ready())return ready();
+      try {await action();return await wait(ready,message);}
+      catch(e) {
+        if(guard.pending || guard.callback_count || guard.uncertain)throw e;
+        if(ready())return ready();
+        if(attempt===3)throw error(message+'（已尝试3次）','uncertain');
+        if(g.console?.warn)g.console.warn('[plugin.ui]',message+'，重试 '+(attempt+1)+'/3');
+      }
+    }
+  }
   function background(view) {
     if (view.cfg === cfg.GuideUI && cfg.GuideUI) {
       const root = view.ui && view.ui.view && view.ui.view.node_guideRoot;
@@ -119,8 +132,7 @@ function createEnergyRuntime(g, timing) {
     let control;
     if (which===cfg.GameMethod) control=main.view.button_method;
     else if (which===cfg.MineUI || which===cfg.ArenaUI) {
-      await click(main.view.button_method);
-      const method=await wait(()=>ui().findOpen(cfg.GameMethod),'玩法页面未打开');
+      const method=await retryUI(()=>click(main.view.button_method),()=>ui().findOpen(cfg.GameMethod),'玩法页面未打开');
       control=which===cfg.MineUI?method.view.btn_mine:method.view.btn_arena;
     }
     else if (which===cfg.PetUI) control=main.view.button_pet;
@@ -131,26 +143,21 @@ function createEnergyRuntime(g, timing) {
       const component=main.node.getComponentInChildren(Type);
       control=component && component.btn_hang_up;
     } else if (which===cfg.MagicArtifactUI) {
-      await click(main.view.button_attrUp);
-      const attr=await wait(()=>ui().findOpen(cfg.AttrUp),'属性页面未打开');
+      const attr=await retryUI(()=>click(main.view.button_attrUp),()=>ui().findOpen(cfg.AttrUp),'属性页面未打开');
       const Type=await uiClass('attr-attr-up.ts','AttrAttrUp');
       const contents=attr.node ? attr.node.getComponentInChildren(Type) : attr;
       const item=await wait(()=>contents && contents.magicArtifactItem,'法器入口未显示');
       const Unlock=await uiClass('common-unlock-button.ts','default');
       control=(item.getComponent && item.getComponent(Unlock)) || item.getComponentInChildren(Unlock);
     } else throw error('没有核实此页面的UI导航按钮');
-    await click(control);
-    const retained=await wait(()=>ui().find(which),'UI导航未打开目标页面');
+    const retained=await retryUI(()=>click(control),()=>ui().find(which),'UI导航未打开目标页面');
     if (retained.waitAfterOpen) await bounded(retained.waitAfterOpen,'页面打开动画未结束');
     return await wait(()=>ui().findOpen(which),'页面尚未显示');
   }
   async function switchTab(screen,index,label) {
-    if (screen.curSelectedIndex!==index) {
-      const node=screen.view.btnTabGroup.children[index];
-      await click(node.getComponent(Button));
-    }
     try {
-      return await wait(()=>screen.pages && screen.pages[index],'UI页签未加载');
+      return await retryUI(()=>click(screen.view.btnTabGroup.children[index].getComponent(Button)),
+        ()=>screen.curSelectedIndex===index && screen.pages && screen.pages[index],'UI页签未加载');
     } catch(e) {
       if(g.console && typeof g.console.error==='function')g.console.error('[plugin.error]','UI页签诊断 '+JSON.stringify({page:label,index,
         selected:screen.curSelectedIndex,loadedPages:Object.keys(screen.pages || {}).slice(0,20),
@@ -226,9 +233,12 @@ function createEnergyRuntime(g, timing) {
       if (!screen) throw error('界面实例尚未加载');
       if (screen.battleWorld || screen.battleWorldOther || blockedViews().length)
         throw error('页面加载后出现战斗或阻挡状态，停止返回主界面');
-      await click(closeControl(screen,'close'));
+      await retryUI(async()=>{
+        if(blockedViews().length)throw error('返回过程中出现阻挡页面');
+        const current=ui().findOpen(view.cfg);
+        if(current)await click(closeControl(current,'close'));
+      },()=>!ui().findOpen(view.cfg),'界面关闭未完成');
       if (retained.waitAfterClose) await bounded(retained.waitAfterClose,'界面关闭动画未完成');
-      await wait(()=>!ui().findOpen(view.cfg),'界面关闭未完成');
     }
     throw error('返回主界面的页面跳转次数异常，停止继续关闭');
   }
