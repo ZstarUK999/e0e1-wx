@@ -194,13 +194,46 @@ class WechatImageLauncher:
             return None
         if rect.right < 200 or rect.bottom < 200:
             return None
-        shot = self.gui.screenshot(region=(point.x, point.y, rect.right, rect.bottom))
+        shot = capture_desktop_client((point.x, point.y, rect.right, rect.bottom))
+        if shot is None:
+            return None
+        # 窗口切换/移动期间截到的桌面不能作为持续黑白屏的证据。
+        current_rect, current_point = W.RECT(), W.POINT()
+        foreground = user.GetForegroundWindow
+        foreground.restype = W.HWND
+        if (window.isMinimized or foreground() != window._hWnd
+                or not user.GetClientRect(handle, ctypes.byref(current_rect))
+                or not user.ClientToScreen(handle, ctypes.byref(current_point))
+                or (current_point.x, current_point.y, current_rect.right, current_rect.bottom)
+                != (point.x, point.y, rect.right, rect.bottom)):
+            return None
         kind = classify_blank(shot)
         if kind:
             folder = Path('logs') / 'recovery'
             folder.mkdir(parents=True, exist_ok=True)
             shot.save(folder / ('blank_' + kind + '.png'))
         return (window._hWnd, kind) if kind else None
+
+
+def capture_desktop_client(region):
+    """以虚拟桌面的物理坐标截客户区，支持副屏及主屏左/上方的负坐标。"""
+    from PIL import ImageGrab
+    x, y, width, height = region
+    user = ctypes.windll.user32
+    # SM_X/Y/CX/CYVIRTUALSCREEN；越界 crop 会补黑，不能用于判定游戏黑屏。
+    left, top = user.GetSystemMetrics(76), user.GetSystemMetrics(77)
+    right = left + user.GetSystemMetrics(78)
+    bottom = top + user.GetSystemMetrics(79)
+    if width <= 0 or height <= 0 or x < left or y < top or x + width > right or y + height > bottom:
+        LOG.debug('跳过屏幕范围外的游戏客户区：region=%s，desktop=%s', region, (left, top, right, bottom))
+        return None
+    # pyautogui 默认只截主屏，即使用 allScreens=True，其 region 裁剪也未换算负原点。
+    # Pillow 的 bbox + all_screens 会按虚拟桌面原点正确换算。
+    shot = ImageGrab.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+    if shot.size != (width, height):
+        LOG.warning('游戏客户区截图尺寸异常：expected=%s，actual=%s', (width, height), shot.size)
+        return None
+    return shot
 
 
 def classify_blank(image):

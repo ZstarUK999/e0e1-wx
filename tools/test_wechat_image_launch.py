@@ -129,6 +129,7 @@ def test_screenshot_failure_resets_continuous_confirmation():
 
 def test_connected_checks_only_foreground_without_stealing_focus(monkeypatch, tmp_path):
     import ctypes
+    import package.plugin_manager.wechat_image_launch as image_launch
     monkeypatch.chdir(tmp_path)
     window = SimpleNamespace(_hWnd=2**40+123, isMinimized=False)
     foreground = [1]
@@ -139,9 +140,10 @@ def test_connected_checks_only_foreground_without_stealing_focus(monkeypatch, tm
     user = SimpleNamespace(GetForegroundWindow=current, GetClientRect=rect, ClientToScreen=lambda *args: True)
     monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=user))
     shots, focused = [], []
-    def screenshot(**kwargs):
-        shots.append(kwargs)
+    def screenshot(region):
+        shots.append(region)
         return Image.new('RGB', (300, 300), 'black')
+    monkeypatch.setattr(image_launch, 'capture_desktop_client', screenshot)
     launcher = WechatImageLauncher(gui=SimpleNamespace(screenshot=screenshot))
     launcher.game_windows = lambda: [window]
     launcher.focus = lambda w: focused.append(w)
@@ -152,6 +154,48 @@ def test_connected_checks_only_foreground_without_stealing_focus(monkeypatch, tm
     assert len(shots) == 1 and not focused
     assert launcher.blank_screen() == (window._hWnd, 'black')
     assert focused == [window]
+
+
+@pytest.mark.parametrize('region', [(2000, 100, 300, 300), (-1600, -200, 300, 300)])
+def test_client_capture_uses_virtual_desktop_coordinates(monkeypatch, region):
+    import ctypes
+    from PIL import ImageGrab
+    from package.plugin_manager.wechat_image_launch import capture_desktop_client
+    metrics = {76: -1920, 77: -1080, 78: 5760, 79: 2160}
+    monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=SimpleNamespace(GetSystemMetrics=metrics.__getitem__)))
+    calls = []
+    def grab(**kwargs):
+        calls.append(kwargs)
+        return Image.new('RGB', (300, 300), 'green')
+    monkeypatch.setattr(ImageGrab, 'grab', grab)
+    shot = capture_desktop_client(region)
+    x, y, w, h = region
+    assert calls == [dict(bbox=(x, y, x+w, y+h), all_screens=True)]
+    assert classify_blank(shot) is None
+
+
+@pytest.mark.parametrize('region', [(-2000, 0, 300, 300), (3700, 0, 300, 300),
+                                     (0, -1200, 300, 300), (0, 1000, 300, 300)])
+def test_offscreen_client_is_not_classified_as_black(monkeypatch, region):
+    import ctypes
+    from PIL import ImageGrab
+    from package.plugin_manager.wechat_image_launch import capture_desktop_client
+    metrics = {76: -1920, 77: -1080, 78: 5760, 79: 2160}
+    monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=SimpleNamespace(GetSystemMetrics=metrics.__getitem__)))
+    def unexpected(**kwargs):
+        pytest.fail('offscreen pixels must not be captured and padded black')
+    monkeypatch.setattr(ImageGrab, 'grab', unexpected)
+    assert capture_desktop_client(region) is None
+
+
+def test_client_capture_rejects_wrong_size(monkeypatch):
+    import ctypes
+    from PIL import ImageGrab
+    from package.plugin_manager.wechat_image_launch import capture_desktop_client
+    metrics = {76: 0, 77: 0, 78: 1920, 79: 1080}
+    monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(user32=SimpleNamespace(GetSystemMetrics=metrics.__getitem__)))
+    monkeypatch.setattr(ImageGrab, 'grab', lambda **kwargs: Image.new('RGB', (1, 1), 'black'))
+    assert capture_desktop_client((0, 0, 300, 300)) is None
 
 
 def test_nonblank_or_changed_window_resets_confirmation():
