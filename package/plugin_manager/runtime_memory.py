@@ -31,7 +31,15 @@ def process_memory():
             rows.append({'pid':proc.pid,'privateBytes':getattr(info,'private',getattr(info,'pagefile',info.rss))})
         except (psutil.Error,OSError):continue
     rows.sort(key=lambda v:v['privateBytes'],reverse=True)
-    return {'processCount':len(rows),'privateBytes':sum(v['privateBytes'] for v in rows),'largest':rows[:4]}
+    result={'processCount':len(rows),'privateBytes':sum(v['privateBytes'] for v in rows),'largest':rows[:4]}
+    try:
+        proc=psutil.Process();info=proc.memory_info()
+        result['python']={'pid':proc.pid,'rssBytes':info.rss,
+            'privateBytes':getattr(info,'private',getattr(info,'pagefile',info.rss)),
+            'threads':proc.num_threads()}
+        if hasattr(proc,'num_handles'):result['python']['handles']=proc.num_handles()
+    except (psutil.Error,OSError):pass
+    return result
 
 
 class RuntimeMemoryMonitor:
@@ -45,7 +53,12 @@ class RuntimeMemoryMonitor:
         if session!=self.session:self.session=session;self.next_sample=0
         if now<self.next_sample:return
         self.next_sample=now+300
-        result={'session':session}
+        result={'session':session,'pythonAsyncTasks':len(asyncio.all_tasks())}
+        cdp=getattr(transport,'cdp',None)
+        if cdp is not None:
+            result['cdp']={'pending':len(getattr(cdp,'pending',{})),
+                'cachedEvents':len(getattr(cdp,'events',[]))}
+
         try:result['native']=await asyncio.to_thread(self.processes)
         except Exception as exc:result['nativeUnavailable']=type(exc).__name__
         try:result['js']=await getter()

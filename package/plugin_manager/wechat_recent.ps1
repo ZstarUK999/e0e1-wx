@@ -1,5 +1,5 @@
-﻿param([ValidateSet('Prepare','WaitClosed','Open')][string]$Mode='Prepare',
- [int]$SidebarX=-1,[int]$SidebarY=-1,[int]$SidebarWidth=0,[int]$SidebarHeight=0,[string]$SidebarWindowClass='')
+﻿param([ValidateSet('Prepare','WaitClosed','Open','Probe','EntryPrepare','EntryOpen','Navigate','Scan','CachedPrepare','CachedOpen')][string]$Mode='Prepare',
+ [int]$SidebarX=-1,[int]$SidebarY=-1,[int]$SidebarWidth=0,[int]$SidebarHeight=0,[string]$SidebarWindowClass='', [string]$EntryCachePath='')
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
 Add-Type -AssemblyName UIAutomationClient
@@ -11,6 +11,7 @@ public static class GameEntryInput {
  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
  [StructLayout(LayoutKind.Sequential)] public struct Point {public int X;public int Y;}
  [StructLayout(LayoutKind.Sequential)] public struct Rect {public int Left;public int Top;public int Right;public int Bottom;}
+ [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Rect r);
  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h,ref Point p);
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -53,6 +54,44 @@ function Click($element,$window) {
  [GameEntryInput]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
  [GameEntryInput]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
 }
+function EntryCache($entry) {
+ $w=$entry.Window;$hwnd=[IntPtr]$w.Current.NativeWindowHandle
+ $r=$entry.Element.Current.BoundingRectangle
+ $rect=New-Object GameEntryInput+Rect;$point=New-Object GameEntryInput+Point
+ if(![GameEntryInput]::GetClientRect($hwnd,[ref]$rect) -or ![GameEntryInput]::ClientToScreen($hwnd,[ref]$point)){throw '无法缓存微信窗口位置'}
+ $proc=Get-Process -Id $w.Current.ProcessId
+ return @{pid=$proc.Id;processStart=$proc.StartTime.ToUniversalTime().Ticks.ToString();hwnd=$hwnd.ToInt64().ToString();
+  width=$rect.Right;height=$rect.Bottom;dpi=[GameEntryInput]::GetDpiForWindow($hwnd);
+  x=($r.X+$r.Width/2-$point.X);y=($r.Y+$r.Height/2-$point.Y);runtimeId=@($entry.Element.GetRuntimeId())}
+}
+function CachedEntry {
+ if(!$EntryCachePath){throw '游戏入口位置缓存不存在'}
+ $cache=Get-Content -LiteralPath $EntryCachePath -Raw | ConvertFrom-Json
+ $windows=@(WechatWindows | Where-Object {$_.Current.ProcessId -eq $cache.pid -and $_.Current.NativeWindowHandle.ToString() -eq $cache.hwnd})
+ if($windows.Count -ne 1){throw '缓存对应的微信窗口已变化'}
+ $w=$windows[0];$proc=Get-Process -Id $w.Current.ProcessId
+ if($proc.StartTime.ToUniversalTime().Ticks.ToString() -ne $cache.processStart){throw '微信进程已变化'}
+ Activate $w
+ $hwnd=[IntPtr]$w.Current.NativeWindowHandle
+ $rect=New-Object GameEntryInput+Rect;$origin=New-Object GameEntryInput+Point
+ if(![GameEntryInput]::GetClientRect($hwnd,[ref]$rect) -or ![GameEntryInput]::ClientToScreen($hwnd,[ref]$origin)){throw '微信窗口位置不可用'}
+ if($rect.Right -ne $cache.width -or $rect.Bottom -ne $cache.height -or [GameEntryInput]::GetDpiForWindow($hwnd) -ne $cache.dpi){throw '微信尺寸或DPI已变化'}
+ $point=New-Object System.Windows.Point(($origin.X+$cache.x),($origin.Y+$cache.y))
+ $element=[System.Windows.Automation.AutomationElement]::FromPoint($point)
+ $match=$null
+ for($i=0;$i -lt 4 -and $element;$i++) {
+  if($element.Current.Name -eq '遗弃之地' -and (@($element.GetRuntimeId()) -join ',') -eq (@($cache.runtimeId) -join ',')){$match=$element;break}
+  foreach($text in (Named $element '遗弃之地')) {
+   if((@($text.GetRuntimeId()) -join ',') -eq (@($cache.runtimeId) -join ',')){$match=$text;break}
+  }
+  if($match){break}
+  $element=$walker.GetParent($element)
+ }
+ if(!$match -or $match.Current.IsOffscreen -or !$match.Current.IsEnabled){throw '缓存位置未命中原游戏入口，重新扫描'}
+ $r=$match.Current.BoundingRectangle
+ if($r.IsEmpty -or !$r.Contains($point)){throw '游戏入口位置已变化'}
+ return @{Window=$w;Element=$match}
+}
 function Entry {
  foreach($w in (WechatWindows)) {
   foreach($doc in (Named $w '小程序')) {
@@ -68,6 +107,15 @@ function Entry {
     foreach($text in (Named $section '遗弃之地')) {
      if($text.Current.ControlType -ne [System.Windows.Automation.ControlType]::Text -or $text.Current.IsOffscreen){continue}
      $card=$walker.GetParent($text)
+     # The nearest group containing 最近使用 may also contain 我的常用.
+     # Keep only cards whose direct section branch belongs to the recent list.
+     $branch=$card
+     for($level=0;$level -lt 12 -and $branch;$level++) {
+      $parent=$walker.GetParent($branch)
+      if(!$parent -or [System.Windows.Automation.Automation]::Compare($parent,$section)){break}
+      $branch=$parent
+     }
+     if(!$branch -or (Named $branch '我的常用').Count -gt 0 -or (Named $branch '我的小程序').Count -gt 0){continue}
      if((Named $card '开发版').Count -gt 0 -or (Named $card '体验版').Count -gt 0){continue}
      $cards+=,$text
     }
@@ -113,11 +161,41 @@ try {
  $windows=@(WechatWindows);$diagnostics.wechatWindowCount=$windows.Count
  foreach($w in $windows){
   $hwnd=[IntPtr]$w.Current.NativeWindowHandle
-  if($hwnd -ne [IntPtr]::Zero){if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null}}
+  if($Mode -ne 'Scan' -and $hwnd -ne [IntPtr]::Zero){if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null}}
  }
  Start-Sleep -Milliseconds 300
  $diagnostics.stage='find-entry'
+ if($Mode -in @('CachedPrepare','CachedOpen')) {
+  $entry=CachedEntry
+  $freshCache=EntryCache $entry
+  if($Mode -eq 'CachedOpen'){Click $entry.Element $entry.Window}
+  @{ok=$true;phase=$Mode;cache=$freshCache;cached=$true} | ConvertTo-Json -Depth 6 -Compress;exit 0
+ }
  $entry=Entry
+ if($Mode -eq 'Scan') {
+  if($entry){@{ok=$true;found=$true;cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress}
+  else{@{ok=$true;found=$false} | ConvertTo-Json -Compress}
+  exit 0
+ }
+ if($Mode -eq 'Probe') {
+  @{ok=$true;found=($null -ne $entry);entry='recent-release'} | ConvertTo-Json -Compress;exit 0
+ }
+ if($Mode -eq 'Navigate') {
+  $targets=@()
+  foreach($w in (WechatWindows)) {
+   foreach($n in (Named $w '小程序')) {
+    if(!$n.Current.IsOffscreen -and $n.Current.IsEnabled -and
+       $n.Current.ControlType -ne [System.Windows.Automation.ControlType]::Document) {
+      $r=$n.Current.BoundingRectangle
+      if(!$r.IsEmpty -and $r.Width -gt 0 -and $r.Height -gt 0){$targets+=,@{Window=$w;Element=$n}}
+    }
+   }
+  }
+  if($targets.Count -ne 1){throw ('小程序文本入口匹配数为 '+$targets.Count+'，停止点击')}
+  Click $targets[0].Element $targets[0].Window
+  @{ok=$true;phase='Navigate'} | ConvertTo-Json -Compress;exit 0
+ }
+ if(!$entry -and $Mode -in @('EntryPrepare','EntryOpen')) {throw '最近使用中未识别到唯一的普通版遗弃之地'}
  if(!$entry) {
   # Navigate only via a uniquely named native sidebar control, never via a URL scheme.
   $nav=@()
@@ -141,8 +219,8 @@ try {
  Activate $entry.Window
  $rect=$entry.Element.Current.BoundingRectangle
  if($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw '普通版游戏入口没有可用位置，请显示微信最近使用页面'}
- if($Mode -eq 'Open'){Click $entry.Element $entry.Window}
- @{ok=$true;phase=$Mode;entry='recent-release'} | ConvertTo-Json -Compress
+ if($Mode -in @('Open','EntryOpen')){Click $entry.Element $entry.Window}
+ @{ok=$true;phase=$Mode;entry='recent-release';cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress
 }catch {
  @{ok=$false;message=$_.Exception.Message;diagnostics=$diagnostics} | ConvertTo-Json -Compress
  exit 1

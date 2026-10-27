@@ -30,6 +30,7 @@ def test_panel_filter_copy_and_rank_table():
     app = QApplication.instance() or QApplication([])
     panel = LegionBossPanel()
     panel.accept(snapshot())
+    panel.filter.setCurrentIndex(0)
     assert panel.table.rowCount() == 1 and panel.table.item(0, 1).text() == '3'
     assert panel.rank_table.rowCount() == 1
     assert '已确认参与 2 人' in panel.summary.text()
@@ -41,6 +42,32 @@ def test_panel_filter_copy_and_rank_table():
     panel.copy_missing()
     assert '重名（3）' in app.clipboard().text() and '（2）' not in app.clipboard().text()
     panel.close()
+
+
+def test_weighted_attacks_contribution_estimate_and_csv(tmp_path):
+    import csv
+    from package.plugin_manager.legion_boss import export_members_csv
+    data=snapshot()
+    data.update(logComplete=True,logTotal=6,logs=[
+        dict(roleId='2',roundId=1,kind='player'),dict(roleId='2',roundId=1,kind='monster'),
+        dict(roleId='2',roundId=3,kind='monster'),dict(roleId='2',roundId=3,kind='monster'),
+        dict(roleId='3',roundId=6,kind='boss'),dict(roleId='2',roundId=3,kind='unknown')],
+        contributions=[dict(id='2',rank=1,score=1234)],bossOngoing=True,
+        bossRewardRules=[dict(**{'from':4,'to':5},points=12000)])
+    rows=compare_members(data);r=next(r for r in rows if r['id']=='2')
+    assert r['tue_monsters']==1 and r['tue_players']==1 and r['tue_attacks']==3
+    assert r['thu_monsters']==2 and r['thu_attacks']==2
+    assert r['total_contribution']==13234 and r['boss_bonus']==12000
+    unknown=next(r for r in rows if r['id']=='3')
+    assert unknown['participated'] and unknown['total_contribution'] is None
+    r['name']='=danger,名字'
+    path=tmp_path/'members.csv';export_members_csv(path,data,rows)
+    with path.open(encoding='utf-8-sig',newline='') as f: exported=list(csv.DictReader(f))
+    entry=next(r for r in exported if r['玩家ID']=='2')
+    assert entry['名字']=="'=danger,名字" and entry['当前总贡献']=='13234'
+    assert len(exported)==3 and entry['日志完整']=='是'
+    data['bossOngoing']=False
+    assert next(r for r in compare_members(data) if r['id']=='2')['total_contribution']==1234
 
 
 def test_feature_fetch_and_session_change(tmp_path):

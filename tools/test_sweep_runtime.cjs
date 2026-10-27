@@ -683,3 +683,22 @@ test('home closes pages opened by previous close callbacks before reporting succ
  assert.ok(f.inputs.includes('close-other'));assert.ok(f.inputs.includes('close-mine'));
  assert.equal(f.windows.size,1);
 });
+
+test('home retries a missed close using the current page',async()=>{
+  const f=fixture();let closes=0;
+  f.petUI.close=()=>{if(++closes===2)f.windows.delete(f.cfg.PetUI);};
+  f.windows.set(f.cfg.PetUI,f.petUI);
+  const result=await f.runtime.dispatch('home',{});
+  assert.equal(result.status,'ok');assert.equal(closes,2);assert.equal(f.requests.length,0);
+});
+test('navigation retries a missed page open without replaying a business request',async()=>{
+  const f=fixture(),b=f.windows.get(f.cfg.MainUI).view.button_pet,original=b.clickCallback;let clicks=0;
+  b.clickCallback=function(...args){if(++clicks===2)return original.apply(this,args);};
+  const result=await f.runtime.dispatch('catalog',{name:'双子僵尸'});
+  assert.equal(result.status,'ok');assert.equal(clicks,2);assert.equal(f.requests.length,0);
+});
+test('home stops after three ineffective closes',async()=>{
+  const f=fixture();let closes=0;f.petUI.close=()=>{closes++;};f.windows.set(f.cfg.PetUI,f.petUI);
+  const result=await f.runtime.dispatch('home',{});
+  assert.equal(result.status,'uncertain');assert.match(result.message,/已尝试3次/);assert.equal(closes,3);
+});

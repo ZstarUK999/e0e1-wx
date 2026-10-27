@@ -50,7 +50,35 @@ def launcher_with_screens(screens):
     def locate(name, window):
         return (10, 20) if name in screens(len(clicks)) else None
     launcher.locate = locate
+    launcher.locate_many = lambda names, window: {name: point for name in names
+                                                 if (point := locate(name, window))}
     return launcher, clicks
+
+
+def test_multiple_states_share_screenshot_and_try_native_scale_before_fallback():
+    import pyautogui
+    shots, attempts = [], []
+    with Image.open(IMAGES / 'sidebar_inactive_red_dot.png') as icon:
+        shot = Image.new('RGB', (300, 200), '#ededed')
+        shot.paste(icon, (40, 60))
+    def capture(**kwargs):
+        shots.append(kwargs)
+        return shot
+    def locate(template, frame, **kwargs):
+        attempts.append(template)
+        return pyautogui.locate(template, frame, **kwargs)
+    gui = SimpleNamespace(screenshot=capture, locate=locate,
+                          ImageNotFoundException=pyautogui.ImageNotFoundException)
+    launcher = WechatImageLauncher(gui=gui)
+    launcher.focus = lambda window: None
+    window = SimpleNamespace(left=100, top=200, width=300, height=200)
+    matches = launcher.locate_many(('sidebar_active', 'sidebar_inactive'), window)
+    assert set(matches) == {'sidebar_inactive'}
+    assert len(shots) == 1 and len(attempts) == 4
+    assert all(image in launcher.templates.values() for image in attempts)
+    cached = dict(launcher._scaled_templates)
+    launcher.locate_many(('sidebar_active', 'sidebar_inactive'), window)
+    assert all(launcher._scaled_templates[key] is image for key, image in cached.items())
 
 
 def test_navigation_clicks_only_inactive_and_confirms_green():
