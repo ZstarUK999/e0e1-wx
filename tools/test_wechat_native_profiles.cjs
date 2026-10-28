@@ -111,3 +111,15 @@ test('persistent script rediscovers a replaced window without reinjection',()=>{
   ctx.rpc.exports.snapshot(null,geometry);
   assert.equal(ctx.getScans(),1);
 });
+
+
+test('Discover cell private text is recognized even without an XTextView child',()=>{
+  const ctx=context();
+  vm.runInContext(`
+    const object={add:offset=>({readPointer:()=>({base:'object',offset})})};
+    const data={add:offset=>({readPointer:()=>({base:'private',offset})})};
+    qstring=p=>p.base==='private' && p.offset===232?'小程序':null;
+    this.label=controlLabel(object,data,'mmui::ExtensionDiscoverContentCell');
+  `,ctx);
+  assert.equal(ctx.label,'小程序');
+});

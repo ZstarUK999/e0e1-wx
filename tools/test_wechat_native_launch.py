@@ -242,3 +242,28 @@ def test_newly_scanned_geometry_is_reused_and_only_invalid_geometry_is_rescanned
         assert (await launch._click_native_control(snapshot,'发现'))['ok']
         assert calls==['CachedClick','Click']
     asyncio.run(run())
+
+
+def test_discover_cell_navigation_stays_on_native_path(monkeypatch):
+    async def run():
+        snapshots=0;opened=False;clicks=[]
+        async def native(mode,label=None,**kwargs):
+            nonlocal snapshots,opened
+            if mode=='Snapshot':
+                snapshots+=1
+                return {'controls':[{'label':'发现'}] if snapshots==1 else
+                    [{'label':'小程序','type':'mmui::ExtensionDiscoverContentCell'}]}
+            assert mode=='CachedClick'
+            clicks.append(label)
+            if label=='小程序':opened=True
+            return {'ok':True}
+        async def recent(mode,**kwargs):
+            assert mode in ('Probe','EntryPrepare'), 'must not fall back to unmatched UIA text navigation'
+            return {'found':opened,'ok':True}
+        async def sleep(seconds):pass
+        monkeypatch.setattr(launch,'_native_ui',native)
+        monkeypatch.setattr(launch,'_recent_ui',recent)
+        monkeypatch.setattr(launch.asyncio,'sleep',sleep)
+        assert (await launch.prepare_wechat_game())['ok']
+        assert clicks==['发现','小程序'] and snapshots==2
+    asyncio.run(run())

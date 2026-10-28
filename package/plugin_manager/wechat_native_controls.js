@@ -23,6 +23,17 @@ function qstring(header) {
   if (size < 1 || size > 100 || offset < 24 || offset > 4096) return null;
   return header.add(offset).readUtf16String(size);
 }
+function controlLabel(object,data,type) {
+  let label=null;
+  try {label=qstring(data.add(200).readPointer());}catch(_){}
+  // Discover renders its text inside the cell's private data instead of a
+  // separate XTextView. Search bounded fields, without a build-specific RVA.
+  if(!label && ['mmui::XTextView','mmui::ExtensionDiscoverContentCell'].includes(type))
+    for(const base of [data,object])for(let offset=64;offset<512;offset+=8) {
+      try {if(qstring(base.add(offset).readPointer())==='小程序')return '小程序';}catch(_){}
+    }
+  return label;
+}
 function children(object) {
   const data = object.add(8).readPointer();
   if (!data.add(8).readPointer().equals(object)) throw Error('QObject ownership mismatch');
@@ -201,11 +212,8 @@ rpc.exports.snapshot = function (savedLayout, geometry) {
       if (widget) { const rect = rectangle(object); x += rect.x; y += rect.y;
         visible=visible && !!(object.add(40).readPointer().add(8).readU32() & 0x8000); }
       sidebar = sidebar || type === 'mmui::MainTabBar';
-      if (visible && ['mmui::XTabBarItem','mmui::XButton','mmui::XTextView'].includes(type)) {
-        let label = null;try { label = qstring(data.add(200).readPointer()); } catch (_) {}
-        if(!label && type==='mmui::XTextView')for(let offset=64;offset<512;offset+=8){
-          try{const text=qstring(object.add(offset).readPointer());if(text==='小程序'){label=text;break;}}catch(_){}
-        }
+      if (visible && ['mmui::XTabBarItem','mmui::XButton','mmui::XTextView','mmui::ExtensionDiscoverContentCell'].includes(type)) {
+        const label=controlLabel(object,data,type);
         if (label && ['发现','小程序','最近使用','微信','更多'].includes(label)) {
           const rect = rectangle(object);
           controls.push({type,label,object:object.toString(),localRect:rect,
