@@ -102,20 +102,26 @@ def test_two_failed_launches_end_this_round(monkeypatch):
     asyncio.run(run())
 
 
-def test_cached_native_click_translates_window_movement_without_frida(monkeypatch):
+@pytest.mark.parametrize('visible',[True,False])
+def test_cached_native_click_reads_live_control_instead_of_old_coordinate(monkeypatch,visible):
     from package.plugin_manager import wechat_native_launch as native
-    def rect(h,p):p._obj.right=100;p._obj.bottom=100;return True
-    def origin(h,p):p._obj.x=200;p._obj.y=300;return True
-    def pid(h,p):p._obj.value=10
-    def dpi(h):return 144
-    user=SimpleNamespace(GetWindowThreadProcessId=pid,IsIconic=lambda h:False,
-        SetForegroundWindow=lambda h:None,GetClientRect=rect,ClientToScreen=origin,GetDpiForWindow=dpi)
+    user=SimpleNamespace(IsIconic=lambda h:False,SetForegroundWindow=lambda h:None)
     monkeypatch.setattr(native,'user32',lambda:user)
-    monkeypatch.setattr(native.psutil,'Process',lambda pid:SimpleNamespace(pid=10,name=lambda:'Weixin.exe',create_time=lambda:12))
+    process=SimpleNamespace(pid=10,info={'name':'Weixin.exe','cmdline':[]},name=lambda:'Weixin.exe',create_time=lambda:12)
+    monkeypatch.setattr(native.psutil,'Process',lambda pid:process)
+    monkeypatch.setattr(native.psutil,'process_iter',lambda attrs:[process])
+    monkeypatch.setattr(native,'wechat_window_pids',lambda user:{10})
+    monkeypatch.setattr(native,'main_geometry',lambda user,pid:{'hwnd':'0x10'})
     monkeypatch.setattr(native.time,'sleep',lambda t:None)
+    live=dict(NATIVE,controls=[dict(label='发现',screenCenter={'x':99,'y':88})] if visible else [])
+    monkeypatch.setattr(native,'_probe',SimpleNamespace(snapshot=lambda *args:live))
     clicks=[];monkeypatch.setattr(native,'click_control',lambda u,s,c:clicks.append(c['screenCenter']))
-    result=native.run('CachedClick','发现',cache=NATIVE)
-    assert result['cached'] and clicks==[{'x':230,'y':340}]
+    if visible:
+        native.run('CachedClick','发现',cache=NATIVE)
+        assert clicks==[{'x':99,'y':88}]
+    else:
+        with pytest.raises(RuntimeError,match='0 个'):native.run('CachedClick','发现',cache=NATIVE)
+        assert clicks==[]
 
 
 def test_cache_write_failure_does_not_stop_positioning(monkeypatch):

@@ -42,7 +42,7 @@ def test_open_recent_page_needs_no_frida_or_image_navigation(monkeypatch):
     async def native(*args):raise AssertionError('must not attach unnecessarily')
     monkeypatch.setattr(launch,'_recent_ui',recent);monkeypatch.setattr(launch,'_native_ui',native)
     asyncio.run(launch.prepare_wechat_game())
-    assert calls==['Probe','EntryPrepare']
+    assert calls==['Probe']
 
 
 def test_discover_uses_frida_position_then_text_entry(monkeypatch):
@@ -50,11 +50,11 @@ def test_discover_uses_frida_position_then_text_entry(monkeypatch):
     async def recent(mode):calls.append(mode);return {'found':found[0]}
     async def native(mode,label=None,**kwargs):
         calls.append((mode,label))
-        if mode=='CachedClick':found[0]=True
+        if mode=='Click':found[0]=True
         return {'controls':[{'label':'发现'}]}
     monkeypatch.setattr(launch,'_recent_ui',recent);monkeypatch.setattr(launch,'_native_ui',native)
     asyncio.run(launch.prepare_wechat_game())
-    assert calls==['Probe',('Snapshot',None),('CachedClick','发现'),'Probe','EntryPrepare']
+    assert calls==['Probe',('Snapshot',None),('Click','发现'),('Snapshot',None),'Probe']
 
 
 def test_unsupported_native_build_does_not_close_game(monkeypatch):
@@ -229,7 +229,7 @@ def test_main_geometry_ignores_hidden_weixin_helper_and_keeps_minimized_main(min
     with pytest.raises(RuntimeError,match='未唯一就绪'):main_geometry(user,123)
 
 
-def test_newly_scanned_geometry_is_reused_and_only_invalid_geometry_is_rescanned(monkeypatch):
+def test_click_revalidates_visible_control_before_input(monkeypatch):
     async def run():
         snapshot={'controls':[{'label':'发现'}]};calls=[]
         async def native(mode,label,**kwargs):
@@ -240,7 +240,7 @@ def test_newly_scanned_geometry_is_reused_and_only_invalid_geometry_is_rescanned
             return {'ok':True}
         monkeypatch.setattr(launch,'_native_ui',native)
         assert (await launch._click_native_control(snapshot,'发现'))['ok']
-        assert calls==['CachedClick','Click']
+        assert calls==['Click']
     asyncio.run(run())
 
 
@@ -253,12 +253,12 @@ def test_discover_cell_navigation_stays_on_native_path(monkeypatch):
                 snapshots+=1
                 return {'controls':[{'label':'发现'}] if snapshots==1 else
                     [{'label':'小程序','type':'mmui::ExtensionDiscoverContentCell'}]}
-            assert mode=='CachedClick'
+            assert mode=='Click'
             clicks.append(label)
             if label=='小程序':opened=True
             return {'ok':True}
         async def recent(mode,**kwargs):
-            assert mode in ('Probe','EntryPrepare'), 'must not fall back to unmatched UIA text navigation'
+            assert mode in ('Probe','WaitPrepare'), 'must not fall back to unmatched UIA text navigation'
             return {'found':opened,'ok':True}
         async def sleep(seconds):pass
         monkeypatch.setattr(launch,'_native_ui',native)
@@ -266,4 +266,48 @@ def test_discover_cell_navigation_stays_on_native_path(monkeypatch):
         monkeypatch.setattr(launch.asyncio,'sleep',sleep)
         assert (await launch.prepare_wechat_game())['ok']
         assert clicks==['发现','小程序'] and snapshots==2
+    asyncio.run(run())
+
+
+def test_ready_probe_returns_same_validated_card_without_rescanning(monkeypatch):
+    prepared={'ok':True,'found':True,'cache':{'runtimeId':[1,2]}}
+    async def recent(mode):
+        assert mode=='Probe'
+        return prepared
+    monkeypatch.setattr(launch,'_recent_ui',recent)
+    assert asyncio.run(launch._prepare_native_entry()) is prepared
+
+
+@pytest.mark.parametrize('page',['chat','discover','recent'])
+def test_persisted_small_program_coordinate_never_selects_navigation(page,monkeypatch):
+    async def run():
+        cached={'native':{'controls':[{'label':'小程序'},{'label':'发现'}]}}
+        state=[page];calls=[]
+        async def native(mode,label=None,**kwargs):
+            calls.append((mode,label))
+            assert mode!='CachedClick', 'historical coordinates cannot establish visibility'
+            if mode=='Snapshot':
+                labels=['发现'] if state[0]=='chat' else ['发现','小程序']
+                return {'controls':[{'label':x} for x in labels]}
+            assert mode=='Click'
+            if label=='发现':
+                assert state[0]=='chat'
+                state[0]='discover'
+            else:
+                assert state[0]=='discover', 'must open Discover before clicking small program'
+                state[0]='recent'
+            return {'ok':True}
+        async def recent(mode,**kwargs):
+            calls.append(mode)
+            assert mode in ('Probe','WaitPrepare')
+            if mode=='WaitPrepare':assert state[0]=='recent'
+            return {'ok':True,'found':state[0]=='recent','cache':{}}
+        monkeypatch.setattr(launch.positions,'load',lambda:cached)
+        monkeypatch.setattr(launch,'_native_ui',native)
+        monkeypatch.setattr(launch,'_recent_ui',recent)
+        await launch._prepare_native_entry()
+        clicks=[x[1] for x in calls if isinstance(x,tuple) and x[0]=='Click']
+        assert clicks==({'chat':['发现','小程序'],'discover':['小程序'],'recent':[]}[page])
+        assert calls[0]=='Probe'
+        assert calls.count('WaitPrepare')==(page!='recent')
     asyncio.run(run())

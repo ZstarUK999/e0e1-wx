@@ -1,4 +1,4 @@
-﻿param([ValidateSet('Prepare','WaitClosed','Open','Probe','EntryPrepare','EntryOpen','Navigate','Scan','CachedPrepare','CachedOpen')][string]$Mode='Prepare',
+﻿param([ValidateSet('Prepare','WaitClosed','Open','Probe','EntryPrepare','EntryOpen','WaitPrepare','Navigate','Scan','CachedPrepare','CachedOpen')][string]$Mode='Prepare',
  [string]$EntryCachePath='', [switch]$Worker)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
@@ -17,6 +17,10 @@ public static class GameEntryInput {
  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h,ref Point p);
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+ [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,IntPtr processId);
+ [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from,uint to,bool attach);
+ [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h,int n);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
@@ -39,11 +43,32 @@ function Activate($w) {
  $hwnd=[IntPtr]$w.Current.NativeWindowHandle
  if($hwnd -eq [IntPtr]::Zero){throw '微信主窗口不可见，请打开微信的小程序最近使用页面'}
  if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null}
- if([GameEntryInput]::GetForegroundWindow() -ne $hwnd){
+ if([GameEntryInput]::GetForegroundWindow() -eq $hwnd){return}
+ [GameEntryInput]::SetForegroundWindow($hwnd) | Out-Null
+ Start-Sleep -Milliseconds 200
+ if([GameEntryInput]::GetForegroundWindow() -eq $hwnd){return}
+ # A fresh PowerShell helper does not own the foreground input queue. Join it
+ # briefly for activation, then always detach before returning or clicking.
+ $currentThread=[GameEntryInput]::GetCurrentThreadId()
+ $foregroundThread=[GameEntryInput]::GetWindowThreadProcessId([GameEntryInput]::GetForegroundWindow(),[IntPtr]::Zero)
+ $targetThread=[GameEntryInput]::GetWindowThreadProcessId($hwnd,[IntPtr]::Zero)
+ $attached=@()
+ try {
+  foreach($thread in (@($foregroundThread,$targetThread) | Select-Object -Unique)) {
+   if($thread -ne 0 -and $thread -ne $currentThread -and [GameEntryInput]::AttachThreadInput($currentThread,$thread,$true)){$attached+=,$thread}
+  }
+  [GameEntryInput]::BringWindowToTop($hwnd) | Out-Null
   [GameEntryInput]::SetForegroundWindow($hwnd) | Out-Null
-  Start-Sleep -Milliseconds 100
+  Start-Sleep -Milliseconds 200
+ } finally {
+  foreach($thread in $attached){[GameEntryInput]::AttachThreadInput($currentThread,$thread,$false) | Out-Null}
  }
- if([GameEntryInput]::GetForegroundWindow() -ne $hwnd){throw '无法激活微信窗口，停止点击'}
+ $foreground=[GameEntryInput]::GetForegroundWindow()
+ if($foreground -ne $hwnd){
+  $diagnostics.targetHwnd=$hwnd.ToInt64().ToString()
+  $diagnostics.foregroundHwnd=$foreground.ToInt64().ToString()
+  throw '无法激活微信窗口，停止点击'
+ }
 }
 function Click($element,$window) {
  if($element.Current.IsOffscreen -or !$element.Current.IsEnabled){throw '游戏入口不可见或不可点击'}
@@ -168,7 +193,13 @@ try {
   return
  }
  if($Mode -eq 'Probe') {
-  @{ok=$true;found=($null -ne $entry);entry='recent-release'} | ConvertTo-Json -Compress;return
+  if(!$entry){@{ok=$true;found=$false;entry='recent-release'} | ConvertTo-Json -Compress;return}
+  # Return the validated card cache without another EntryPrepare traversal.
+ }
+ if($Mode -eq 'WaitPrepare') {
+  $deadline=[DateTime]::UtcNow.AddSeconds(5)
+  while(!$entry -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 150;$entry=Entry}
+  if(!$entry){throw '点击微信小程序后，最近使用页面5秒内仍未就绪'}
  }
  if($Mode -eq 'Navigate') {
   $targets=@()
@@ -210,7 +241,7 @@ try {
  $rect=$entry.Element.Current.BoundingRectangle
  if($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw '普通版游戏入口没有可用位置，请显示微信最近使用页面'}
  if($Mode -in @('Open','EntryOpen')){Click $entry.Element $entry.Window}
- @{ok=$true;phase=$Mode;entry='recent-release';cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress
+ @{ok=$true;found=$true;phase=$Mode;entry='recent-release';cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress
 }catch {
  @{ok=$false;message=$_.Exception.Message;diagnostics=$diagnostics} | ConvertTo-Json -Compress
  return

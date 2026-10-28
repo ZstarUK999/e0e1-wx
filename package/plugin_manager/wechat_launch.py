@@ -26,7 +26,7 @@ async def _recent_ui(mode, entry_cache=None):
             source=Path(folder)/"entry.json"
             source.write_text(json.dumps(entry_cache),encoding="utf-8")
             extra.extend(["-EntryCachePath",str(source)])
-        hot_modes={'Probe','EntryPrepare','EntryOpen','Navigate','CachedPrepare','CachedOpen'}
+        hot_modes={'Probe','EntryPrepare','EntryOpen','WaitPrepare','Navigate','CachedPrepare','CachedOpen'}
         failed=False
         if mode in hot_modes:
             from .wechat_ui_worker import request
@@ -57,7 +57,7 @@ _native_probe_task = None
 
 async def _native_ui(mode,label=None,cache=None):
     global _native_probe_task
-    if mode not in ('Snapshot','Scan','Click'):
+    if mode not in ('Snapshot','Scan','Click','CachedClick'):
         return await _native_ui_request(mode,label,cache)
     if _native_probe_task is not None and not _native_probe_task.done():
         raise RuntimeError('上次微信原生控件扫描仍在收尾，暂不重复注入')
@@ -97,33 +97,32 @@ async def _cached_prepare(cached):
     if entry:
         try:return await _recent_ui('CachedPrepare',entry_cache=entry)
         except Exception as exc:LOG.debug('缓存游戏入口需更新：%s',exc)
-    native=cached.get('native')
-    if native:
-        labels={c.get('label') for c in native.get('controls',[])}
-        label='小程序' if '小程序' in labels else '发现' if '发现' in labels else None
-        if label:
-            try:
-                await _native_ui('CachedClick',label,cache=native)
-                if entry:
-                    try:return await _recent_ui('CachedPrepare',entry_cache=entry)
-                    except Exception:pass
-                return await _recent_ui('EntryPrepare')
-            except Exception as exc:LOG.debug('缓存微信导航需更新：%s',exc)
+    # Persisted native coordinates describe a past page, never current visibility.
     return None
 
 
 async def _wait_recent():
-    for _ in range(10):
-        if (await _recent_ui('Probe')).get('found'):return True
-        await asyncio.sleep(.3)
-    return False
+    # Wait and validate in one warm worker request, returning the located card.
+    return await _recent_ui('WaitPrepare')
 
 
 async def _click_native_control(snapshot,label):
-    # Reuse the just-read geometry; CachedClick validates process, DPI, size and
-    # occlusion before sending input. Only failed validation requires a new read.
-    try:return await _native_ui('CachedClick',label,cache=snapshot)
-    except (RuntimeError,OSError):return await _native_ui('Click',label)
+    # Re-read current visible controls immediately before input. The persistent
+    # Frida session reuses its root; only layout metadata is taken from cache.
+    return await _native_ui('Click',label,cache=snapshot)
+
+
+async def _prepare_after_navigation(label):
+    if label=='发现':
+        # Discover is intermediate: open its native cell before waiting for cards.
+        snapshot=await _native_ui('Snapshot')
+        if any(c.get('label')=='小程序' for c in snapshot.get('controls',[])):
+            await _click_native_control(snapshot,'小程序')
+        else:
+            prepared=await _recent_ui('Probe')
+            if prepared.get('found'):return prepared
+            await _recent_ui('Navigate')
+    return await _wait_recent()
 
 
 async def _prepare_native_entry(*,force_scan=False):
@@ -135,31 +134,26 @@ async def _prepare_native_entry(*,force_scan=False):
                 LOG.info('微信入口预检查通过：已使用缓存位置')
                 return prepared
     # An already-open page needs no native navigation or version-dependent scan.
-    if (await _recent_ui('Probe')).get('found'):
-        return await _recent_ui('EntryPrepare')
+    prepared=await _recent_ui('Probe')
+    if prepared.get('found'):
+        return prepared
     snapshot=await _native_ui('Snapshot')
     labels={c.get('label') for c in snapshot.get('controls',[])}
     if '小程序' in labels:
         await _click_native_control(snapshot,'小程序')
+        return await _prepare_after_navigation('小程序')
     elif '发现' in labels:
         await _click_native_control(snapshot,'发现')
-        if await _wait_recent():return await _recent_ui('EntryPrepare')
-        # Discover may expose its small-program tab through the embedded web UI.
-        snapshot=await _native_ui('Snapshot')
-        if any(c.get('label')=='小程序' for c in snapshot.get('controls',[])):
-            await _click_native_control(snapshot,'小程序')
-        else:
-            await _recent_ui('Navigate')
+        return await _prepare_after_navigation('发现')
     else:
         raise RuntimeError('Frida未找到微信小程序或发现入口；未关闭游戏')
-    if not await _wait_recent():raise RuntimeError('点击微信入口后，最近使用页面仍未就绪')
-    return await _recent_ui('EntryPrepare')
 
 
 async def prepare_wechat_game(*,runner=None):
+    started=time.monotonic()
     if runner:result=await runner('Prepare')
     else:result=await _prepare_native_entry()
-    LOG.info('微信重开预检查通过：Frida原生控件及最近使用文本入口')
+    LOG.info('微信重开预检查通过：Frida原生控件及最近使用文本入口；耗时=%.2f秒',time.monotonic()-started)
     return result
 
 

@@ -236,26 +236,9 @@ def run(mode,label=None,cache=None):
         proc=psutil.Process(int(cache['pid']))
         if proc.name().lower()!='weixin.exe' or proc.create_time()!=cache['processCreatedAt']:
             raise RuntimeError('微信进程已变化，重新扫描位置')
-        hwnd=int(cache['hwnd'],16);pid=W.DWORD()
-        user.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
-        if pid.value!=proc.pid:raise RuntimeError('微信窗口已变化')
-        if user.IsIconic(hwnd):user.ShowWindowAsync(hwnd,9)
-        user.SetForegroundWindow(hwnd);time.sleep(.2)
-        rect=W.RECT();origin=W.POINT()
-        if not user.GetClientRect(hwnd,ctypes.byref(rect)) or not user.ClientToScreen(hwnd,ctypes.byref(origin)):
-            raise RuntimeError('微信窗口位置不可用')
-        if {'width':rect.right,'height':rect.bottom}!=cache['clientSize']:
-            raise RuntimeError('微信窗口尺寸已变化，重新扫描位置')
-        user.GetDpiForWindow.argtypes=[W.HWND];user.GetDpiForWindow.restype=W.UINT
-        if abs(user.GetDpiForWindow(hwnd)/96-float(cache['scaleX']))>.01:
-            raise RuntimeError('微信窗口DPI已变化，重新扫描位置')
-        previous=choose_control(cache,label)
-        control=dict(previous,screenCenter={
-            'x':previous['screenCenter']['x']-cache['origin']['x']+origin.x,
-            'y':previous['screenCenter']['y']-cache['origin']['y']+origin.y})
-        live=dict(cache,origin={'x':origin.x,'y':origin.y})
-        click_control(user,live,control)
-        return {'ok':True,'label':label,'control':control,'cached':True}
+        # Old coordinates cannot prove that the named control is still visible.
+        # Resolve the label and geometry from the current Qt tree before input.
+        return run('Click',label,cache)
     deadline=time.monotonic()+20
     pid=select_wechat_pid(psutil.process_iter(['name','cmdline']),wechat_window_pids(user))
     created=psutil.Process(pid).create_time()
