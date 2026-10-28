@@ -59,13 +59,12 @@ class DouyinImageLauncher(WechatImageLauncher):
 async def ensure_game_started(platform, *, before_open=None, factory=None):
     """已有目标游戏窗口则保留；缺失时准备监听后只点击一次入口。"""
     if platform == '微信' and factory is None:
-        from .wechat_launch import _native_ui, prepare_wechat_game, open_wechat_game
+        from .wechat_launch import _native_ui, prepare_wechat_start, open_wechat_game
         if (await _native_ui('Status'))['windows']:return False
-        await prepare_wechat_game()
-        if before_open:await before_open()
+        prepared=await prepare_wechat_start(before_open)
         # Another actor may have opened the game while hooks were prepared.
         if not (await _native_ui('Status'))['windows']:
-            await open_wechat_game()
+            await open_wechat_game(prepared=prepared)
         LOG.info('微信控件启动检查完成，等待游戏连接')
         return True
     if platform == '应用宝' and factory is None:

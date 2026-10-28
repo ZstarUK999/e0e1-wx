@@ -83,7 +83,7 @@ def persist_addresses_config(version: int, config: dict, platform_dir: str = "wi
     return path
 
 
-def detect_offsets_sync(pid: int, timeout: float = 180.0, frida=None) -> dict:
+def detect_offsets_sync(pid: int, timeout: float = 180.0, frida=None, session=None) -> dict:
     """挂到指定 WMPF 进程算出偏移；失败抛 RuntimeError（带脚本里的原始报错）。"""
     if frida is None:
         import frida as frida_module
@@ -95,8 +95,8 @@ def detect_offsets_sync(pid: int, timeout: float = 180.0, frida=None) -> dict:
         raise RuntimeError(f"自动检测脚本缺失：{script_path}")
 
     script_content = script_path.read_text(encoding="utf-8")
-    device = frida.get_local_device()
-    session = device.attach(int(pid))
+    owns_session=session is None
+    if owns_session:session=frida.get_local_device().attach(int(pid))
     script = None
     try:
         script = session.create_script(script_content)
@@ -125,10 +125,11 @@ def detect_offsets_sync(pid: int, timeout: float = 180.0, frida=None) -> dict:
                 script.unload()
             except Exception:
                 pass
-        try:
-            session.detach()
-        except Exception:
-            pass
+        if owns_session:
+            try:
+                session.detach()
+            except Exception:
+                pass
 
     if "config" not in collected:
         error = str(collected.get("error") or "脚本未返回结果")

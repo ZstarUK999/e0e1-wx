@@ -607,6 +607,7 @@ class DebugEngine:
 
     async def _start_frida(self):
         """在线程中启动 Frida 链路，避免阻塞 DevTools worker 的事件循环。"""
+        self._frida_loop=asyncio.get_running_loop()
         return await asyncio.to_thread(self._start_frida_sync)
 
     def _start_frida_sync(self):
@@ -636,6 +637,7 @@ class DebugEngine:
         if not hook_path.exists():
             raise RuntimeError("[frida] hook script not found")
 
+        prepared_session=None
         config_path = tools_root() / "config" / platform_dir / f"addresses.{wmpf_version}.json"
         if androws_config is None and not config_path.exists():
             # 兜底：本机出现新版本运行时时，现算偏移并落盘，之后照常从磁盘读。
@@ -646,25 +648,36 @@ class DebugEngine:
             self._notify_status("message", f"正在自动检测 {wmpf_version} 偏移…")
             self._notify_status("offset_detect", True)
             try:
-                detected = offset_autodetect.detect_offsets_sync(pids[0], frida=frida)
+                prepared_session=frida.get_local_device().attach(pids[0])
+                detected = offset_autodetect.detect_offsets_sync(pids[0], frida=frida,session=prepared_session)
                 normalized = offset_autodetect.normalize_detected_config(wmpf_version, detected)
                 saved_path = offset_autodetect.persist_addresses_config(
                     wmpf_version, normalized, platform_dir
                 )
                 logger.info(f"[frida] 自动检测完成，偏移已写入 {saved_path}")
             except Exception as exc:
+                if prepared_session is not None:
+                    try:prepared_session.detach()
+                    except Exception:pass
+                    prepared_session=None
                 raise RuntimeError(f"[frida] 版本 {wmpf_version} 偏移自动检测失败：{exc}") from None
             finally:
                 # 不清空的话 bridge 结束时还会再推一次状态，界面会一直挂着检测提示。
                 self._notify_status("offset_detect", False)
                 self._notify_status("message", "")
 
-        script_content = hook_path.read_text(encoding="utf-8")
-        config_content = json.dumps(androws_config if androws_config is not None
-                                    else json.loads(config_path.read_text(encoding="utf-8")))
-        final_script = script_content.replace("@@CONFIG@@", config_content)
-        debug_port = getattr(getattr(self, 'options', None), 'debug_port', 9421)
-        final_script = render_hook_debug_port(final_script, debug_port)
+        try:
+            script_content = hook_path.read_text(encoding="utf-8")
+            config_content = json.dumps(androws_config if androws_config is not None
+                                        else json.loads(config_path.read_text(encoding="utf-8")))
+            final_script = script_content.replace("@@CONFIG@@", config_content)
+            debug_port = getattr(getattr(self, 'options', None), 'debug_port', 9421)
+            final_script = render_hook_debug_port(final_script, debug_port)
+        except Exception:
+            if prepared_session is not None:
+                try:prepared_session.detach()
+                except Exception:pass
+            raise
 
         device = frida.get_local_device()
         session = None
@@ -681,10 +694,20 @@ class DebugEngine:
             current_session = None
             current_script = None
             try:
-                current_session = device.attach(pid)
+                current_session = prepared_session if prepared_session is not None and pid==pids[0] else device.attach(pid)
+                if current_session is prepared_session:prepared_session=None
                 current_script = current_session.create_script(final_script)
                 current_script.on("message", on_message)
                 current_script.load()
+                def invalidated(*args,attached=current_session,loaded=current_script):
+                    def publish():
+                        if getattr(self,'frida_session',None) is attached and getattr(self,'frida_script',None) is loaded:
+                            self._notify_status('frida',False)
+                    loop=getattr(self,'_frida_loop',None)
+                    if loop is not None and not loop.is_closed():loop.call_soon_threadsafe(publish)
+                    else:publish()
+                if hasattr(current_session,'on'):current_session.on('detached',invalidated)
+                current_script.on('destroyed',invalidated)
                 if androws_config is not None:
                     current_script.exports_sync.install()
                 logger.info(f"[frida] injected pid={pid}, version={wmpf_version}")
@@ -692,17 +715,13 @@ class DebugEngine:
                     session, script = current_session, current_script
             except Exception as exc:
                 logger.error(f"[frida] failed to inject pid={pid}: {exc}")
+                if current_script is not None:
+                    try:current_script.unload()
+                    except Exception:pass
+                if current_session is not None:
+                    try:current_session.detach()
+                    except Exception:pass
                 if androws_config is not None:
-                    if current_script is not None:
-                        try:
-                            current_script.unload()
-                        except Exception:
-                            pass
-                    if current_session is not None:
-                        try:
-                            current_session.detach()
-                        except Exception:
-                            pass
                     raise RuntimeError(f'应用宝调试挂载失败：{exc}') from exc
 
         if session is None:

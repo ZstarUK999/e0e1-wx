@@ -19,13 +19,17 @@ class PetHatchTask:
             return TaskResult('waiting', '请先选择要自动解封的阴契')
         if ctx.stop_requested():
             return TaskResult('waiting', '已请求停止')
-        await self.game.home()
         placed = claimed = 0
+        opened = False
         info = {}
         for _ in range(24):
             if ctx.stop_requested():
                 break
             info = await self.game.pet_hatch_state(selected)
+            actionable = info.get('claim_slot') or info.get('item_id') and info.get('can_place')
+            if actionable and not opened:
+                await self.game.home()
+                opened = True
             if info.get('claim_slot'):
                 result = await self.game.pet_hatch_claim(info['claim_slot'])
                 claimed += 1
@@ -36,7 +40,14 @@ class PetHatchTask:
                 break
             if not isinstance(result, dict) or result.get('confirmed') is not True:
                 raise ExecutionUncertain('阴契解封操作结果未确认，不重复执行')
-        await self.game.home()
-        delay = max(1, min(60, info.get('remaining_seconds') or 60))
-        return TaskResult('success' if placed or claimed else 'waiting',
-                          f'阴契：已领取{claimed}次，已放入解封槽或队列{placed}个' if placed or claimed else '等待所选阴契或解封槽／队列空位', delay)
+        if opened:
+            await self.game.home()
+        # Bag/slot reads are passive. Wake for completed slots rather than reopening
+        # the pet page every minute; inventory can be replenished between runs.
+        remaining = info.get('remaining_seconds')
+        delay = max(1, remaining) if isinstance(remaining, (int, float)) and remaining > 0 else 1800
+        if not info.get('item_id'):
+            delay = min(delay, 1800)
+        message = (f'阴契：已领取{claimed}次，已放入解封槽或队列{placed}个' if placed or claimed else
+                   '所选阴契不足，暂不解封' if not info.get('item_id') else '等待解封槽／队列空位')
+        return TaskResult('success' if placed or claimed else 'waiting', message, delay)

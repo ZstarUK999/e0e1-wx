@@ -206,7 +206,7 @@ def test_reopen_arms_hook_before_new_launch_and_holds_auto_retries():
         service=Service();session=GameSession(service,SimpleNamespace(),RuntimeState(),record={})
         await session.prepare_reopen(timeout=.1)
         for i in range(4):session.request_debug()
-        assert service.starts==1 and not service.state_changed.slots
+        assert service.starts==0 and not service.state_changed.slots
     asyncio.run(run())
 
 
@@ -219,24 +219,20 @@ def test_wechat_recent_launch_does_not_click_when_hook_is_unready():
     assert calls==['WaitClosed']
 
 
-def test_wechat_sidebar_calibration_validation_and_gui_save(tmp_path,monkeypatch):
-    import package.plugin_manager.wechat_launch as launch
+def test_old_sidebar_configuration_is_discarded_and_no_calibration_button_remains(tmp_path):
+    import json
     from PySide6.QtWidgets import QPushButton
     app=QApplication.instance() or QApplication([])
-    value={'x':30,'y':240,'width':900,'height':800,'window_class':'WeChatMainWindow'}
-    store=PluginConfigStore(tmp_path/'sidebar.json')
-    window=PluginWindow(store);panel=window.pages['global']
-    monkeypatch.setattr(launch,'capture_wechat_sidebar',lambda:dict(value))
-    panel._capture_wechat_sidebar()
-    assert store.snapshot()['ui']['wechat_sidebar']==value
-    assert PluginConfigStore(store.path).snapshot()['ui']['wechat_sidebar']==value
-    for bad in [{**value,'x':901},{**value,'y':-1},{**value,'width':True}]:
-        with pytest.raises(ValueError):store.set_wechat_sidebar(bad)
-    assert panel.findChild(QPushButton,'ui.wechat_sidebar.calibrate').isEnabled()
+    old=default_config();old['ui']['wechat_sidebar']={'x':30,'y':40,'width':900,'height':800,'window_class':'legacy'}
+    path=tmp_path/'plugins.json';path.write_text(json.dumps(old),encoding='utf-8')
+    store=PluginConfigStore(path)
+    assert 'wechat_sidebar' not in store.snapshot()['ui']
+    window=PluginWindow(store)
+    assert window.findChild(QPushButton,'ui.wechat_sidebar.calibrate') is None
     window.deleteLater();app.processEvents()
 
 
-def test_sidebar_coordinates_are_passed_as_arguments_and_failure_diagnostics_logged(monkeypatch,caplog):
+def test_entry_failure_diagnostics_are_logged_without_legacy_calibration(monkeypatch,caplog):
     import logging
     import package.plugin_manager.wechat_launch as launch
     commands=[]
@@ -246,11 +242,83 @@ def test_sidebar_coordinates_are_passed_as_arguments_and_failure_diagnostics_log
             return b'{"ok":false,"message":"missing sidebar","diagnostics":{"stage":"open-sidebar","navigationMatches":0}}',b''
     async def create(*args,**kwargs):commands.append(args);return Process()
     monkeypatch.setattr(launch.asyncio,'create_subprocess_exec',create)
-    sidebar={'x':30,'y':240,'width':900,'height':800,'window_class':'WeChatMainWindow'}
     with caplog.at_level(logging.ERROR,logger='plugin_manager'):
         with pytest.raises(RuntimeError,match='missing sidebar'):
-            asyncio.run(launch._recent_ui('Prepare',sidebar))
+            asyncio.run(launch._recent_ui('Prepare'))
     args=commands[0]
-    assert args[args.index('-SidebarX')+1]=='30'
-    assert args[args.index('-SidebarWindowClass')+1]=='WeChatMainWindow'
+    assert not any(str(arg).startswith('-Sidebar') for arg in args)
     assert 'open-sidebar' in caplog.text and 'navigationMatches' in caplog.text
+
+
+@pytest.mark.parametrize('info,delay',[
+    ({'item_id':None,'remaining_seconds':None},1800),
+    ({'item_id':None,'remaining_seconds':7200},1800),
+    ({'item_id':None,'remaining_seconds':900},900),
+    ({'item_id':400001,'can_place':False,'remaining_seconds':7200},7200),
+])
+def test_pet_waits_without_opening_ui_and_uses_completion_timer(info,delay):
+    class Game:
+        async def home(self):raise AssertionError('waiting must not navigate')
+        async def pet_hatch_state(self,ids):return info
+        async def pet_hatch_start(self,id):raise AssertionError('no available action')
+        async def pet_hatch_claim(self,slot):raise AssertionError('no completed slot')
+    result=asyncio.run(PetHatchTask(Game()).run(context()))
+    assert result.status=='waiting' and result.next_delay_seconds==delay
+
+
+def test_pet_shortage_still_claims_finished_slots_and_replenishment_resumes():
+    class Game:
+        def __init__(self):self.complete=True;self.stock=False;self.claimed=0;self.placed=0
+        async def home(self):pass
+        async def pet_hatch_state(self,ids):
+            return {'claim_slot':1 if self.complete else 0,'item_id':400001 if self.stock else None,
+                    'can_place':True,'remaining_seconds':None}
+        async def pet_hatch_claim(self,slot):
+            self.complete=False;self.claimed+=1;return {'confirmed':True}
+        async def pet_hatch_start(self,id):
+            self.stock=False;self.placed+=1;return {'confirmed':True}
+    async def run():
+        game=Game();task=PetHatchTask(game)
+        result=await task.run(context())
+        assert game.claimed==1 and game.placed==0 and result.next_delay_seconds==1800
+        game.stock=True
+        await task.run(context())
+        assert game.placed==1
+    asyncio.run(run())
+
+
+def test_pet_claim_finishes_cleanup_before_returning_home():
+    class Game:
+        def __init__(self):self.ops=[];self.finished=False
+        async def home(self):self.ops.append('home')
+        async def pet_hatch_state(self,ids):
+            self.ops.append('state')
+            return {'claim_slot':0 if self.finished else 1,'item_id':None,'remaining_seconds':None}
+        async def pet_hatch_claim(self,slot):
+            self.ops.extend(['claim','close-pets','close-rewards']);self.finished=True
+            return {'confirmed':True}
+    async def run():
+        game=Game();result=await PetHatchTask(game).run(context())
+        assert result.status=='success'
+        assert game.ops==['state','home','claim','close-pets','close-rewards','state','home']
+    asyncio.run(run())
+
+
+def test_startup_retry_reuses_the_debug_listener_during_hold_period():
+    import time
+    from package.plugin_manager.session import GameSession
+    class Service:
+        def snapshot(self):return {'frida':True}
+        def start_debug(self,record):raise AssertionError('do not tear down the prepared listener')
+    session=GameSession(Service(),SimpleNamespace(),SimpleNamespace(closing=False),record={})
+    session._started=True;session._next_debug_retry=time.monotonic()-60
+    asyncio.run(session.prepare_reopen())
+
+
+def test_free_summon_cooldown_check_never_navigates():
+    class Game:
+        async def home(self):raise AssertionError('cooldown checks are passive')
+        async def free_summon_state(self):return {'remaining_seconds':120}
+        async def free_summon(self):raise AssertionError('cooldown must not claim')
+    result=asyncio.run(FreeSummonTask(Game()).run(context()))
+    assert result.status=='waiting' and result.next_delay_seconds==120

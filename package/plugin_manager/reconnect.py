@@ -15,7 +15,6 @@ class WechatReconnect:
         self._configured = False
 
     async def poll(self, settings):
-        self.transport.wechat_sidebar=settings.get('wechat_sidebar')
         enabled = settings.get('wechat_reconnect', False)
         if not enabled and not self._configured:
             self.event = None

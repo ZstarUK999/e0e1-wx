@@ -44,19 +44,20 @@ def test_panel_filter_copy_and_rank_table():
     panel.close()
 
 
-def test_weighted_attacks_contribution_estimate_and_csv(tmp_path):
+def test_daily_wins_contribution_estimate_and_csv(tmp_path):
     import csv
     from package.plugin_manager.legion_boss import export_members_csv
     data=snapshot()
-    data.update(logComplete=True,logTotal=6,logs=[
-        dict(roleId='2',roundId=1,kind='player'),dict(roleId='2',roundId=1,kind='monster'),
-        dict(roleId='2',roundId=3,kind='monster'),dict(roleId='2',roundId=3,kind='monster'),
-        dict(roleId='3',roundId=6,kind='boss'),dict(roleId='2',roundId=3,kind='unknown')],
+    logs=[battle_log(2,2,'player',False),battle_log(2,2,'monster',True),
+          battle_log(2,4,'monster',True),battle_log(2,4,'player',True),
+          battle_log(2,4,'monster',False),battle_log(3,6,'boss',False)]
+    for log,point in zip(logs,[5,20,30,40,2,0]):log['point']=point
+    data.update(logComplete=True,logTotal=6,logs=logs,
         contributions=[dict(id='2',rank=1,score=1234)],bossOngoing=True,
         bossRewardRules=[dict(**{'from':4,'to':5},points=12000)])
     rows=compare_members(data);r=next(r for r in rows if r['id']=='2')
-    assert r['tue_monsters']==1 and r['tue_players']==1 and r['tue_attacks']==3
-    assert r['thu_monsters']==2 and r['thu_attacks']==2
+    assert (r['wed_failures'],r['wed_monsters'],r['wed_players'],r['wed_contribution'])==(0,1,0,25)
+    assert (r['fri_failures'],r['fri_monsters'],r['fri_players'],r['fri_contribution'])==(1,1,1,72)
     assert r['total_contribution']==13234 and r['boss_bonus']==12000
     unknown=next(r for r in rows if r['id']=='3')
     assert unknown['participated'] and unknown['total_contribution'] is None
@@ -65,9 +66,11 @@ def test_weighted_attacks_contribution_estimate_and_csv(tmp_path):
     with path.open(encoding='utf-8-sig',newline='') as f: exported=list(csv.DictReader(f))
     entry=next(r for r in exported if r['玩家ID']=='2')
     assert entry['名字']=="'=danger,名字" and entry['当前总贡献']=='13234'
+    assert entry['周三获取贡献']=='25' and entry['周五失败次数']=='1'
     assert len(exported)==3 and entry['日志完整']=='是'
     data['bossOngoing']=False
-    assert next(r for r in compare_members(data) if r['id']=='2')['total_contribution']==1234
+    settled=next(r for r in compare_members(data) if r['id']=='2')
+    assert settled['total_contribution']==1234 and settled['boss_bonus']==12000
 
 
 def test_feature_fetch_and_session_change(tmp_path):
@@ -113,3 +116,130 @@ def test_transport_routes_and_packaging():
     fake = SimpleNamespace(_rpc=rpc)
     assert asyncio.run(DouyinTransport.legion_boss_read(fake))['legionId'] == '42'
     assert ('package/plugin_manager/legion_boss_runtime.js', 'package/plugin_manager') in RESOURCES
+
+
+def battle_log(role,day,kind,win):
+    return dict(roleId=str(role),roundId=day,kind=kind,isWin=win,targetRoleId='0',
+                targetLegionId='0',point=0,wave=1,timeAt=100)
+
+
+def test_failure_counts_use_member_id_and_only_monster_losses():
+    data=snapshot()
+    data.update(logComplete=True,logs=[
+        battle_log(2,2,'player',False),battle_log(2,2,'monster',False),
+        battle_log(2,4,'monster',True),battle_log(2,4,'monster',False),
+        battle_log(2,6,'boss',False),battle_log(3,2,'monster',False),
+        battle_log(2,4,'monster',None),battle_log(999,2,'monster',False),
+        battle_log(2,1,'monster',False),battle_log(2,3,'monster',False)])
+    rows={r['id']:r for r in compare_members(data)}
+    assert rows['2']['wed_failures']==1 and rows['2']['fri_failures']==1
+    assert rows['2']['wed_players']==0 and rows['2']['fri_monsters']==1
+    assert rows['2']['wed_complete'] and not rows['2']['fri_complete']
+    assert rows['3']['wed_failures']==1 and rows['3']['wed_complete']
+    assert rows['1']['wed_failures']==0 and rows['1']['fri_failures']==0
+
+
+def test_failure_table_csv_and_unknown_result_are_explicit(tmp_path):
+    import csv
+    from package.plugin_manager.legion_boss import export_members_csv
+    app=QApplication.instance() or QApplication([])
+    data=snapshot();data.update(logComplete=False,logTotal=200,logs=[
+        battle_log(2,2,'player',False),battle_log(2,2,'monster',None),battle_log(2,2,'monster',False)])
+    panel=LegionBossPanel();panel.accept(data)
+    row=next(i for i in range(panel.table.rowCount()) if panel.table.item(i,1).text()=='2')
+    assert panel.table.item(row,6).text()=='≥1'
+    assert panel.table.item(row,7).text()=='≥0'
+    assert panel.table.item(row,8).text()=='≥0'
+    assert panel.log_table.item(0,10).text()=='重名'
+    assert panel.log_table.item(0,3).text()=='0'
+    assert panel.log_table.item(1,6).text()=='未知'
+    assert panel.log_table.item(2,3).text()=='1'
+    path=tmp_path/'members.csv';export_members_csv(path,data,panel.rows)
+    with path.open(encoding='utf-8-sig',newline='') as f:rows=list(csv.DictReader(f))
+    row=next(r for r in rows if r['玩家ID']=='2')
+    assert row['周三失败次数']=='1' and row['周三次数完整']=='否'
+    panel.close()
+
+
+def test_complete_empty_logs_mean_zero_but_missing_logs_are_only_lower_bounds():
+    data=snapshot();data.update(logComplete=True,logs=[])
+    assert all(r['wed_failures']==0 and r['wed_complete'] and r['fri_complete'] for r in compare_members(data))
+    data['logComplete']=False
+    assert all(r['wed_failures']==0 and not r['wed_complete'] for r in compare_members(data))
+    data.update(logComplete=True,logResultsComplete=False)
+    assert not any(r['wed_complete'] for r in compare_members(data))
+
+
+def test_missing_daily_points_do_not_fabricate_contribution():
+    data=snapshot();logs=[battle_log(2,2,'monster',True),battle_log(2,2,'player',False)]
+    logs[0]['point']=15;logs[1].pop('point')
+    data.update(logComplete=True,logs=logs)
+    row=next(r for r in compare_members(data) if r['id']=='2')
+    assert row['wed_contribution']==15 and not row['wed_contribution_complete']
+    assert row['wed_complete'] and row['fri_contribution_complete']
+    app=QApplication.instance() or QApplication([])
+    panel=LegionBossPanel();panel.accept(data)
+    index=next(i for i in range(panel.table.rowCount()) if panel.table.item(i,1).text()=='2')
+    assert panel.table.item(index,9).text()=='≥15'
+    panel.close()
+
+
+def test_columns_and_sorting_use_raw_numbers_for_all_numeric_fields():
+    from PySide6.QtCore import Qt
+    from package.plugin_manager.legion_boss import MEMBER_COLUMNS
+    app=QApplication.instance() or QApplication([])
+    panel=LegionBossPanel()
+    assert [title for _,title in MEMBER_COLUMNS][6:]==[
+        '周三失败次数','周三击败怪群次数','周三击败玩家次数','周三获取贡献',
+        '周五失败次数','周五击败怪群次数','周五击败玩家次数','周五获取贡献',
+        '周日Boss伤害','周日Boss排名','周日预估贡献','当前总贡献']
+    data=snapshot();data.update(members=[dict(id='2'),dict(id='10'),dict(id='20')],
+        ranks=[dict(id='2',rank=2,score=90000000),dict(id='10',rank=10,score=200000000)],
+        selfDamage=None,logComplete=False,
+        logs=[battle_log(2,2,'monster',False) for _ in range(2)]+
+             [battle_log(10,2,'monster',False) for _ in range(10)])
+    panel.accept(data)
+    def ids():return [panel.table.item(i,1).text() for i in range(3)]
+    panel.table.sortItems(1,Qt.SortOrder.AscendingOrder)
+    assert ids()==['2','10','20']
+    panel.table.sortItems(6,Qt.SortOrder.AscendingOrder)
+    assert ids()==['20','2','10']
+    assert panel.table.item(2,6).text()=='≥10'
+    assert panel.table.item(2,6).data(Qt.ItemDataRole.UserRole)==10
+    panel.table.sortItems(14,Qt.SortOrder.AscendingOrder)
+    assert ids()==['2','10','20']
+    assert panel.table.item(0,14).text()=='9000万' and panel.table.item(1,14).text()=='2亿'
+    panel.table.sortItems(15,Qt.SortOrder.AscendingOrder)
+    assert ids()==['2','10','20']
+    panel.table.sortItems(14,Qt.SortOrder.DescendingOrder)
+    assert ids()==['10','2','20']
+    panel.close()
+
+
+def test_hidden_columns_export_and_total_sort_with_missing_values(tmp_path):
+    import csv
+    from PySide6.QtCore import Qt
+    from package.plugin_manager.legion_boss import MEMBER_COLUMNS, export_members_csv
+    app=QApplication.instance() or QApplication([])
+    data=snapshot()
+    data.update(members=[dict(id=str(i),name=str(i),sName='某服',job=1) for i in range(1,6)],
+        ranks=[],selfDamage=None,bossOngoing=False,
+        contributions=[dict(id='2',rank=1,score=6000),dict(id='3',rank=2,score=5800),dict(id='4',rank=4,score=0),dict(id='5',rank=3,score=900)])
+    panel=LegionBossPanel();panel.accept(data)
+    for i,(key,_) in enumerate(MEMBER_COLUMNS):
+        assert panel.table.isColumnHidden(i)==(key in ('status','id','sName','job'))
+    def ids():return [panel.table.item(i,1).text() for i in range(5)]
+    assert ids()==['2','3','5','4','1']
+    panel.table.sortItems(17,Qt.SortOrder.AscendingOrder)
+    assert ids()==['4','5','3','2','1']
+    panel.table.sortItems(17,Qt.SortOrder.DescendingOrder)
+    assert ids()==['2','3','5','4','1']
+    panel.accept(data)
+    assert ids()==['2','3','5','4','1']
+    path=tmp_path/'members.csv';export_members_csv(path,data,panel.rows)
+    with path.open(encoding='utf-8-sig',newline='') as stream:
+        reader=csv.DictReader(stream)
+        assert '玩家ID' in reader.fieldnames
+        assert not {'Boss参与情况','参与情况','服务器','职位'} & set(reader.fieldnames)
+        assert len(list(reader))==5
+    panel.close()

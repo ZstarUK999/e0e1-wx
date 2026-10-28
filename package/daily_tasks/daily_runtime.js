@@ -394,7 +394,6 @@ function createDailyRuntime(g,h) {
     return screen;
   }
   async function summonState() {
-    await summonPage();
     const {data}=config(),clock=await serverClock(false),cd=Number(data.ConstantCfg.config.DrawAdCd)*60;
     const own=g.ROLE.recruit && g.ROLE.recruit.items.get(1),last=own?Number(own.lastFreeTime)/1000:0;
     if(!Number.isFinite(cd) || cd<=0 || !Number.isFinite(last))throw fail('免费召唤冷却配置尚未同步');
@@ -453,7 +452,6 @@ function createDailyRuntime(g,h) {
       ()=>screen.curPage===PetPageType.Hatch && screen.view.node_page_hatch,'阴契页面尚未加载');
   }
   async function petState(ids) {
-    await petPage();
     const {data}=config(),{petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
     const {roleHelper}=await g.System.import('chunks:///_virtual/role-helper.ts');
     if(!Array.isArray(ids) || ids.some(id=>!Number.isInteger(id) || data.ItemCfg.getById(id)?.type!==data.ItemType.PET_ITEM))throw fail('阴契种类无效','rejected');
@@ -471,7 +469,7 @@ function createDailyRuntime(g,h) {
     const canQueue=queueUnlocked && !petHelper.checkPetHatchFull() && !petHelper.checkPetHatchQueueFull();
     return {item_id:eggs[0]?.id || null,free_slot:freeSlot,can_place:freeSlot>0 || canQueue,
       queue_count:queueCount,queue_capacity:queueCapacity,claim_slot:claim,
-      remaining_seconds:petHelper.getMinSecondsUntilPetHatchFinish() || 60};
+      remaining_seconds:petHelper.getMinSecondsUntilPetHatchFinish()};
   }
   async function petStart(id) {
     const status=await petState([id]);
@@ -486,30 +484,39 @@ function createDailyRuntime(g,h) {
       (status.free_slot>0 || g.ROLE.pet.bornList.length===status.queue_count+1));
     return {confirmed:true};
   }
+  async function closeNewPets(cfg) {
+    for(let count=0;h.ui().findOpen(cfg.UINewPet);count++) {
+      if(count>=100)throw fail('鬼仆展示次数异常','uncertain');
+      const screen=h.ui().findOpen(cfg.UINewPet);
+      const before=screen.curInfoIndex;
+      // A single presentation may contain several pets. Each tap advances its
+      // index; retry only a missed tap, never the already-confirmed claim.
+      await retryUI(()=>h.click(h.closeControl(screen,'closeSelf')),
+        ()=>!h.ui().findOpen(cfg.UINewPet) ||
+          h.ui().findOpen(cfg.UINewPet)!==screen || screen.curInfoIndex!==before,
+        '鬼仆展示尚未推进或关闭');
+    }
+    await h.wait(()=>!h.ui().find(cfg.UINewPet),'鬼仆结果尚未关闭');
+  }
   async function petClaim(slot) {
     const page=await petPage(),{defs,cfg}=config(),{petHelper}=await g.System.import('chunks:///_virtual/pet-helper.ts');
     if(!Number.isInteger(slot) || slot<1 || slot>4 || petHelper.checkPetHatchCompleteListSlotExist(slot)[0]<=0)throw fail('该解封槽尚未完成','rejected');
     const Type=await h.uiClass('hatch-slot-item.ts','HatchSlotItem'),item=page.node.getComponentsInChildren(Type).find(x=>x.index===slot);
     if(!item || item.inClaim)throw fail('解封槽正在领取','rejected');
     const completed=()=>[1,2,3,4].reduce((sum,index)=>sum+petHelper.checkPetHatchCompleteListSlotExist(index)[0],0);
-    // Native one-click claim is visible only for multiple completed contracts.
-    if(completed()>1 && page.unlockReceiveAll && page.btn_recive_all?.node?.activeInHierarchy!==false){
-      const result=await h.observe([defs.PetService.getBornPetAll],()=>h.click(page.btn_recive_all,{waitCompletion:false}),()=>completed()===0);
-      await h.wait(()=>page.node.getComponentsInChildren(Type).every(x=>!x.inClaim),'一键解封动画尚未收尾');
-      if((result.items || []).length){
-        await h.wait(()=>h.ui().findOpen(cfg.UINewPet) || h.ui().findOpen(cfg.Congrats),'解封结果尚未显示');
-        // The native full-screen close control is the blank-area tap; multiple
-        // rare pets may share one result screen and need more than one tap.
-        for(let count=0;h.ui().findOpen(cfg.UINewPet) && count<100;count++)
-          await h.click(h.closeControl(h.ui().findOpen(cfg.UINewPet),'closeSelf'));
-        await h.wait(()=>!h.ui().find(cfg.UINewPet),'鬼仆结果尚未关闭');
-        await h.dismissRewards(true);
-      }
-      return {confirmed:true};
+    const before=completed(),batch=before>1 && page.unlockReceiveAll && page.btn_recive_all?.node?.activeInHierarchy!==false;
+    const resultOpen=()=>h.ui().findOpen(cfg.UINewPet) || h.ui().findOpen(cfg.Congrats);
+    // inClaim is an animation/UI flag, not server state. A stale flag must not
+    // prevent closing results after the server has already confirmed the claim.
+    const result=await h.observe([batch?defs.PetService.getBornPetAll:defs.PetService.getBornPet],
+      ()=>h.click(batch?page.btn_recive_all:item.btn_claim,{waitCompletion:false}),
+      ()=>completed()<before || resultOpen());
+    if(!batch || (result.items || []).length) {
+      await h.wait(resultOpen,'解封结果尚未显示');
+      await closeNewPets(cfg);
+      await h.dismissRewards(!!batch);
     }
-    await h.observe([defs.PetService.getBornPet],()=>h.click(item.btn_claim),()=>!item.inClaim);
-    await closeReward(cfg.UINewPet,'closeSelf');
-    await h.dismissRewards();
+    await h.wait(()=>completed()<before,'解封领取后数量尚未同步，禁止重复领取');
     return {confirmed:true};
   }
   async function fodderPets() {

@@ -72,8 +72,10 @@ class FakeSession:
 class FakeDevice:
     def __init__(self, payloads):
         self.session = FakeSession(payloads)
+        self.attaches=[]
 
     def attach(self, pid):
+        self.attaches.append(pid)
         self.pid = pid
         return self.session
 
@@ -214,10 +216,11 @@ def test_start_frida_sync_falls_back_to_autodetect(tmp_path, monkeypatch):
         lambda self: ([1234], 25799),
     )
     monkeypatch.setattr(
-        offset_autodetect, "detect_offsets_sync", lambda pid, timeout=180.0, frida=None: detected()
+        offset_autodetect, "detect_offsets_sync", lambda pid, timeout=180.0, frida=None, session=None: detected()
     )
 
     instance = StubEngine.__new__(StubEngine)
+    instance.options=type("Options",(),{"channel":"wechat"})()
     instance.__init__()
     session, script = engine.DebugEngine._start_frida_sync(instance)
 
@@ -230,9 +233,17 @@ def test_start_frida_sync_falls_back_to_autodetect(tmp_path, monkeypatch):
         ("offset_detect", False),
         ("message", ""),
     ]
+    assert fake_frida.device.attaches==[1234]
     assert session is fake_frida.device.session
     assert script is fake_frida.device.session.script
     assert "@@CONFIG@@" not in fake_frida.device.session.content
+    instance.frida_session=session;instance.frida_script=script
+    script.handler()  # destroyed: the surviving listener is no longer usable
+    assert statuses[-1]==('frida',False)
+    statuses.clear();instance.frida_session=object()
+    script.handler()
+    assert statuses==[]  # a late old-session event cannot invalidate a new one
+
 
 
 def test_start_frida_sync_reports_autodetect_failure(tmp_path, monkeypatch):
@@ -246,10 +257,11 @@ def test_start_frida_sync_reports_autodetect_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(
         offset_autodetect,
         "detect_offsets_sync",
-        lambda pid, timeout=180.0, frida=None: (_ for _ in ()).throw(RuntimeError("flue.dll is not loaded")),
+        lambda pid, timeout=180.0, frida=None, session=None: (_ for _ in ()).throw(RuntimeError("flue.dll is not loaded")),
     )
 
     instance = engine.DebugEngine.__new__(engine.DebugEngine)
+    instance.options=type("Options",(),{"channel":"wechat"})()
     instance.logger = type("L", (), {"info": staticmethod(lambda *a: None),
                                      "error": staticmethod(lambda *a: None)})()
     instance._status_callbacks = []
@@ -325,3 +337,12 @@ def test_worker_status_message_hint_wins():
 
     worker_module.AsyncDevtoolsWorker.handle_bridge_status(stub, {"message": "", "frida": True})
     assert stub.state["message"] == stub.running_message()
+
+
+def test_autodetect_reuses_caller_session_without_detaching_it(monkeypatch):
+    engine, module=modules()
+    fake=FakeFrida([{'type':module.RESULT_MESSAGE,'config':detected()}])
+    session=fake.device.session
+    monkeypatch.setattr(fake.device,'attach',lambda pid:(_ for _ in ()).throw(AssertionError('no second attach')))
+    result=module.detect_offsets_sync(1234,timeout=5,frida=fake,session=session)
+    assert result==detected() and session.script.unloaded and not session.detached

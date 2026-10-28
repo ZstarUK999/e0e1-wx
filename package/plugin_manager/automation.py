@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
@@ -38,6 +39,8 @@ class AutomationScheduler:
         self.run_id = ""
         self.stopping = False
         self.operation = None
+        self._config_source = None
+        self._parsed_config = None
         self._handlers = {}
         self._task_due = {}
         self._active_task = None
@@ -137,9 +140,16 @@ class AutomationScheduler:
 
     # ── 选择 ──
 
+    def daily_config(self):
+        raw=self.view.store.snapshot()['daily']
+        if raw!=self._config_source:
+            self._parsed_config=parse_config(raw)
+            self._config_source=raw
+        return self._parsed_config
+
     def next_check(self, now: datetime) -> dict | None:
         """下一次调度检查：包含单项延迟和每日时间窗，不承诺届时一定有可执行目标。"""
-        parsed = parse_config(self.view.store.snapshot()['daily'])
+        parsed = self.daily_config()
         clock = time.monotonic()
         candidates = []
         for key, task in parsed.tasks.items():
@@ -163,7 +173,7 @@ class AutomationScheduler:
 
     def pick(self, now: datetime) -> str | None:
         """按优先级挑一个到期任务；时间窗任务还要落在窗口内。"""
-        parsed = parse_config(self.view.store.snapshot()['daily'])
+        parsed = self.daily_config()
         candidates = []
         for key, task in parsed.tasks.items():
             if not task.enabled or key not in self._handlers or time.monotonic() < self._task_due.get(key, 0):
@@ -182,7 +192,7 @@ class AutomationScheduler:
         if self.state.closing or not self.state.installed or self.state.blocked or (self.operation and not self.operation.done()):
             return
         self.state.stop_operation = False
-        ctx_task = parse_config(self.view.store.snapshot()['daily']).tasks[task_id]
+        ctx_task = copy.deepcopy(self.daily_config().tasks[task_id])
         end = None
         if ctx_task.schedule.kind == 'daily_window':
             end = datetime.combine(datetime.now(BEIJING).date(), ctx_task.schedule.end, BEIJING)

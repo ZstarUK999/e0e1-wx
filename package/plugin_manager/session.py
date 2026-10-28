@@ -92,7 +92,7 @@ class GameSession:
         只有一直拿不到 CDP 时才重发一次会话请求。
         """
         state = self.engine_state
-        if (state.get('cdp_port') or state.get('transport_ready')) and state.get('miniapp'):
+        if state.get('frida') or (state.get('cdp_port') or state.get('transport_ready')) and state.get('miniapp'):
             self._debug_retries = 0
             return
         if not self._started:
@@ -109,7 +109,11 @@ class GameSession:
         self.service.start_debug(self.record)
 
     async def prepare_reopen(self, timeout=20):
-        """Re-arm hooks before opening a new game, then leave them intact during startup."""
+        """Reuse live hooks before opening a new game; install only when hooks are unavailable."""
+        if self.state.closing:raise RuntimeError('插件正在退出，已取消打开游戏')
+        if self.engine_state.get('frida'):
+            LOG.info('微信调试监听仍就绪，复用现有挂载，不停止旧会话')
+            return
         ready=asyncio.Event()
         reset_seen=False
         failure=None

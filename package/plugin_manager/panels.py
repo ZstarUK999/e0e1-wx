@@ -8,7 +8,7 @@ from datetime import datetime
 
 LOG = logging.getLogger('plugin_manager.configuration')
 
-from PySide6.QtCore import QSignalBlocker, QTime, Qt, Signal, QTimer
+from PySide6.QtCore import QSignalBlocker, QTime, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTimeEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
@@ -162,7 +162,7 @@ class TaskPanel(QGroupBox):
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if id in params.get('item_ids', []) else Qt.CheckState.Unchecked)
             self._field('params.item_ids', '自动解封种类（可多选）', choices)
-            note = QLabel('按实际品质从高到低解封；同品质按道具排序。先一键领取已完成阴契、点击空白关闭结果，再填满可用解封槽和已解锁的等待队列。不购买槽位或使用黄金加速。')
+            note = QLabel('按实际品质从高到低解封；同品质按道具排序。先一键领取已完成阴契、点击空白关闭结果，再填满可用解封槽和已解锁的等待队列。不购买槽位或使用黄金加速。阴契不足时每30分钟后台复查；正在解封的按完成时间领取，等待期间不打开页面。')
             note.setWordWrap(True)
             layout.addWidget(note)
         elif task_id == 'pet_fodder':
@@ -318,22 +318,12 @@ class GlobalPanel(QWidget):
         self.reconnect_seconds.setSuffix(' 秒')
         self.form.addRow('微信顶号重连', self.wechat_reconnect)
         self.form.addRow('顶号后等待时间', self.reconnect_seconds)
-        self.sidebar_calibrate=QPushButton('旧入口坐标校准（图像模式无需校准）')
-        self.sidebar_calibrate.setObjectName('ui.wechat_sidebar.calibrate')
-        self.sidebar_status=QLabel('');self.sidebar_status.setWordWrap(True)
-        self.sidebar_timer=QTimer(self);self.sidebar_timer.setSingleShot(True)
-        self.sidebar_timer.timeout.connect(self._capture_wechat_sidebar)
-        self.sidebar_calibrate.clicked.connect(self._begin_wechat_sidebar)
-        self.form.addRow('微信侧栏入口',self.sidebar_calibrate)
-        self.form.addRow('',self.sidebar_status)
-        self.sidebar_status.setText('当前使用图片识别入口，自动确认绿色选中状态')
         self.wechat_reconnect.setChecked(store.snapshot()['ui']['wechat_reconnect'])
         self.reconnect_seconds.setValue(store.snapshot()['ui']['reconnect_seconds'])
         self.wechat_reconnect.toggled.connect(lambda enabled: store.set_wechat_reconnect(enabled, self.reconnect_seconds.value()))
         note = QLabel("每一步 UI 操作之间等待的时间，方便观察执行过程；只影响节奏，不改变任何安全检查。\n"
-                      "首次需要手动打开游戏；微信顶号后按倒计时重开。游戏客户区纯白／纯黑持续15秒自动重开，连接正常时仅检测前台游戏窗口。"
-                      "重开通过图片确认微信入口和“小程序”页的绿色选中状态，再点击《遗弃之地》。请保持微信已登录，相关入口可见即可。")
-        note.setWordWrap(True)
+                      "微信未打开游戏时自动从最近使用入口启动；顶号后按倒计时重开。游戏客户区纯白／纯黑持续15秒自动重开，连接正常时仅检测前台游戏窗口。"
+                      "启动与重开优先复用已验证的入口位置，失效时重新定位并保存。请保持微信已登录，相关入口可见即可。")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.save_button = QPushButton("保存全局设置")
@@ -344,22 +334,6 @@ class GlobalPanel(QWidget):
         layout.addWidget(self.message)
         layout.addStretch()
         store.changed.connect(lambda state: self.sync(state))
-
-    def _begin_wechat_sidebar(self):
-        self.sidebar_calibrate.setEnabled(False)
-        self.sidebar_status.setText('3秒后记录：请将鼠标移到微信侧栏“小程序”图标上，无需点击')
-        self.sidebar_timer.start(3000)
-
-    def _capture_wechat_sidebar(self):
-        try:
-            from .wechat_launch import capture_wechat_sidebar
-            value=capture_wechat_sidebar()
-            self.store.set_wechat_sidebar(value)
-            self.sidebar_status.setText(f"已校准（微信窗口 {value['width']}×{value['height']}）；改变窗口尺寸后请重新校准")
-        except Exception as exc:
-            self.sidebar_status.setText('校准失败：'+str(exc))
-        finally:
-            self.sidebar_calibrate.setEnabled(True)
 
     def sync(self, state):
         set_checked(self.game_overlays,state["ui"]["game_overlays"])

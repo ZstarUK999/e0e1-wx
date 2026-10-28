@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .energy import EnergyTask, _finite_number
+from .energy import _finite_number
 from .scheduler import ExecutionUncertain, RetryableTaskError, TaskContext, TaskResult
 
 
-class OfflineRewardTask(EnergyTask):
+class OfflineRewardTask:
     def __init__(self, game, journal_path: Path | None = None) -> None:
-        super().__init__(game, journal_path)
+        self.game = game
+        self.journal_path = Path(journal_path) if journal_path is not None else None
         self.uncertain = ""
 
     async def __call__(self, ctx: TaskContext) -> TaskResult:
@@ -20,8 +21,7 @@ class OfflineRewardTask(EnergyTask):
     async def run(self, ctx: TaskContext, *, force_trigger: bool = False) -> TaskResult:
         if self.uncertain:
             raise ExecutionUncertain(self.uncertain)
-        if self.pending_original is not None or (self.journal_path is not None and
-                (self.journal_path.exists() or self.journal_path.is_symlink())):
+        if self.journal_path is not None and (self.journal_path.exists() or self.journal_path.is_symlink()):
             raise ExecutionUncertain("存在未确认的领取记录，先核对当前会话，不自动重试")
         info = await self.game.reward_info()
         elapsed = _finite_number(info["elapsed"], "挂机累计时间")
@@ -48,7 +48,7 @@ class OfflineRewardTask(EnergyTask):
             if ctx.stop_requested():
                 return TaskResult("waiting", "已请求停止")
             try:
-                return await self.perform(ctx, 0)
+                return await self._claim(ctx)
             except RetryableTaskError as exc:
                 return TaskResult("waiting", str(exc), ctx.task.retry_seconds)
 
@@ -56,12 +56,12 @@ class OfflineRewardTask(EnergyTask):
         """领取结果未知时留下记录：重启也不重复领取。"""
         self.uncertain = reason
         if self.journal_path is not None and not (self.journal_path.exists() or self.journal_path.is_symlink()):
-            record = {"reason": reason, "selection": await self.game.capture()}
+            record = {"reason": reason}
             with open(self.journal_path, "w", encoding="utf-8") as file:
                 json.dump(record, file, ensure_ascii=False)
         return ExecutionUncertain(reason)
 
-    async def perform(self, ctx: TaskContext, best_score: float) -> TaskResult:
+    async def _claim(self, ctx: TaskContext) -> TaskResult:
         if ctx.stop_requested():
             return TaskResult("waiting", "已请求停止")
         try:

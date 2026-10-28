@@ -183,7 +183,6 @@ def test_due_or_force_claims_once_without_touching_plans(elapsed, minimum, force
         names = [name for name, _ in game.calls]
         assert names == ["reward_info", "transaction", "home", "claim_reward"]
         assert game.snapshot() == game.original
-        assert handler.pending_original is None
     asyncio.run(run())
 
 
@@ -225,7 +224,6 @@ def test_missing_positive_claim_receipt_preserves_original_and_blocks_repeat(rep
         handler = reward_module().OfflineRewardTask(game)
         with pytest.raises(ExecutionUncertain):
             await handler(context())
-        assert handler.pending_original is None
         assert handler.uncertain
         assert sum(name == "claim_reward" for name, _ in game.calls) == 1
         assert not any(name == "restore" for name, _ in game.calls)
@@ -245,7 +243,8 @@ def test_unknown_claim_preserves_journal_and_blocks_new_instance(tmp_path, failu
         handler = reward_module().OfflineRewardTask(game, path)
         with pytest.raises(ExecutionUncertain):
             await handler(context())
-        assert json.loads(path.read_text(encoding="utf-8"))["selection"] == game.original
+        assert json.loads(path.read_text(encoding="utf-8"))["reason"]
+        assert not any(name == "capture" for name, _ in game.calls)
         assert sum(name == "claim_reward" for name, _ in game.calls) == 1
         assert not any(name == "restore" for name, _ in game.calls)
         old_calls = copy.deepcopy(game.calls)
@@ -264,7 +263,6 @@ def test_confirmed_rejection_waits_without_changing_anything():
         assert result.status == "waiting"
         assert "拒绝" in result.message
         assert game.snapshot() == game.original
-        assert handler.pending_original is None
         assert not handler.uncertain
     asyncio.run(run())
 
@@ -303,7 +301,6 @@ def test_stop_after_home_never_claims():
         assert result.status == "waiting"
         assert not any(name == "claim_reward" for name, _ in game.calls)
         assert game.snapshot() == game.original
-        assert handler.pending_original is None
     asyncio.run(run())
 
 
@@ -325,5 +322,4 @@ def test_cancel_during_claim_leaves_no_repeat_and_no_journal(tmp_path):
             await job
         assert game.snapshot() == game.original
         assert not (tmp_path / "restore.json").exists()
-        assert handler.pending_original is None
     asyncio.run(run())

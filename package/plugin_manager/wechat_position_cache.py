@@ -26,7 +26,7 @@ def save(kind,value):
     if kind=='native':
         required={'pid','processCreatedAt','hwnd','origin','clientSize','controls'}
         if not required.issubset(value) or not value['controls']:return
-        value={k:value[k] for k in required | {'version','scaleX','scaleY'} if k in value}
+        value={k:value[k] for k in required | {'version','scaleX','scaleY','layout'} if k in value}
         value['controls']=[{k:c[k] for k in ('label','type','screenCenter','localRect') if k in c}
                            for c in value['controls']]
     elif kind=='entry':

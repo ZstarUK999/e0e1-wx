@@ -82,7 +82,7 @@ def default_config() -> dict:
     daily = {"version": 1, "enabled": False, "timezone": "Asia/Shanghai", "poll_seconds": 1,
              "summary_interval_seconds": 3600, "tasks": tasks}
     return {"version": 1, "daily": daily, "player": {"enabled": False},
-            "ui": {**POLLING_DEFAULTS, "delay_ms": 500, "game_overlays": True, "wechat_reconnect": False, "reconnect_seconds": 300, "wechat_sidebar": None, "legion_scan_auto_start": False},
+            "ui": {**POLLING_DEFAULTS, "delay_ms": 500, "game_overlays": True, "wechat_reconnect": False, "reconnect_seconds": 300, "legion_scan_auto_start": False},
             "treasure": {"enabled": False, "auto_dump": False, "overlay": False, "refresh_seconds": 30},
             "damage": {"enabled": False, "auto_csv": True},
             # 三尸自动合成：kind 1贪 2嗔 3痴；expected_rate 是报告里理论曲线的默认成功率（百分数）。
@@ -186,16 +186,7 @@ def validate_config(raw: dict) -> dict:
         raise ValueError('区段扫描自动启动须为布尔开关')
     ui.setdefault('wechat_reconnect', False)
     ui.setdefault('reconnect_seconds', 300)
-    ui.setdefault('wechat_sidebar', None)
-    sidebar=ui['wechat_sidebar']
-    if sidebar is not None:
-        if not isinstance(sidebar,dict) or set(sidebar)!={'x','y','width','height','window_class'}:
-            raise ValueError('微信侧栏校准数据无效')
-        if any(type(sidebar[k]) is not int for k in ('x','y','width','height')) or not (
-            0<=sidebar['x']<sidebar['width']<=20000 and 0<=sidebar['y']<sidebar['height']<=20000):
-            raise ValueError('微信侧栏校准位置超出窗口')
-        if not isinstance(sidebar['window_class'],str) or not 1<=len(sidebar['window_class'])<=120:
-            raise ValueError('微信侧栏校准窗口类型无效')
+    ui.pop('wechat_sidebar',None)  # Discard obsolete calibration in older saved settings.
     if type(ui['wechat_reconnect']) is not bool or type(ui['reconnect_seconds']) is not int or not 1 <= ui['reconnect_seconds'] <= 86400:
         raise ValueError('微信顶号重连须为布尔开关，等待时间须为1至86400秒整数')
     # Existing configurations enter the no-custom-overlay diagnostic mode on first upgrade.
@@ -381,11 +372,6 @@ class PluginConfigStore(QObject):
     def set_ui_delay(self, delay_ms: int) -> None:
         raw = self.snapshot()
         raw["ui"]["delay_ms"] = delay_ms
-        self._commit(raw)
-
-    def set_wechat_sidebar(self, value):
-        raw=self.snapshot()
-        raw['ui']['wechat_sidebar']=value
         self._commit(raw)
 
     def set_wechat_reconnect(self, enabled: bool, seconds: int) -> None:

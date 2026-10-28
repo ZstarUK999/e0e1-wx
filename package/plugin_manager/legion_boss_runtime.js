@@ -32,6 +32,7 @@ async function readLegionCrossBoss(g) {
     if(theater && theater.myBfId && theater.myBfId!==initialBfId && theater.myBfId!==bfId)
       throw Error('查询期间战场发生变化，请重新刷新');
   };
+  const notes=[];
   const packRank=row=>{
     const id=row && (row.roleId || row.info && row.info.id);
     if(!Number.isSafeInteger(Number(id)) || Number(id)<=0)throw Error('排名接口缺少有效玩家ID');
@@ -45,9 +46,16 @@ async function readLegionCrossBoss(g) {
   for(let start=1;start<=500;){
     check();
     const end=Math.min(start+99,500),requested=end-start+1;
-    const reply=await BattlefieldService.getBattlefieldRoleBossDmgRank({bfId,start,end});
-    check();
-    const data=readReply(reply,'读取跨服战场 Boss 排名失败（战场 '+bfId+'）');
+    let data;
+    try {
+      const reply=await BattlefieldService.getBattlefieldRoleBossDmgRank({bfId,start,end});
+      check();
+      data=readReply(reply,'读取跨服战场 Boss 排名失败（战场 '+bfId+'）');
+    } catch(error) {
+      check(); // Account/battlefield changes still invalidate the entire snapshot.
+      notes.push(String(error.message||error)+'；继续读取成员战报与贡献');
+      stop='unavailable';break;
+    }
     if(!data || !Array.isArray(data.rankList))throw Error('跨服战场 Boss 排名返回结构异常');
     if(data.me)me=packRank({...data.me,roleId});
     if(!data.rankList.length){stop='end';break;}
@@ -81,7 +89,6 @@ async function readLegionCrossBoss(g) {
   const selfDamage=own && String(own.id)===roleId && Number.isFinite(own.bossDmgMax)?own.bossDmgMax:
     Number.isFinite(fieldInfo.bossDmgMax)?fieldInfo.bossDmgMax:null;
   const cfg=await chunk('configs.ts');
-  const notes=[];
   async function readOptional(name,params){
     if(typeof BattlefieldService[name]!=='function'){notes.push('当前版本没有接口：'+name);return null;}
     try{
@@ -111,7 +118,7 @@ async function readLegionCrossBoss(g) {
       const monster=cfg.TheaterMonsterCfg.getById(r.monsterId);
       logs.push({roleId:String(r.roleId),monsterId:r.monsterId,roundId:r.roundId,
         targetRoleId:String(r.targetRoleId||0),targetLegionId:String(r.targetLegionId||0),
-        isWin:r.isWin,wave:r.wave,point:r.point,timeAt:r.timeAt,
+        isWin:typeof r.isWin==='boolean'?r.isWin:null,wave:r.wave,point:r.point,timeAt:r.timeAt,
         kind:monster?monster.type===cfg.TheaterMonsterType.EIGHT?'player':
           monster.type===cfg.TheaterMonsterType.NINE?'boss':'monster':'unknown'});
     }
@@ -119,6 +126,8 @@ async function readLegionCrossBoss(g) {
     if(page.logList.length<100){notes.push('日志提前结束，结果未标为完整');break;}
   }
   if(!logComplete)notes.push('日志统计仅覆盖已读取记录，不能把缺失记录视为零次');
+  const logResultsComplete=logs.every(r=>typeof r.isWin==='boolean' && Number.isSafeInteger(Number(r.roleId)) && Number(r.roleId)>0);
+  if(!logResultsComplete)notes.push('部分战报缺少有效玩家ID或胜负，战败次数仅为已确认记录下限');
   const currentField=theater && typeof theater.getBattleField==='function'?theater.getBattleField(bfId):null;
   const memberBoss={};
   if(currentField && currentField.roles && typeof currentField.roles.forEach==='function')
@@ -129,20 +138,20 @@ async function readLegionCrossBoss(g) {
   // isBossStage is a native calendar/config check and works before scene entry.
   const bossOngoing=!!(typeof theater.isBossStage==='function' && theater.isBossStage());
   let bossRewardRules=[];
-  if(bossOngoing){
+  if(cfg.TheaterCfg && cfg.FinalDayCfg && cfg.RankRewardCfg){
     const theaterCfg=cfg.TheaterCfg.getById(currentField && currentField.level || info.bfLevel);
     const boss=theaterCfg && cfg.TheaterMonsterCfg.list.find(r=>r.group===theaterCfg.monster &&
       r.type===cfg.TheaterMonsterType.NINE);
     const final=boss && cfg.FinalDayCfg.getById(boss.stageId);
     if(final)bossRewardRules=cfg.RankRewardCfg.list.filter(r=>r.group===final.rankReward).map(r=>({
       from:r.num[0],to:r.num[1],points:r.reward.filter(x=>x.item===10035).reduce((n,x)=>n+x.num,0)}));
-    else notes.push('未找到当前战场Boss排名积分配置，预估贡献留空');
+    else if(bossOngoing || ranks.length)notes.push('未找到当前战场Boss排名积分配置，预估贡献留空');
   }
   const unknownLogs=logs.filter(r=>r.kind==='unknown').length;
-  if(unknownLogs)notes.push(unknownLogs+'条日志的怪物类型配置缺失，未纳入进攻折算');
+  if(unknownLogs)notes.push(unknownLogs+'条日志的怪物类型配置缺失，未纳入击败怪群／玩家次数');
   check();
   return {roleId,legionId,legionName:String(info.name || ''),bfId,source:'legion-theater',
     bossName:'跨服战场 Boss',members,ranks,me,selfDamage,
-    rankLimit:500,stop,contributions,logs,logTotal,logComplete,memberBoss,bossOngoing,
+    rankLimit:500,stop,contributions,logs,logTotal,logComplete,logResultsComplete,memberBoss,bossOngoing,
     bossRewardRules,notes,fetchedAt:new Date().toISOString()};
 }

@@ -153,7 +153,7 @@ class LegionFeature:
             self.panel.boss.message.setText('阴司查询正在进行，请稍后刷新');return
         self.job=asyncio.create_task(self.fetch_boss())
     async def fetch_boss(self):
-        panel=self.panel.boss;panel.refresh.setEnabled(False);panel.message.setText('正在拉取贡献排名、完整战场日志、Boss伤害及本阴司成员…');session=self.state.installed
+        panel=self.panel.boss;panel.refresh.setEnabled(False);panel.message.setText('正在拉取本阴司成员战报、战败次数、贡献排名及Boss伤害…');session=self.state.installed
         try:
             await self.scanner.wait_operation()
             if self.state.closing or session!=self.state.installed:return
@@ -162,6 +162,8 @@ class LegionFeature:
             if not data:raise RuntimeError('未返回跨服 Boss 数据')
             panel.accept(data)
             LOG.info('跨服 Boss 参与情况查询完成：阴司=%s，成员=%s，排名=%s',data['legionId'],len(data['members']),len(data['ranks']))
+            LOG.info('跨服战场成员战报：已读取%s/%s条，分页完整=%s，胜负完整=%s',
+                     len(data.get('logs',[])),data.get('logTotal'),data.get('logComplete'),data.get('logResultsComplete'))
         except Exception as exc:
             panel.message.setText(f'查询失败：{exc}；已有结果为上次查询快照')
             LOG.warning('跨服战场 Boss 参与情况查询失败：%s',exc)

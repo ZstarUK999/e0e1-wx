@@ -8,7 +8,7 @@ function fixture(options={}){
   const data={ItemType:{PET_ITEM:18},ItemCfg:{getById:id=>table.find(x=>x.id===id)},PetIncubateCfg:{getById:id=>id>0?{time:30}:null},UnlockCfg:{getById:()=>({condition:'queue'})},ConstantCfg:{config:{DrawAdCd:480,PetIncubateSlotBornListNum:options.queuePerSlot??2}}};
   const defs={RoleService:{recruit:()=>{}},PetService:{bornPet:()=>{},getBornPet:()=>{},getBornPetAll:()=>{}}};
   const button=(name,run)=>({name,run});
-  const reward=(which)=>{let attempts=0;const s={isFinish:true,view:{btn_close:button('close',()=>{if(++attempts<=(options.ignoredCloses||0))return;windows.delete(which);if(which===cfg.UINewPet && options.rareBatch)reward(cfg.Congrats);})}};windows.set(which,s);};
+  const reward=(which)=>{let attempts=0;const s={isFinish:true,curInfoIndex:0,view:{btn_close:button('close',()=>{if(++attempts<=(options.ignoredCloses||0))return;if(which===cfg.UINewPet && s.curInfoIndex<(options.petPresentations||1)-1){s.curInfoIndex++;return;}windows.delete(which);if(which===cfg.UINewPet && options.rareBatch)reward(cfg.Congrats);})}};windows.set(which,s);};
   const draw={drawTypeInfos:[{cfgId:2,eType:2},{cfgId:1,eType:1}],curSelectPage:0,inDrawing:false,view:{node_pages:[0,1].map(i=>({getComponent:()=>button('tab',()=>draw.curSelectPage=i)}))}};
   draw.view.button_drawOnce=button('paid',()=>{throw Error('paid summon forbidden');});
   draw.view.button_drawAd=button('free',()=>{ROLE.recruit.items.get(1).lastFreeTime=now;if(!options.specialBooks){reward(cfg.DrawReward);return;}
@@ -21,9 +21,9 @@ function fixture(options={}){
       else{windows.delete(cfg.DrawSpecialBook);reward(cfg.DrawReward);}
     });windows.set(cfg.DrawSpecialBook,special);
   });
-  const slots=[1,2,3,4].map(index=>({index,inClaim:false,btn_claim:button('claim',()=>{complete=0;reward(cfg.UINewPet);})}));
+  const slots=[1,2,3,4].map(index=>({index,inClaim:false,btn_claim:button('claim',()=>{slots[index-1].inClaim=!!options.stickyClaim;complete=0;reward(cfg.UINewPet);})}));
   const page={curEggs:table.map(x=>x.id),node:{getComponentsInChildren:()=>slots},unlockReceiveAll:true,
-    btn_recive_all:button('claim-all',()=>{complete=0;reward(options.rareBatch?cfg.UINewPet:cfg.Congrats);})};
+    btn_recive_all:button('claim-all',()=>{for(const item of slots)item.inClaim=!!options.stickyClaim;complete=options.remainingCompleted?2:0;completedCount=options.remainingCompleted||1;reward(options.rareBatch?cfg.UINewPet:cfg.Congrats);})};
   page.list_eggs={};
   const pet={curPage:0,view:{node_page_hatch:page,node_pageList:[0,1,2,3].map(i=>({getComponent:()=>button('pet-tab',()=>pet.curPage=i)}))}};
   const queueCapacity=(options.unlockedSlots??4)*(options.queuePerSlot??2);
@@ -124,4 +124,40 @@ for(const count of [1,3])test('free summon handles '+count+' special book presen
   assert.equal(f.calls.filter(x=>x==='special-close').length,count+1);
   assert.equal(f.calls.filter(x=>x==='close').length,1);
   assert(f.calls.lastIndexOf('special-close')<f.calls.indexOf('close'));
+});
+
+
+test('pet status is passive and never opens the hatch tab',async()=>{
+  const f=fixture();
+  await f.api.dispatch('pet_hatch_state',{item_ids:[400001]});
+  assert.deepEqual(f.calls,[]);
+});
+
+
+for(const batch of [false,true])test('confirmed '+(batch?'batch':'single')+' claim closes all pets even with stale inClaim flags',async()=>{
+  const f=fixture({stickyClaim:true,rareBatch:batch,petPresentations:3,ignoredCloses:1});
+  f.completed(1,batch?3:1);
+  const result=await f.api.dispatch('pet_hatch_claim',{slot:1});
+  assert(result.confirmed);
+  assert.equal(f.calls.filter(x=>x===(batch?'claim-all':'claim')).length,1);
+  assert.equal(f.calls.filter(x=>x==='close').length,4);
+  assert(f.calls.indexOf('close')<f.calls.indexOf('blank-dismiss'));
+  const state=await f.api.dispatch('pet_hatch_state',{item_ids:[400001]});
+  assert.equal(state.claim_slot,0);
+});
+
+
+test('batch claim can finish when another slot completes during receipt processing',async()=>{
+  const f=fixture({rareBatch:true,remainingCompleted:1});f.completed(1,3);
+  const result=await f.api.dispatch('pet_hatch_claim',{slot:1});
+  assert(result.confirmed);
+  assert.equal(f.calls.filter(x=>x==='claim-all').length,1);
+  assert(f.calls.includes('close') && f.calls.includes('blank-dismiss'));
+});
+
+
+test('free summon status reads cooldown without opening any page',async()=>{
+  const f=fixture();
+  await f.api.dispatch('free_summon_state',{});
+  assert.deepEqual(f.calls,[]);
 });

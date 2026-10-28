@@ -175,6 +175,7 @@ class PluginRuntime(QObject):
 
     def start(self):
         self._startup_checked = False
+        self._next_startup_retry = 0.0
         self.timer.start()
         self._schedule_poll()
 
@@ -241,7 +242,7 @@ class PluginRuntime(QObject):
         from .wechat_launch import prepare_wechat_game, reopen_wechat_game
         self._observe_restart_tasks()
         self.restart_resume.arm()
-        await prepare_wechat_game()
+        prepared=await prepare_wechat_game()
         self.state.stop_operation = True
         reason = self.blank_recovery.reason
         self.state.blocked = '正在重启游戏：' + reason
@@ -250,7 +251,7 @@ class PluginRuntime(QObject):
             self.automation.set_automation(False)
         self.desire.request('stop')
         self.window.action_label.setText(reason + '，正在重新打开游戏')
-        await reopen_wechat_game(before_open=self.session.prepare_reopen)
+        await reopen_wechat_game(before_open=self.session.prepare_reopen,prepared=prepared)
         self._mark_reopened()
 
     def _observe_restart_tasks(self):
@@ -403,8 +404,7 @@ class PluginRuntime(QObject):
                    'phase': 'running' if active else 'waiting',
                    'status': '等待当前操作安全收尾' if self.state.stop_operation else '等待下一项定时任务'}
         if active:
-            from package.daily_tasks.config import parse_config
-            payload['task'] = parse_config(self.window.store.snapshot()['daily']).tasks[active].name
+            payload['task'] = self.automation.daily_config().tasks[active].name
         elif self.automation.running and not self.state.blocked:
             upcoming = self.automation.next_check(datetime.now(BEIJING))
             payload['next_task'] = upcoming['name'] if upcoming else ''
@@ -461,6 +461,28 @@ class PluginRuntime(QObject):
         self._publish_zhongkui(status if isinstance(status,dict) else None)
         self._publish_battle_assist_timing(rows if isinstance(rows,list) else [])
 
+    async def _ensure_startup(self):
+        if getattr(self,'_startup_checked',True):return True
+        now=time.monotonic()
+        if now<getattr(self,'_next_startup_retry',0.0):return False
+        self._next_startup_retry=now+20
+        from .startup_launch import ensure_game_started
+        self.window.action_label.setText(f'正在检查{self.platform_name}游戏，未运行时自动打开')
+        if self.platform_name not in ('微信','应用宝'):
+            self.session.request_debug()
+        try:
+            await ensure_game_started(self.platform_name,
+                before_open=self.session.prepare_reopen if self.platform_name in ('微信','应用宝') else None)
+        except Exception as exc:
+            self._next_startup_retry=time.monotonic()+20
+            self.window.action_label.setText('启动未完成，20秒后重试：'+str(exc))
+            LOG.warning('%s游戏启动检查未完成，20秒后自动重试：%s',self.platform_name,exc)
+            return False
+        if self.state.closing:return False
+        self._startup_checked=True
+        self._next_startup_retry=0.0
+        return True
+
     async def poll(self):
         if self.state.closing or self._poll_lock.locked():
             return
@@ -486,16 +508,7 @@ class PluginRuntime(QObject):
                         self.timer.setInterval(self.season.scan_interval_ms)
                     return
                 self._next_full_poll = now + 1.0
-                if not getattr(self, '_startup_checked', True):
-                    self._startup_checked = True
-                    from .startup_launch import ensure_game_started
-                    self.window.action_label.setText(f'正在检查{self.platform_name}游戏，未运行时自动打开')
-                    if self.platform_name not in ('微信', '应用宝'):
-                        self.session.request_debug()
-                    await ensure_game_started(self.platform_name,
-                        before_open=self.session.prepare_reopen if self.platform_name in ('微信', '应用宝') else None)
-                    if self.state.closing:
-                        return
+                if not await self._ensure_startup():return
                 self._observe_restart_tasks()
                 await self._sync_optional_controls()
                 if self.window.store.snapshot()['ui'].get('memory_poll', False):
@@ -877,8 +890,6 @@ class PluginRuntime(QObject):
         self.state.closing = True
         self.state.stop_operation = True
         self.timer.stop()
-        from .wechat_launch import cancel_position_refresh
-        await cancel_position_refresh()
         await self.season_insight.close()
         await self.flag_upgrade.close()
         if self._controls_job and not self._controls_job.done():
@@ -923,7 +934,11 @@ class PluginRuntime(QObject):
             await self.transport.close()
             # 插件操作全部收尾后才停止内部调试worker；不停止微信进程。
         finally:
-            await cancel_position_refresh()
+            from .wechat_ui_worker import close as close_wechat_ui
+            await close_wechat_ui()
+            from .wechat_launch import close_native
+            try:await close_native()
+            except Exception as exc:LOG.warning('微信原生会话收尾失败：%s',exc)
             # 前面的游戏清理失败时也必须回收监听 9421 的 worker。
             self.service.shutdown(wait=True)
             self.state.installed = self.state.configured = None

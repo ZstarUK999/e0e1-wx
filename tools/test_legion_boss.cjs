@@ -27,7 +27,12 @@ function fixture(size=123){
   f=fixture(500);out=await context.readLegionCrossBoss(f.g);assert.equal(out.ranks.length,500);assert.equal(out.stop,'limit');assert.equal(f.calls.length,7);
   f=fixture(0);out=await context.readLegionCrossBoss(f.g);assert.equal(out.ranks.length,0);assert.equal(out.members.length,2);
   f=fixture();f.module.legionId=0;await assert.rejects(()=>context.readLegionCrossBoss(f.g),/未加入/);assert.equal(f.calls.length,0);
-  f=fixture();f.service.getBattlefieldRoleBossDmgRank=async()=>({code:123,error:'活动未开启'});await assert.rejects(()=>context.readLegionCrossBoss(f.g),/战场 bf-current.*活动未开启.*123/);
+  f=fixture();f.service.getBattlefieldRoleBossDmgRank=async()=>({code:123,error:'活动未开启'});
+  f.imports['define-index.ts'].BattlefieldService.getLegionBattleLog=async()=>({code:0,getData:()=>({
+    logList:[{roleId:10,monsterId:1,roundId:1,isWin:false}],totalCount:1})});
+  out=await context.readLegionCrossBoss(f.g);
+  assert.equal(out.stop,'unavailable');assert.equal(out.logs.length,1);assert.equal(out.logs[0].isWin,false);
+  assert(out.notes.some(n=>/战场 bf-current.*活动未开启.*123/.test(n)));
   f=fixture();f.roster.memberNum=3;await assert.rejects(()=>context.readLegionCrossBoss(f.g),/不完整/);
   f=fixture();f.roster.id=43;await assert.rejects(()=>context.readLegionCrossBoss(f.g),/完整成员/);
   f=fixture();const request=f.service.getBattlefieldRoleBossDmgRank;f.service.getBattlefieldRoleBossDmgRank=async p=>{const r=await request(p);f.role.id=20;return r;};
@@ -58,7 +63,20 @@ function fixture(size=123){
     FinalDayCfg:{getById:()=>({rankReward:14})},RankRewardCfg:{list:[{group:14,num:[1,1],reward:[{item:10035,num:15000}]}]}});
   out=await context.readLegionCrossBoss(f.g);assert.equal(out.bossOngoing,true);
   assert.equal(out.bossRewardRules[0].points,15000);assert.equal(out.memberBoss['11'].count,1);
+  f.theater.isBossStage=()=>false;
+  out=await context.readLegionCrossBoss(f.g);assert.equal(out.bossOngoing,false);
+  assert.equal(out.bossRewardRules[0].points,15000,'Sunday estimate remains available after settlement');
   f.imports['define-index.ts'].BattlefieldService.getLegionBattleLog=async p=>({code:0,getData:()=>({logList:all.slice(0,100),totalCount:123})});
   out=await context.readLegionCrossBoss(f.g);assert.equal(out.logComplete,false);assert.equal(out.logs.length,100);
+  f=fixture(0);
+  const battles=[{roleId:10,monsterId:1,roundId:1,isWin:false},
+    {roleId:11,monsterId:8,roundId:3,isWin:true},{roleId:11,monsterId:1,roundId:3}];
+  f.imports['define-index.ts'].BattlefieldService.getLegionBattleLog=async()=>({code:0,getData:()=>({logList:battles,totalCount:3})});
+  out=await context.readLegionCrossBoss(f.g);
+  assert.equal(out.logComplete,true);assert.equal(out.logResultsComplete,false);
+  assert.equal(out.logs[0].isWin,false);assert.equal(out.logs[1].isWin,true);assert.equal(out.logs[2].isWin,null);
+  assert(out.notes.some(n=>n.includes('胜负')));
+  battles[2].isWin=false;
+  out=await context.readLegionCrossBoss(f.g);assert.equal(out.logResultsComplete,true);
   console.log('PASS correct battlefield endpoint, fresh bfId, pagination, cap, empty ranks, own roster, errors, incomplete roster, account/battlefield switch, duplicate pages and unloaded scene');
 })().catch(e=>{console.error(e);process.exitCode=1;});

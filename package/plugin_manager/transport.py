@@ -674,13 +674,13 @@ return {{resident_id:id,capabilities:['lazy-v1']}};
         if not self.connected or self.context_id is None:
             return False
         from .wechat_launch import prepare_wechat_game, reopen_wechat_game
-        await prepare_wechat_game(sidebar=getattr(self,'wechat_sidebar',None))
+        prepared=await prepare_wechat_game()
         source = Path(__file__).with_name('wechat_reconnect.js').read_text(encoding='utf-8')
         accepted = await self._evaluate('(async()=>{' + source + '\nreturn restartWechatAfterKick(globalThis,' + json.dumps(event) + ',"wechat-recent");})()', self.context_id, timeout_ms=2000)
         if accepted is not True:
             return False
         # Native exit destroys CDP; the external launch does not use that connection.
-        await reopen_wechat_game(before_open=getattr(self,'before_wechat_reopen',None),sidebar=getattr(self,'wechat_sidebar',None))
+        await reopen_wechat_game(before_open=getattr(self,'before_wechat_reopen',None),prepared=prepared)
         callback = getattr(self, 'on_wechat_reopened', None)
         if callback is not None:
             callback()

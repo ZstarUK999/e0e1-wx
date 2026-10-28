@@ -1366,3 +1366,21 @@ def test_native_promise_object_error_preserves_error_code_without_getters(caplog
     with caplog.at_level(logging.ERROR,logger='plugin_manager'):asyncio.run(run())
     assert 'launch:fail session unavailable' in caplog.text and '123' in caplog.text
     assert 'secret-never-log' not in caplog.text
+
+
+def test_daily_configuration_parsing_is_reused_until_settings_change(app,tmp_path,monkeypatch):
+    from datetime import datetime
+    from package.daily_tasks.scheduler import BEIJING
+    from package.plugin_manager import automation
+    controller,service,transport,window=make_controller(tmp_path)
+    calls=[];parse=automation.parse_config
+    def counted(raw):calls.append(True);return parse(raw)
+    monkeypatch.setattr(automation,'parse_config',counted)
+    scheduler=controller.automation;now=datetime.now(BEIJING)
+    scheduler.daily_config();scheduler.pick(now);scheduler.next_check(now)
+    assert len(calls)==1
+    window.store.set_task_enabled('energy',True)
+    assert scheduler.daily_config().tasks['energy'].enabled
+    scheduler.pick(now);scheduler.next_check(now)
+    assert len(calls)==2
+    asyncio.run(controller.shutdown());window.close()

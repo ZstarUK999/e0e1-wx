@@ -1,7 +1,8 @@
 ﻿param([ValidateSet('Prepare','WaitClosed','Open','Probe','EntryPrepare','EntryOpen','Navigate','Scan','CachedPrepare','CachedOpen')][string]$Mode='Prepare',
- [int]$SidebarX=-1,[int]$SidebarY=-1,[int]$SidebarWidth=0,[int]$SidebarHeight=0,[string]$SidebarWindowClass='', [string]$EntryCachePath='')
+ [string]$EntryCachePath='', [switch]$Worker)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false)
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type @"
@@ -23,7 +24,7 @@ public static class GameEntryInput {
 }
 "@
 [GameEntryInput]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
-$diagnostics=@{stage='start';mode=$Mode;calibrated=($SidebarX -ge 0)}
+$diagnostics=@{stage='start';mode=$Mode}
 $root=[System.Windows.Automation.AutomationElement]::RootElement
 $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
 function Named($base,[string]$name) {
@@ -38,8 +39,10 @@ function Activate($w) {
  $hwnd=[IntPtr]$w.Current.NativeWindowHandle
  if($hwnd -eq [IntPtr]::Zero){throw '微信主窗口不可见，请打开微信的小程序最近使用页面'}
  if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null}
- [GameEntryInput]::SetForegroundWindow($hwnd) | Out-Null
- Start-Sleep -Milliseconds 200
+ if([GameEntryInput]::GetForegroundWindow() -ne $hwnd){
+  [GameEntryInput]::SetForegroundWindow($hwnd) | Out-Null
+  Start-Sleep -Milliseconds 100
+ }
  if([GameEntryInput]::GetForegroundWindow() -ne $hwnd){throw '无法激活微信窗口，停止点击'}
 }
 function Click($element,$window) {
@@ -126,23 +129,9 @@ function Entry {
  }
  return $null
 }
-function CalibratedSidebar {
- if($SidebarX -lt 0 -or !$SidebarWindowClass){throw '微信原生侧栏未暴露可访问控件，请在全局设置先校准微信小程序入口'}
- $windows=@(WechatWindows | Where-Object {$_.Current.ClassName -eq $SidebarWindowClass})
- $diagnostics.calibrationWindowMatches=$windows.Count
- if($windows.Count -ne 1){throw '校准对应的微信窗口不唯一或已关闭，请重新校准'}
- $w=$windows[0];Activate $w
- $hwnd=[IntPtr]$w.Current.NativeWindowHandle
- $rect=New-Object GameEntryInput+Rect
- if(![GameEntryInput]::GetClientRect($hwnd,[ref]$rect)){throw '无法读取微信窗口尺寸'}
- if($rect.Right -ne $SidebarWidth -or $rect.Bottom -ne $SidebarHeight){throw '微信窗口尺寸已改变，请重新校准小程序入口'}
- if($SidebarX -ge [Math]::Min(120,$rect.Right) -or $SidebarY -lt 0 -or $SidebarY -ge $rect.Bottom){throw '微信侧栏校准位置无效'}
- $point=New-Object GameEntryInput+Point;$point.X=$SidebarX;$point.Y=$SidebarY
- if(![GameEntryInput]::ClientToScreen($hwnd,[ref]$point)){throw '无法转换微信侧栏位置'}
- [GameEntryInput]::SetCursorPos($point.X,$point.Y) | Out-Null
- [GameEntryInput]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
- [GameEntryInput]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
-}
+function Invoke-Stage {
+ $script:diagnostics=@{stage='start';mode=$Mode}
+
 try {
  if($Mode -eq 'WaitClosed') {
   $deadline=[DateTime]::UtcNow.AddSeconds(10)
@@ -152,33 +141,34 @@ try {
     $proc=Get-Process -Id $_.Current.ProcessId -ErrorAction SilentlyContinue
     return $proc -and $proc.ProcessName -eq 'WeChatAppEx'
    })
-   if($game.Count -eq 0){@{ok=$true;phase='closed'} | ConvertTo-Json -Compress;exit 0}
+   if($game.Count -eq 0){@{ok=$true;phase='closed'} | ConvertTo-Json -Compress;return}
    Start-Sleep -Milliseconds 200
   }while([DateTime]::UtcNow -lt $deadline)
   throw '旧游戏窗口尚未退出，停止重复打开'
  }
  $diagnostics.stage='restore-wechat'
  $windows=@(WechatWindows);$diagnostics.wechatWindowCount=$windows.Count
+ $restored=$false
  foreach($w in $windows){
   $hwnd=[IntPtr]$w.Current.NativeWindowHandle
-  if($Mode -ne 'Scan' -and $hwnd -ne [IntPtr]::Zero){if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null}}
+  if($Mode -ne 'Scan' -and $hwnd -ne [IntPtr]::Zero){if([GameEntryInput]::IsIconic($hwnd)){[GameEntryInput]::ShowWindowAsync($hwnd,9) | Out-Null;$restored=$true}}
  }
- Start-Sleep -Milliseconds 300
+ if($restored){Start-Sleep -Milliseconds 150}
  $diagnostics.stage='find-entry'
  if($Mode -in @('CachedPrepare','CachedOpen')) {
   $entry=CachedEntry
   $freshCache=EntryCache $entry
   if($Mode -eq 'CachedOpen'){Click $entry.Element $entry.Window}
-  @{ok=$true;phase=$Mode;cache=$freshCache;cached=$true} | ConvertTo-Json -Depth 6 -Compress;exit 0
+  @{ok=$true;phase=$Mode;cache=$freshCache;cached=$true} | ConvertTo-Json -Depth 6 -Compress;return
  }
  $entry=Entry
  if($Mode -eq 'Scan') {
   if($entry){@{ok=$true;found=$true;cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress}
   else{@{ok=$true;found=$false} | ConvertTo-Json -Compress}
-  exit 0
+  return
  }
  if($Mode -eq 'Probe') {
-  @{ok=$true;found=($null -ne $entry);entry='recent-release'} | ConvertTo-Json -Compress;exit 0
+  @{ok=$true;found=($null -ne $entry);entry='recent-release'} | ConvertTo-Json -Compress;return
  }
  if($Mode -eq 'Navigate') {
   $targets=@()
@@ -193,7 +183,7 @@ try {
   }
   if($targets.Count -ne 1){throw ('小程序文本入口匹配数为 '+$targets.Count+'，停止点击')}
   Click $targets[0].Element $targets[0].Window
-  @{ok=$true;phase='Navigate'} | ConvertTo-Json -Compress;exit 0
+  @{ok=$true;phase='Navigate'} | ConvertTo-Json -Compress;return
  }
  if(!$entry -and $Mode -in @('EntryPrepare','EntryOpen')) {throw '最近使用中未识别到唯一的普通版遗弃之地'}
  if(!$entry) {
@@ -209,7 +199,7 @@ try {
    }
   }
   $diagnostics.stage='open-sidebar';$diagnostics.navigationMatches=$nav.Count
-  if($nav.Count -eq 1){Click $nav[0].Element $nav[0].Window}else{CalibratedSidebar}
+  if($nav.Count -eq 1){Click $nav[0].Element $nav[0].Window}else{throw '未找到唯一的微信小程序入口，未点击'}
   $deadline=[DateTime]::UtcNow.AddSeconds(5)
   do {Start-Sleep -Milliseconds 200;$entry=Entry}while(!$entry -and [DateTime]::UtcNow -lt $deadline)
  }
@@ -223,5 +213,28 @@ try {
  @{ok=$true;phase=$Mode;entry='recent-release';cache=(EntryCache $entry)} | ConvertTo-Json -Depth 6 -Compress
 }catch {
  @{ok=$false;message=$_.Exception.Message;diagnostics=$diagnostics} | ConvertTo-Json -Compress
- exit 1
+ return
+}
+
+}
+if($Worker) {
+ [Console]::Out.WriteLine('{"ok":true,"ready":true}')
+ [Console]::Out.Flush()
+ while($null -ne ($line=[Console]::ReadLine())) {
+  try {
+   $command=$line | ConvertFrom-Json
+   if($command.mode -eq 'Quit'){break}
+   $script:Mode=[string]$command.mode
+   $script:EntryCachePath=[string]$command.entryCachePath
+   $result=Invoke-Stage
+   [Console]::Out.WriteLine([string]$result)
+  } catch {
+   [Console]::Out.WriteLine((@{ok=$false;message=$_.Exception.Message} | ConvertTo-Json -Compress))
+  }
+  [Console]::Out.Flush()
+ }
+} else {
+ $result=Invoke-Stage
+ [Console]::Out.WriteLine([string]$result)
+ if(!($result | ConvertFrom-Json).ok){exit 1}
 }
