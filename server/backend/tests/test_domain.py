@@ -278,7 +278,8 @@ def test_multi_package_selection_and_unique_archive(db):
         assert archive.namelist().count("e0e1-wx-plugins/license.bin") == 1
     other, _ = packages.build_player_package(db, ["1001", "1002"])
     assert str(other) != str(response.path)
-    asyncio.run(response.background());assert not Path(response.path).exists()
+    assert response.background is None
+    assert Path(response.path).exists()  # 玩家包统一缓存 24 小时后定时清理。
     for ids in ([], ["missing"], ["1001", "1003"], [""]):
         with pytest.raises(HTTPException):
             download_selected_package(PackageIn(player_ids=ids), db, "admin")
