@@ -154,8 +154,18 @@ class TaskPanel(QGroupBox):
             layout.addWidget(note)
         elif task_id == 'pet_hatch':
             from package.daily_tasks.pet_hatch import PET_EGGS
+            from package.ui.styles import TOKENS
             choices = QListWidget()
             choices.setMinimumHeight(240)
+            # Explicit indicators remain visible when the native checked glyph is
+            # drawn against our light application stylesheet.
+            choices.setStyleSheet(f'''
+                QListWidget::indicator {{ width: 14px; height: 14px; border-radius: 4px;
+                    border: 1px solid {TOKENS['border_strong']}; background: {TOKENS['bg_panel']}; }}
+                QListWidget::indicator:checked {{ image: none;
+                    background: {TOKENS['accent']}; border-color: {TOKENS['accent']}; }}
+                QListWidget::indicator:unchecked {{ image: none; }}
+            ''')
             for id, name in reversed(PET_EGGS):
                 item = QListWidgetItem(name, choices)
                 item.setData(Qt.ItemDataRole.UserRole, id)
@@ -584,12 +594,14 @@ class BloodmoonPanel(QWidget):
         self.speed_times.setSuffix(" 次")
         self.speed_times.setObjectName("bloodmoon.speed_up.max_times")
         speed_form.addRow("单次行军最多加速", self.speed_times)
-        self.speed_interval = QSpinBox()
+        self.speed_interval = QDoubleSpinBox()
+        self.speed_interval.setDecimals(3)
+        self.speed_interval.setSingleStep(0.1)
         self.speed_interval.setRange(0, 3600)
         self.speed_interval.setSuffix(" 秒")
         self.speed_interval.setObjectName("bloodmoon.speed_up.interval_seconds")
         self.speed_interval.setSpecialValueText("跟随游戏间隔")
-        self.speed_interval.setToolTip("0：读取游戏 MarchSpeedUpCD；正数：使用自定义秒数。8～10秒窗口内最多尝试一次，仍遵守请求间隔；低于8秒不发送。")
+        self.speed_interval.setToolTip("0：读取游戏 MarchSpeedUpCD；正数：使用自定义秒数，支持三位小数（例如0.25秒）。8～10秒窗口内最多尝试一次，仍遵守请求间隔；低于8秒不发送。")
         speed_form.addRow("赶路请求间隔（0跟随游戏）", self.speed_interval)
         speed_layout.addLayout(speed_form)
         self.speed_save = QPushButton("保存加速设置")
@@ -608,7 +620,35 @@ class BloodmoonPanel(QWidget):
         self.attack_limit.setSpecialValueText("不限制")
         self.attack_limit.setObjectName("bloodmoon.attack.power_limit")
         attack_form.addRow("目标战力上限", self.attack_limit)
-        attack_hint = QLabel("只攻击战力低于我方、且低于此上限的可见玩家；0 表示只按我方战力筛选。每100毫秒扫描当前节点；待命后直接挑战，上一场结束且回到待命后立即续战，等待回执期间不重复发送。")
+        self.attack_lowest_first = QCheckBox("从最低战力开始攻击")
+        self.attack_lowest_first.setObjectName("bloodmoon.attack.lowest_power_first")
+        self.attack_lowest_first.setToolTip("开启：优先攻击符合条件中战力最低的玩家；关闭：优先攻击战力最高的玩家。切换后立即保存，下次选敌生效。")
+        attack_form.addRow("攻击顺序", self.attack_lowest_first)
+        self.attack_lead = QSpinBox()
+        self.attack_lead.setRange(0, 10000)
+        self.attack_lead.setSingleStep(100)
+        self.attack_lead.setSuffix(" 毫秒")
+        self.attack_lead.setSpecialValueText("关闭提前尝试")
+        self.attack_lead.setObjectName("bloodmoon.attack.lead_ms")
+        self.attack_lead.setToolTip("开启动态提前量且有样本时，使用近10秒攻击接口平均RTT的一半（向上取整至毫秒，最多10000ms）；关闭动态提前量或无样本时使用此配置。0始终关闭提前尝试。自己抵达、战斗结束、目标抵达共用实际提前量。")
+        attack_form.addRow("攻击提前量 x", self.attack_lead)
+        self.attack_interval = QSpinBox()
+        self.attack_interval.setRange(1, 10000)
+        self.attack_interval.setSingleStep(10)
+        self.attack_interval.setSuffix(" 毫秒")
+        self.attack_interval.setObjectName("bloodmoon.attack.interval_ms")
+        self.attack_interval.setToolTip("每轮重新选择合法目标并发送挑战的间隔，默认200ms；不等待任何旧包回执。")
+        attack_form.addRow("循环间隔 y", self.attack_interval)
+        self.attack_dynamic_lead = QCheckBox("启用动态提前量")
+        self.attack_dynamic_lead.setObjectName("bloodmoon.attack.dynamic_lead")
+        self.attack_dynamic_lead.setToolTip("开启时使用近10秒平均RTT/2；无样本时使用配置值。关闭时始终使用配置值。切换后立即保存，下次扫描生效。")
+        dynamic_row = QHBoxLayout()
+        dynamic_row.addWidget(self.attack_dynamic_lead)
+        self.attack_latency_status = QLabel("RTT/2：暂无回包样本")
+        self.attack_latency_status.setWordWrap(True)
+        dynamic_row.addWidget(self.attack_latency_status, 1)
+        attack_form.addRow(dynamic_row)
+        attack_hint = QLabel("只攻击战力低于我方、且低于此上限的玩家；0 表示只按我方战力筛选。自己抵达、战斗结束和目标抵达共用攻击提前量，每隔配置的 y 毫秒重新选敌并挑战。优先当前可攻击玩家，无合格目标时才尝试即将到达者。不等待上一包回执；超时、拒绝或异常不阻塞后续发送，实际进入战斗才结束本轮。")
         attack_hint.setWordWrap(True)
         attack_layout.addWidget(attack_hint)
         self.attack_max = QSpinBox()
@@ -645,6 +685,8 @@ class BloodmoonPanel(QWidget):
         scroll.setWidget(content)
         self.set_ready(False)
         self.enabled.toggled.connect(lambda value: self._patch({"enabled": value}))
+        self.attack_dynamic_lead.toggled.connect(lambda value: self._patch({"attack": {"dynamic_lead": value}}))
+        self.attack_lowest_first.toggled.connect(lambda value: self._patch({"attack": {"lowest_power_first": value}}))
         self.probe_start.clicked.connect(lambda: self.probe_requested.emit(True))
         self.probe_stop.clicked.connect(lambda: self.probe_requested.emit(False))
         self.diagnose_button.clicked.connect(self.diagnose_requested.emit)
@@ -682,7 +724,11 @@ class BloodmoonPanel(QWidget):
 
     def _attack_patch(self) -> dict:
         return {"attack": {"power_ratio": 100, "power_limit": int(self.attack_limit.value()),
-                           "max_battles": self.attack_max.value(), "wait_seconds": 0}}
+                           "max_battles": self.attack_max.value(), "wait_seconds": 0,
+                           "lowest_power_first": self.attack_lowest_first.isChecked(),
+                           "dynamic_lead": self.attack_dynamic_lead.isChecked(),
+                           "interval_ms": self.attack_interval.value(),
+                           "lead_ms": self.attack_lead.value()}}
 
     def sync(self, state):
         bloodmoon = state.get("bloodmoon") or {}
@@ -699,12 +745,18 @@ class BloodmoonPanel(QWidget):
         probe = bloodmoon.get("flag_probe") or {}
         speed = bloodmoon.get("speed_up") or {}
         attack = bloodmoon.get("attack") or {}
+        set_checked(self.attack_dynamic_lead, bool(attack.get("dynamic_lead", False)))
+        set_checked(self.attack_lowest_first, bool(attack.get("lowest_power_first", False)))
         set_checked(self.enabled, bool(bloodmoon.get("enabled")))
+        interval = float(speed.get("interval_seconds", 0))
+        if self.speed_interval.value() != interval:
+            self.speed_interval.setValue(interval)
         for widget, value in ((self.probe_refresh, probe.get("refresh_seconds", 5)),
                               (self.probe_top, probe.get("top_members", 3)),
                               (self.speed_times, speed.get("max_times", 15)),
-                              (self.speed_interval, speed.get("interval_seconds", 0)),
                               (self.attack_limit, attack.get("power_limit", 0)),
+                              (self.attack_lead, attack.get("lead_ms", 400)),
+                              (self.attack_interval, attack.get("interval_ms", 200)),
                               (self.attack_max, attack.get("max_battles", 20))):
             if widget.value() != value:
                 widget.setValue(int(value))

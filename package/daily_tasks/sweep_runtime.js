@@ -749,6 +749,27 @@ function createEnergyRuntime(g, timing) {
       equipment_plan:snapshot.equipmentUesPlan,suits:isMap(snapshot.equipmentSuit)?Array.from(snapshot.equipmentSuit.entries()):[],missing};
   }
 
+  const SEASON_ATTRS = {
+    200101:'深渊攻击力',200102:'深渊防御力',200103:'赛季最终增伤',200104:'赛季最终减伤',
+    200105:'致命一击率',200106:'致命一击率抵抗',200107:'致命一击伤害',200108:'致命一击伤害抵抗',
+    200109:'群攻致命一击率',200110:'群攻致命一击率抵抗',200111:'群攻致命一击伤害',200112:'群攻致命一击伤害抵抗'
+  };
+  const isSeasonAttr = id => !!SEASON_ATTRS[Number(id)] || !!rowOf('SeasonAttrCfg',id);
+  function seasonAttributes(attributes) {
+    // 原生 UIAttrPreview 的赛季区读的是本人的 SEASON 模块；这里仅用当前目标的属性表。
+    const ids = new Set([200101,200103,200105,200107]);
+    for (const row of data && data.SeasonAttrCfg && data.SeasonAttrCfg.list || [])
+      if (row.show>0) ids.add(Number(row.id));
+    if (isMap(attributes)) attributes.forEach((_,id)=>{if(isSeasonAttr(id))ids.add(Number(id));});
+    return [...ids].sort((a,b)=>(rowOf('SeasonAttrCfg',a)?.namesort ?? a)-(rowOf('SeasonAttrCfg',b)?.namesort ?? b)).map(id=>{
+      const row=rowOf('SeasonAttrCfg',id);
+      const name=row && cjk(row.note)?row.note:SEASON_ATTRS[id] || ('赛季属性'+id);
+      const value=isMap(attributes)?attributes.get(id) ?? attributes.get(String(id)):undefined;
+      if(value===undefined || value===null)return name+'：未下发';
+      const style=row && row.style!==undefined?Number(row.style):id===200101 || id===200102?1:2;
+      return name+' '+(style===2?String(Math.round(Number(value))/100)+'%':String(value));
+    });
+  }
   function snapshotSections(snapshot) {
     const out = [];
     const head = [];
@@ -931,10 +952,12 @@ function createEnergyRuntime(g, timing) {
 
     const attrs = [];
     eachMap(snapshot.attribute, 80, (value, attrId) => {
+      if (isSeasonAttr(attrId)) return;
       const name = nameOf('AttrCfg', attrId);
       if (name) attrs.push(name + ' ' + attrText(attrId, value));
     });
     if (attrs.length) out.push('── 属性 ──\n  ' + attrs.join('\n  '));
+    out.push('── 赛季属性 ──\n  '+seasonAttributes(snapshot.attribute).join('\n  '));
     if (Array.isArray(snapshot.unlockModuleIds) && snapshot.unlockModuleIds.length)
       out.push('── 玩法 ──\n  已解锁 ' + snapshot.unlockModuleIds.length + ' 项：' + snapshot.unlockModuleIds.join(', '));
     return out;
@@ -961,8 +984,10 @@ function createEnergyRuntime(g, timing) {
         typeof screen.isSelf!=='boolean' || screen.isSelf!==page.isPersonal) return null;
     if (!screen.isSelf && (!screen.info || page.info!==screen.info)) return null;
     // 本人与他人都按 player_info_dump.js 的口径解析本地快照（GDRoleSnap），含对方界面上隐藏的分区。
-    const snapshot = screen.isSelf ? (screen.info || g.ROLE) : screen.info;
+    let snapshot = screen.isSelf ? (screen.info || g.ROLE) : screen.info;
     if (!snapshot) return null;
+    // ROLE 本人与 GDRoleSnap 的属性路径不同，仅本人页面可以读取 ROLE.hero。
+    if (screen.isSelf) snapshot={...snapshot,attribute:snapshot.attribute || g.ROLE?.hero?.attribute?.attributes};
     let sections;
     try {
       sections = snapshotSections(snapshot);

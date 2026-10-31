@@ -381,7 +381,7 @@
       case 'treasure-status': return typeof g.treasureMapOverlayStatus === 'function' ? String(g.treasureMapOverlayStatus()) : '摸金脚本尚未注入';
       case 'season-inject': return staticScripts.season();
       case 'season-call': {
-        const allowed = ['reset','diagnose','stop','marks','flags','march','speedUp','candidates','attack'];
+        const allowed = ['reset','diagnose','stop','marks','flags','march','speedUp','candidates','attack','automationConfigure','automationEvents'];
         if (!allowed.includes(args.name)) throw new Error('不支持的血月命令');
         const api = g.e0e1Season;
         return api && typeof api[args.name] === 'function' ? api[args.name](args.payload || {})

@@ -13,10 +13,15 @@ class PetHatchTask:
     def __init__(self, game):
         self.game = game
 
+    @staticmethod
+    def configuration_issue(params):
+        return '' if params.get('item_ids') else '请先选择要自动解封的阴契'
+
     async def run(self, ctx, *, force_trigger=False):
         selected = ctx.task.params.get('item_ids', [])
-        if not selected:
-            return TaskResult('waiting', '请先选择要自动解封的阴契')
+        issue = self.configuration_issue(ctx.task.params)
+        if issue:
+            return TaskResult('waiting', issue)
         if ctx.stop_requested():
             return TaskResult('waiting', '已请求停止')
         placed = claimed = 0

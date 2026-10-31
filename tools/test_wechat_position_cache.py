@@ -102,8 +102,8 @@ def test_two_failed_launches_end_this_round(monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('visible',[True,False])
-def test_cached_native_click_reads_live_control_instead_of_old_coordinate(monkeypatch,visible):
+@pytest.mark.parametrize('mode',['CachedClick','CachedEntryClick'])
+def test_cached_click_uses_saved_coordinates_without_frida_and_follows_moved_window(monkeypatch,mode):
     from package.plugin_manager import wechat_native_launch as native
     user=SimpleNamespace(IsIconic=lambda h:False,SetForegroundWindow=lambda h:None)
     monkeypatch.setattr(native,'user32',lambda:user)
@@ -111,17 +111,119 @@ def test_cached_native_click_reads_live_control_instead_of_old_coordinate(monkey
     monkeypatch.setattr(native.psutil,'Process',lambda pid:process)
     monkeypatch.setattr(native.psutil,'process_iter',lambda attrs:[process])
     monkeypatch.setattr(native,'wechat_window_pids',lambda user:{10})
-    monkeypatch.setattr(native,'main_geometry',lambda user,pid:{'hwnd':'0x10'})
+    geometry=dict(hwnd='0x10',origin={'x':50,'y':60},clientSize=NATIVE['clientSize'],scale=1.5)
+    monkeypatch.setattr(native,'main_geometry',lambda user,pid:geometry)
     monkeypatch.setattr(native.time,'sleep',lambda t:None)
-    live=dict(NATIVE,controls=[dict(label='发现',screenCenter={'x':99,'y':88})] if visible else [])
-    monkeypatch.setattr(native,'_probe',SimpleNamespace(snapshot=lambda *args:live))
+    def scan(*args):raise AssertionError('cached click must not scan')
+    monkeypatch.setattr(native,'_probe',SimpleNamespace(snapshot=scan))
     clicks=[];monkeypatch.setattr(native,'click_control',lambda u,s,c:clicks.append(c['screenCenter']))
-    if visible:
-        native.run('CachedClick','发现',cache=NATIVE)
-        assert clicks==[{'x':99,'y':88}]
-    else:
-        with pytest.raises(RuntimeError,match='0 个'):native.run('CachedClick','发现',cache=NATIVE)
-        assert clicks==[]
+    entry=dict(ENTRY,processStart=str(621355968000000000+120000000))
+    native.run(mode,'发现' if mode=='CachedClick' else '遗弃之地',cache=NATIVE if mode=='CachedClick' else entry)
+    assert clicks==[{'x':80,'y':100}]
+
+
+def test_cached_navigation_ticket_defers_all_clicks_and_scans(monkeypatch):
+    native=dict(NATIVE,controls=NATIVE['controls']+[dict(label='小程序',screenCenter={'x':50,'y':60})])
+    cache.save('native',native);cache.save('entry',ENTRY)
+    async def unexpected(*args,**kwargs):raise AssertionError('must defer work until open')
+    monkeypatch.setattr(launch,'_native_ui',unexpected)
+    monkeypatch.setattr(launch,'_recent_ui',unexpected)
+    result=asyncio.run(launch._prepare_native_entry())
+    assert result['cached_navigation'] and result['cache']==ENTRY
+
+
+def test_cached_click_rejects_changed_size_without_scanning_or_clicking(monkeypatch):
+    from package.plugin_manager import wechat_native_launch as native
+    user=SimpleNamespace(IsIconic=lambda h:False,SetForegroundWindow=lambda h:None)
+    monkeypatch.setattr(native,'user32',lambda:user)
+    monkeypatch.setattr(native.psutil,'Process',lambda pid:SimpleNamespace(pid=10,name=lambda:'Weixin.exe',create_time=lambda:12))
+    monkeypatch.setattr(native,'main_geometry',lambda u,p:dict(hwnd='0x10',origin=NATIVE['origin'],clientSize={'width':200,'height':100},scale=1.5))
+    monkeypatch.setattr(native.time,'sleep',lambda t:None)
+    def unexpected(*args):raise AssertionError('must not click or scan invalid geometry')
+    monkeypatch.setattr(native,'click_control',unexpected)
+    monkeypatch.setattr(native,'_probe',SimpleNamespace(snapshot=unexpected))
+    with pytest.raises(RuntimeError,match='尺寸已变化'):native.run('CachedClick','发现',cache=NATIVE)
+
+
+def test_late_window_after_cached_navigation_failure_prevents_scan_and_second_launch(monkeypatch):
+    async def run():
+        checks=iter([[],[],[123]])
+        async def native(mode,label=None,**kwargs):
+            if mode=='Status':return {'windows':next(checks)}
+            assert mode=='CachedClick';raise RuntimeError('acknowledgement lost')
+        async def unexpected(*args,**kwargs):raise AssertionError('must not retry an opened game')
+        monkeypatch.setattr(launch,'_native_ui',native)
+        monkeypatch.setattr(launch,'_prepare_native_entry',unexpected)
+        monkeypatch.setattr(launch,'_recent_ui',unexpected)
+        await launch.open_wechat_game(prepared={'cached_navigation':True,'native_cache':NATIVE,'cache':ENTRY})
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('opened',[True,False])
+def test_cached_navigation_is_attempted_before_scan_and_failed_launch_falls_back_once(monkeypatch,opened):
+    async def run():
+        calls=[]
+        ticket={'cache':ENTRY,'native_cache':NATIVE,'cached_navigation':True}
+        async def native(mode,label=None,**kwargs):
+            calls.append((mode,label))
+            return {'windows':[]}
+        async def recent(mode,**kwargs):calls.append(mode)
+        async def prepare(**kwargs):assert kwargs=={'force_scan':True};calls.append('scan')
+        waits=iter([opened,True])
+        async def wait(timeout=15):calls.append('wait');return next(waits)
+        async def pause(delay):pass
+        monkeypatch.setattr(launch,'_native_ui',native)
+        monkeypatch.setattr(launch,'_recent_ui',recent)
+        monkeypatch.setattr(launch,'_prepare_native_entry',prepare)
+        monkeypatch.setattr(launch,'_wait_game_window',wait)
+        monkeypatch.setattr(launch.asyncio,'sleep',pause)
+        await launch.open_wechat_game(prepared=ticket)
+        inputs=[c for c in calls if isinstance(c,tuple) and c[0]!='Status']
+        assert inputs==[('CachedClick','发现'),('CachedEntryClick','遗弃之地'),
+                       ('CachedClick','小程序'),('CachedEntryClick','遗弃之地')]
+        if opened:assert 'scan' not in calls and 'EntryOpen' not in calls
+        else:
+            assert calls.count('scan')==calls.count('EntryOpen')==1
+            assert calls.index('wait')<calls.index('scan')<calls.index('EntryOpen')
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('page_visible',[True,False])
+def test_game_position_is_tried_before_toggling_mini_program_page(monkeypatch,page_visible):
+    async def run():
+        page=[page_visible];windows=[];inputs=[];waits=[]
+        async def native(mode,label=None,**kwargs):
+            if mode=='Status':return {'windows':windows[:]}
+            inputs.append((mode,label))
+            if label=='小程序':page[0]=not page[0]
+            if mode=='CachedEntryClick' and page[0]:windows.append(123)
+            return {'ok':True}
+        async def wait(timeout=15):waits.append(timeout);return bool(windows)
+        async def pause(delay):pass
+        async def unexpected(*args,**kwargs):raise AssertionError('cached launch must succeed without scanning')
+        monkeypatch.setattr(launch,'_native_ui',native)
+        monkeypatch.setattr(launch,'_wait_game_window',wait)
+        monkeypatch.setattr(launch.asyncio,'sleep',pause)
+        monkeypatch.setattr(launch,'_prepare_native_entry',unexpected)
+        monkeypatch.setattr(launch,'_recent_ui',unexpected)
+        await launch.open_wechat_game(prepared={'cached_navigation':True,'native_cache':NATIVE,'cache':ENTRY})
+        assert inputs[:2]==[('CachedClick','发现'),('CachedEntryClick','遗弃之地')]
+        if page_visible:
+            assert inputs[2:]==[('CachedClick','小程序')] and waits==[]
+        else:
+            assert inputs[2:]==[('CachedClick','小程序'),('CachedEntryClick','遗弃之地')]
+            assert waits==[15]
+        assert windows==[123]
+    asyncio.run(run())
+
+
+def test_native_cache_keeps_navigation_buttons_across_pages_and_translates_window_move():
+    initial=dict(NATIVE,controls=NATIVE['controls']+[dict(label='小程序',screenCenter={'x':50,'y':60})])
+    cache.save('native',initial)
+    cache.save('native',dict(NATIVE,origin={'x':10,'y':20}))
+    controls={c['label']:c for c in cache.load()['native']['controls']}
+    assert controls['小程序']['screenCenter']=={'x':60,'y':80}
+    assert controls['发现']['screenCenter']=={'x':30,'y':40}
 
 
 def test_cache_write_failure_does_not_stop_positioning(monkeypatch):

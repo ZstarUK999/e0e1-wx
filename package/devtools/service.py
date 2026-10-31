@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import json
+import logging
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -500,6 +502,13 @@ class DevtoolsService(QObject):
     def handle_event(self, event: dict) -> None:
         """按事件类型同步服务缓存，并向 UI 分发对应信号。"""
         event_type = str(event.get("type") or "")
+        if event_type == 'hook_diagnostic':
+            payload = event.get('payload')
+            if isinstance(payload, dict):
+                level = {'error': logging.ERROR, 'warning': logging.WARNING}.get(payload.get('level'), logging.INFO)
+                logging.getLogger('plugin_manager').log(level, '微信hook诊断：%s',
+                    json.dumps(payload, ensure_ascii=False))
+            return
         if event_type == "devtools_state":
             next_state = event.get("state") if isinstance(event.get("state"), dict) else default_state()
             if next_state == self.state:

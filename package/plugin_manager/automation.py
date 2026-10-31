@@ -41,6 +41,7 @@ class AutomationScheduler:
         self.operation = None
         self._config_source = None
         self._parsed_config = None
+        self._configuration_issues = {}
         self._handlers = {}
         self._task_due = {}
         self._active_task = None
@@ -143,8 +144,26 @@ class AutomationScheduler:
     def daily_config(self):
         raw=self.view.store.snapshot()['daily']
         if raw!=self._config_source:
+            previous = self._parsed_config
             self._parsed_config=parse_config(raw)
             self._config_source=raw
+            issues = {}
+            for key, task in self._parsed_config.tasks.items():
+                old_task = previous.tasks.get(key) if previous is not None else None
+                if old_task is not None and (old_task.params != task.params or old_task.schedule != task.schedule):
+                    self._task_due[key] = 0.0
+                check = getattr(self._handlers.get(key), 'configuration_issue', None)
+                issue = check(task.params) if task.enabled and check else ''
+                if issue:
+                    issues[key] = issue
+                    if self._configuration_issues.get(key) != issue:
+                        LOG.info('任务跳过：%s，%s；配置完成后自动恢复', task.name, issue)
+                        panel = getattr(self.view, 'task_panels', {}).get(key)
+                        if panel:
+                            panel.runtime_message.setText(issue)
+                elif key in self._configuration_issues:
+                    self._task_due[key] = 0.0
+            self._configuration_issues = issues
         return self._parsed_config
 
     def next_check(self, now: datetime) -> dict | None:
@@ -153,7 +172,7 @@ class AutomationScheduler:
         clock = time.monotonic()
         candidates = []
         for key, task in parsed.tasks.items():
-            if not task.enabled or key not in self._handlers:
+            if not task.enabled or key not in self._handlers or key in self._configuration_issues:
                 continue
             delay = max(0.0, self._task_due.get(key, 0) - clock)
             when = now + timedelta(seconds=delay)
@@ -176,7 +195,7 @@ class AutomationScheduler:
         parsed = self.daily_config()
         candidates = []
         for key, task in parsed.tasks.items():
-            if not task.enabled or key not in self._handlers or time.monotonic() < self._task_due.get(key, 0):
+            if not task.enabled or key not in self._handlers or key in self._configuration_issues or time.monotonic() < self._task_due.get(key, 0):
                 continue
             if task.schedule.kind == 'daily_window' and not task.schedule.start <= now.time().replace(tzinfo=None) < task.schedule.end:
                 continue
@@ -206,23 +225,44 @@ class AutomationScheduler:
         LOG.info('任务开始：%s%s', context.task.name, '（手动测试）' if manual else '')
         message = ''
         delay = context.task.schedule.interval_seconds
+        timed_out = owns_timeout_block = False
+        timeout_reason = '任务超时；等待当前请求收尾后需核对'
+        stop_before_timeout = False
+        session = self.state.installed
         try:
             job = asyncio.create_task(self._handlers[task_id].run(context, force_trigger=manual))
             done, _ = await asyncio.wait({job}, timeout=context.task.timeout_seconds)
             if not done:
                 # 只请求在安全步骤停止，不取消已经发到游戏的请求/恢复。
+                timed_out = True
+                stop_before_timeout = self.state.stop_operation
                 self.state.stop_operation = True
-                self.state.blocked = '任务超时；等待当前请求收尾后需核对'
+                if not self.state.blocked:
+                    self.state.blocked = timeout_reason
+                    owns_timeout_block = True
+                LOG.warning('任务达到单轮时限：%s；停止追加操作，等待当前请求确认及收尾', context.task.name)
             result = await job
+            if (timed_out and result.safe_to_resume and owns_timeout_block
+                    and self.state.blocked == timeout_reason and self.state.installed == session
+                    and not self.state.closing):
+                self.state.blocked = ''
+                if not stop_before_timeout and self.running and not self.stopping:
+                    self.state.stop_operation = False
+                LOG.info('任务超时后已确认安全收尾：%s；已解除本次超时暂停', context.task.name)
             message = result.message
             if result.next_delay_seconds is not None:
                 delay = result.next_delay_seconds
             if manual or result.status == 'success':
-                LOG.info('任务结束：%s，%s', context.task.name, message)
+                LOG.info('任务结束：%s，%s；下次检查=%.1f秒后', context.task.name, message, delay)
+            else:
+                LOG.info('任务结束：%s，状态=%s，%s；下次检查=%.1f秒后',
+                         context.task.name, result.status, message, delay)
             if self.state.blocked:
                 raise ExecutionUncertain(self.state.blocked)
         except RetryableTaskError as exc:
             message = str(exc)
+            delay = context.task.retry_seconds
+            LOG.warning('任务暂不可执行：%s，%s；%.1f秒后再检查', context.task.name, message, delay)
         except Exception as exc:
             self.state.blocked = str(exc)
             self.state.blocked_session = self.state.installed or self.state.blocked_session
@@ -234,7 +274,10 @@ class AutomationScheduler:
             if self.state.stop_operation:
                 returned_home = await self._return_home_after_stop()
             self.stopping = False
-            self._task_due[task_id] = time.monotonic() + delay
+            current_task = self.daily_config().tasks.get(task_id)
+            interrupted = self.state.stop_operation and not self.state.blocked
+            self._task_due[task_id] = (0.0 if interrupted or current_task != context.task
+                                       else time.monotonic() + delay)
             self.view.task_panels[task_id].runtime_message.setText(message or '任务已收尾')
             self._active_task = None
             self.view.set_operation_running(False)

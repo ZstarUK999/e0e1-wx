@@ -80,7 +80,8 @@ async def _native_ui_request(mode,label=None,cache=None):
     result=await asyncio.to_thread(native.run,mode,label,cache)
     if mode in ('Scan','Snapshot'):_save_position('native',result)
     elif result.get('snapshot'):_save_position('native',result['snapshot'])
-    if mode in ('Click','CachedClick'):LOG.info('微信控件导航：%s，位置=%s',label,result['control']['screenCenter'])
+    if mode in ('Click','CachedClick','CachedEntryClick'):LOG.info('微信%s导航：%s，位置=%s',
+        '缓存位置' if mode.startswith('Cached') else '控件',label,result['control']['screenCenter'])
     elif mode=='Close':LOG.info('微信旧游戏窗口已确认关闭')
     return result
 
@@ -94,10 +95,15 @@ async def close_native():
 
 async def _cached_prepare(cached):
     entry=cached.get('entry')
+    native=cached.get('native')
+    labels={c.get('label') for c in (native or {}).get('controls',[])}
+    if entry and {'发现','小程序'}.issubset(labels):
+        # Defer clicks until debug hooks are ready and the old game is closed.
+        # Do not perform UIA/Frida discovery before trying the saved coordinates.
+        return {'cache':entry,'native_cache':native,'cached_navigation':True}
     if entry:
         try:return await _recent_ui('CachedPrepare',entry_cache=entry)
         except Exception as exc:LOG.debug('缓存游戏入口需更新：%s',exc)
-    # Persisted native coordinates describe a past page, never current visibility.
     return None
 
 
@@ -131,7 +137,7 @@ async def _prepare_native_entry(*,force_scan=False):
         if cached.get('entry') or cached.get('native'):
             prepared=await _cached_prepare(cached)
             if prepared:
-                LOG.info('微信入口预检查通过：已使用缓存位置')
+                LOG.info('微信入口预检查通过：优先使用缓存位置，失败后再扫描')
                 return prepared
     # An already-open page needs no native navigation or version-dependent scan.
     prepared=await _recent_ui('Probe')
@@ -153,7 +159,7 @@ async def prepare_wechat_game(*,runner=None):
     started=time.monotonic()
     if runner:result=await runner('Prepare')
     else:result=await _prepare_native_entry()
-    LOG.info('微信重开预检查通过：Frida原生控件及最近使用文本入口；耗时=%.2f秒',time.monotonic()-started)
+    LOG.info('微信启动入口准备完成；耗时=%.2f秒',time.monotonic()-started)
     return result
 
 
@@ -185,8 +191,8 @@ async def reopen_wechat_game(*,runner=None,before_open=None,prepared=None):
     LOG.info('已点击微信最近使用中的普通版遗弃之地，等待大厅确认')
 
 
-async def _wait_game_window():
-    deadline=time.monotonic()+15
+async def _wait_game_window(timeout=15):
+    deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
         if (await _native_ui('Status'))['windows']:return True
         await asyncio.sleep(.5)
@@ -200,7 +206,21 @@ async def open_wechat_game(*,prepared=None):
         raise RuntimeError('游戏窗口已经存在，停止重复打开')
     try:
         target=(prepared or {}).get('cache') or cached.get('entry')
-        if target:
+        if (prepared or {}).get('cached_navigation'):
+            native=prepared['native_cache']
+            # Cached coordinates need time for the destination page to become clickable.
+            for label,delay in (('发现',1.5),('小程序',2.0)):
+                if (await _native_ui('Status'))['windows']:return
+                if label=='小程序':
+                    # Click the game position first, then continue to the toggle
+                    # immediately, without waiting for or checking a game window.
+                    await _native_ui('CachedEntryClick','遗弃之地',cache=target)
+                await _native_ui('CachedClick',label,cache=native)
+                await asyncio.sleep(delay)
+            if (await _native_ui('Status'))['windows']:return
+            await _native_ui('CachedEntryClick','遗弃之地',cache=target)
+            LOG.info('已按缓存位置完成发现、小程序、游戏导航，等待窗口确认')
+        elif target:
             await _recent_ui('CachedOpen',entry_cache=target)
             LOG.info('已使用缓存位置打开游戏，等待窗口确认')
         else:

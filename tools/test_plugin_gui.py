@@ -634,8 +634,13 @@ def test_debug_platform_selection_keeps_main_ui_visible(window, monkeypatch, pla
 
 
 
-def test_delayed_shutdown_shows_single_dialog_with_live_countdown(window, app):
+def test_delayed_shutdown_shows_single_dialog_with_live_countdown(window, app, monkeypatch):
     from PySide6.QtTest import QTest
+    from types import SimpleNamespace
+    import package.plugin_manager.window as window_module
+    # Qt's real show timer may run late on a busy machine; countdown assertions
+    # should measure the configured duration, not test-machine scheduling lag.
+    monkeypatch.setattr(window_module, 'time', SimpleNamespace(monotonic=lambda:1000.0))
     window.attach_runtime([])
     window.set_shutdown_estimate(10)
     spy=QSignalSpy(window.shutdown_requested)
@@ -692,3 +697,89 @@ def test_legacy_config_starts_overlay_isolation_until_explicitly_enabled():
     assert validate_config(raw)['ui']['game_overlays'] is False
     raw['ui']['game_overlays']=True
     assert validate_config(raw)['ui']['game_overlays'] is True
+
+
+def _wheel(widget, delta=-120):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    point=widget.rect().center()
+    event=QWheelEvent(QPointF(point),QPointF(widget.mapToGlobal(point)),QPoint(),QPoint(0,delta),
+        Qt.MouseButton.NoButton,Qt.KeyboardModifier.NoModifier,Qt.ScrollPhase.NoScrollPhase,False)
+    QApplication.sendEvent(widget,event)
+
+
+@pytest.mark.parametrize('kind',['integer','decimal','combo','date','time','slider','dial'])
+def test_wheel_scrolls_page_until_editor_is_clicked(app, kind):
+    from PySide6.QtCore import QDate,QTime,QPoint,Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import (QWidget,QVBoxLayout,QScrollArea,QDoubleSpinBox,QComboBox,
+        QDateEdit,QTimeEdit,QSlider,QDial,QAbstractSpinBox)
+    from package.plugin_manager.wheel_focus import install_wheel_focus_guard
+    install_wheel_focus_guard()
+    area=QScrollArea();area.resize(420,240);area.setWidgetResizable(True)
+    content=QWidget();layout=QVBoxLayout(content)
+    editor={'integer':QSpinBox,'decimal':QDoubleSpinBox,'combo':QComboBox,'date':QDateEdit,
+            'time':QTimeEdit,'slider':QSlider,'dial':QDial}[kind]()
+    if kind=='combo':editor.addItems(['A','B','C']);editor.setCurrentIndex(1);editor.setEditable(True)
+    elif kind=='date':editor.setDate(QDate(2026,10,31))
+    elif kind=='time':editor.setTime(QTime(12,30))
+    else:editor.setRange(0,100);editor.setValue(50)
+    layout.addWidget(editor);layout.addSpacing(2000)
+    area.setWidget(content);area.show();app.processEvents()
+    value=lambda: editor.currentIndex() if kind=='combo' else (
+        editor.dateTime().toMSecsSinceEpoch() if kind in ('date','time') else editor.value())
+    try:
+        assert editor.focusPolicy()==Qt.FocusPolicy.ClickFocus
+        before=value()
+        _wheel(editor);app.processEvents()
+        assert value()==before
+        assert area.verticalScrollBar().value()>0
+        area.verticalScrollBar().setValue(0);app.processEvents()
+        target=editor.lineEdit() if isinstance(editor,(QAbstractSpinBox,QComboBox)) else editor
+        QTest.mouseClick(target,Qt.MouseButton.LeftButton,pos=QPoint(12,target.height()//2))
+        app.processEvents()
+        assert editor.hasFocus()
+        before=value();_wheel(editor,120);app.processEvents()
+        assert value()!=before
+        assert area.verticalScrollBar().value()==0
+    finally:
+        area.close();area.deleteLater();app.processEvents()
+
+
+def test_clicking_elsewhere_disarms_a_previously_clicked_editor(app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QWidget,QVBoxLayout,QPushButton
+    from package.plugin_manager.wheel_focus import install_wheel_focus_guard
+    install_wheel_focus_guard()
+    page=QWidget();layout=QVBoxLayout(page);editor=QSpinBox();button=QPushButton('Other')
+    layout.addWidget(editor);layout.addWidget(button);page.show();app.processEvents()
+    try:
+        QTest.mouseClick(editor.lineEdit(),Qt.MouseButton.LeftButton)
+        QTest.mouseClick(button,Qt.MouseButton.LeftButton)
+        before=editor.value();_wheel(editor,120)
+        assert editor.value()==before and not editor.hasFocus()
+    finally:page.close();page.deleteLater();app.processEvents()
+
+
+def test_all_window_editors_use_click_focus_and_scrollbars_are_exempt(window, app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QWidget,QAbstractSpinBox,QComboBox,QAbstractSlider,QScrollBar
+    window.show();app.processEvents()
+    editors=[w for w in window.findChildren(QWidget) if isinstance(w,(QAbstractSpinBox,QComboBox,QAbstractSlider))
+             and not isinstance(w,QScrollBar)]
+    assert len(editors)>15
+    assert all(w.focusPolicy()==Qt.FocusPolicy.ClickFocus for w in editors)
+
+
+def test_open_combo_popup_still_scrolls_its_list(app):
+    from PySide6.QtWidgets import QComboBox
+    from package.plugin_manager.wheel_focus import install_wheel_focus_guard
+    install_wheel_focus_guard()
+    combo=QComboBox();combo.setEditable(True);combo.setMaxVisibleItems(3)
+    combo.addItems([str(i) for i in range(60)]);combo.show();app.processEvents();combo.showPopup();app.processEvents()
+    try:
+        view=combo.view();assert view.isVisible()
+        _wheel(view.viewport());app.processEvents()
+        assert view.verticalScrollBar().value()>0
+    finally:combo.hidePopup();combo.close();combo.deleteLater();app.processEvents()

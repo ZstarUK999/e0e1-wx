@@ -1,4 +1,4 @@
-"""Persistent read-only Frida control discovery, with ordinary Windows input outside the target.
+"""Cached Windows input, with persistent read-only Frida discovery as the fallback.
 One session/script per live Weixin process; no background scanning.
 """
 from __future__ import annotations
@@ -231,14 +231,38 @@ def run(mode,label=None,cache=None):
             if time.monotonic()>=end:raise RuntimeError('游戏窗口15秒内未关闭，停止重开')
             time.sleep(.2)
         return {'ok':True,'phase':'closed'}
-    if mode=='CachedClick':
+    if mode in ('CachedClick','CachedEntryClick'):
         if not isinstance(cache,dict):raise RuntimeError('微信位置缓存不存在')
         proc=psutil.Process(int(cache['pid']))
-        if proc.name().lower()!='weixin.exe' or proc.create_time()!=cache['processCreatedAt']:
+        created=(float(cache['processCreatedAt']) if mode=='CachedClick' else
+                 (int(cache['processStart'])-621355968000000000)/10000000)
+        if proc.name().lower()!='weixin.exe' or abs(proc.create_time()-created)>.001:
             raise RuntimeError('微信进程已变化，重新扫描位置')
-        # Old coordinates cannot prove that the named control is still visible.
-        # Resolve the label and geometry from the current Qt tree before input.
-        return run('Click',label,cache)
+        geometry=main_geometry(user,proc.pid)
+        hwnd=int(geometry['hwnd'],16)
+        if user.IsIconic(hwnd):user.ShowWindowAsync(hwnd,9)
+        user.SetForegroundWindow(hwnd)
+        time.sleep(.2)
+        geometry=main_geometry(user,proc.pid)
+        if mode=='CachedEntryClick':
+            size={'width':cache['width'],'height':cache['height']}
+            if int(cache['hwnd'])!=hwnd or abs(geometry['scale']-cache['dpi']/96)>.01:
+                raise RuntimeError('缓存游戏窗口或DPI已变化')
+            point={'x':round(geometry['origin']['x']+cache['x']),
+                   'y':round(geometry['origin']['y']+cache['y'])}
+            control={'label':label,'screenCenter':point}
+        else:
+            size=cache['clientSize']
+            if int(cache['hwnd'],16)!=hwnd or any(
+                    abs(geometry['scale']-cache.get(key,geometry['scale']))>.01 for key in ('scaleX','scaleY')):
+                raise RuntimeError('缓存微信窗口或DPI已变化')
+            old=choose_control(cache,label)
+            control={**old,'screenCenter':{axis:old['screenCenter'][axis]-cache['origin'][axis]+geometry['origin'][axis]
+                                         for axis in ('x','y')}}
+        if geometry['clientSize']!=size:raise RuntimeError('微信尺寸已变化，重新扫描位置')
+        # User-requested optimistic coordinate click; only a failed launch triggers discovery.
+        click_control(user,geometry,control)
+        return {'ok':True,'label':label,'control':control,'cached':True}
     deadline=time.monotonic()+20
     pid=select_wechat_pid(psutil.process_iter(['name','cmdline']),wechat_window_pids(user))
     created=psutil.Process(pid).create_time()

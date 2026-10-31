@@ -12,11 +12,11 @@
 //
 // 边界（与 血月调查与插件设计.md 一致）：
 //   · 只读：不改写角色状态；赶路按配置间隔请求，剩余低于8秒停止。
-//   · 赶路和挑战走游戏原有请求接口，并确认真实回执；请求没确认就报 uncertain，不重试。
-//   · 仅显示客户端已同步的行军数据，保留角色真实状态及原生挑战资格。
+//   · 攻击按实时资格持续发送，回包独立记录；超时或异常不阻塞后续攻击。
+//   · 仅显示客户端已同步数据，不改角色状态；提前窗口允许请求，由服务端判定开战资格。
 
 await (async function () {
-  var g = globalThis, VERSION = '2026-10-24-routes-v17', restored = null;
+  var g = globalThis, VERSION = '2026-10-31-js-runtime-v24', restored = null;
   if (g.e0e1Season) {
     if (g.e0e1Season.version === VERSION) return;
     var previous = await g.e0e1Season.diagnose();
@@ -38,8 +38,13 @@ await (async function () {
     catch (e) { snapshot = { serializationError: String(e), fields: Object.keys(values || {}) }; }
     var row = { step: step, at: Date.now(), values: snapshot };
     if (actionTrace) actionTrace.push(row);
-    // 高频只读扫描保留结构化回执，不重复写入游戏控制台。
-    if (!/^(candidates|march|flags|diagnose)\.(begin|end)$/.test(step)) {
+    if(/^automationEvents\.(begin|end)$/.test(step))return;
+    // Realtime detail is batched back to the file logger, never spammed through console events.
+    if(automation && (automation.config || /^attack\.packet/.test(step))){
+      automationEvent('debug_trace',{step:step,values:snapshot},/exception/.test(step)?'ERROR':'DEBUG');
+      return;
+    }
+    if (!/^(candidates|march|flags|diagnose|automationEvents)\.(begin|end)$/.test(step)) {
       try { g.console.info('[bloodmoon]', JSON.stringify(row)); } catch (e) { }
     }
   }
@@ -56,14 +61,13 @@ await (async function () {
         uncertain: state.uncertain, outstanding: state.outstanding,
         lastAttackAt: state.lastAttackAt, marchKey: state.marchKey, speedTimes: state.speedTimes, battles: state.battles,
         lastSpeedAt: state.lastSpeedAt, finalSpeedAttempted: state.finalSpeedAttempted,
-        attackObservation: state.attackObservation,
         systemPresent: !!g.System, uiPresent: !!g.UIManager, rolePresent: !!g.ROLE,
         modulePresent: !!g.seasonModule, warId: g.seasonModule && g.seasonModule.enteredMapId });
       var result;
       try { result = await fn(args); }
       catch (e) {
         trace(name + '.exception', { message: String(e), stack: e && e.stack });
-        result = bad(String(e), mutating ? 'uncertain' : 'unavailable');
+        result = bad(String(e), name === 'attack' ? 'unavailable' : (mutating ? 'uncertain' : 'unavailable'));
       }
       // Read results already cross the bridge once. Do not deep-copy the whole
       // queue/flag roster into its own trace on every high-frequency poll.
@@ -73,7 +77,8 @@ await (async function () {
         defenseCount: result.defense && result.defense.length,
         groupCount: result.groups && result.groups.length
       } });
-      if (mutating) result.request_sent = !!state.dispatched;
+      if (name === 'attack') result.request_sent = result.request_sent === true;
+      else if (mutating) result.request_sent = !!state.dispatched;
       result.trace = ownTrace.slice();
       if (actionTrace === ownTrace) actionTrace = null;
       return result;
@@ -82,13 +87,21 @@ await (async function () {
   var state = {
     lastSpeedAt: restored ? num(restored.lastSpeedAt) : 0,
     finalSpeedAttempted: restored ? !!restored.finalSpeedAttempted : false,
-    attackObservation: restored ? restored.attackObservation || null : null,
     lastAttackAt: restored ? num(restored.lastAttackAt) : 0,
+    attackSeq: 0,
+    attackWave: 0,
+    attackScope: '',
+    lastBattleIdentity: '',
+    countedBattleKeys: {},
+    attackRequests: [],
+    attackLatencySamples: [],
+    latestTargetRequest: {},
+    lastAttackRejection: null,
     dispatched: false,
     markError: null,
     outstanding: 0,
-    pending: false,        // 有动作在途，禁止并发
-    uncertain: false,      // 上次动作结果未知，停止后续自动动作
+    pending: false,        // 仅用于赶路动作；攻击在途请求不占用此锁。
+    uncertain: false,      // 赶路结果未知标记；不阻止实时校验后的新攻击。
     marks: [],             // 已挂的「隐匿中」节点
     markTimer: null,
     speedTimes: restored ? num(restored.speedTimes) : 0,         // 本次行军已成功加速次数
@@ -117,31 +130,9 @@ await (async function () {
     return lib;
   }
 
-  // The native PvP end notification can arrive between two polling snapshots.
-  // Match our own accepted challenge, never infer completion from elapsed time.
-  var battleSignal = null;
-  function detachBattleObserver() {
-    if (battleSignal) battleSignal.off(onBattleExit, state);
-    battleSignal = null;
-  }
-  function onBattleExit(event) {
-    var observation = state.attackObservation, m = module_(), me = myRole();
-    if (!observation || !event || event.isRobot !== false || event.isMeAtk !== true ||
-        !m || !me || String(m.enteredMapId) !== observation.warId ||
-        num(me.id) !== observation.selfId || num(event.other) !== observation.targetId ||
-        String(event.buildingId) !== observation.buildingId) return;
-    observation.completed = true;
-    detachBattleObserver();
-  }
-  function bindBattleObserver() {
-    if (battleSignal || !state.attackObservation || state.attackObservation.completed) return;
-    var signals = lib.signalMod && lib.signalMod.SeasonMapInnerSignal;
-    var signal = signals && signals.mySeasonRoleExitedBattle;
-    if (signal && typeof signal.on === 'function' && typeof signal.off === 'function') {
-      signal.on(onBattleExit, state);
-      battleSignal = signal;
-    }
-  }
+  // Packet responses never control the scanner. Real role/map state does.
+  function detachBattleObserver() {}
+  function bindBattleObserver() {}
 
   function module_() { return g.seasonModule || null; }
   function mapData() {
@@ -385,8 +376,10 @@ await (async function () {
     state.pending=true;state.dispatched=false;
     try {
       var fresh=await march(args);
+      if(args._automation_epoch!==undefined && args._automation_epoch!==automation.epoch)return {ok:false,status:'waiting',request_sent:false,message:'已停止旧的自动加速循环'};
       if(!fresh.ok)return fresh;
-      if(!fresh.speed_up.available)return bad(fresh.speed_up.reasons.join('；'),'waiting');
+      if(!fresh.speed_up.available)return Object.assign(bad(fresh.speed_up.reasons.join('；'),'waiting'),
+        {wait_ms:Math.max(0,num(fresh.speed_up.cool_down_until)-num(fresh.server_now))});
       var limit=num(args.max_times);
       if(limit>0 && state.speedTimes>=limit)return bad('本次行军赶路已达上限','waiting');
       var fn=lib.defs.SeasonService && lib.defs.SeasonService.moveSpeedUp;
@@ -404,6 +397,8 @@ await (async function () {
       state.lastSpeedAt=now;
       trace('speed.preflight',{warId:fresh.war_id,remaining:remaining,finalAttempt:finalAttempt,
         intervalSeconds:fresh.speed_up.interval_seconds,times:state.speedTimes,limit:limit});
+      if(args._automation_epoch!==undefined)automationEvent('speed_sent',{message:'发起赶路',request_seq:++automation.speedSeq,
+        march_key:state.marchKey,war_id:fresh.war_id,remaining_ms:remaining,interval_seconds:fresh.speed_up.interval_seconds});
       var receipt=await directRequest('moveSpeedUp',{warId:fresh.war_id});
       var failure=checkReceipt(receipt,'赶路');
       if(failure){
@@ -420,17 +415,63 @@ await (async function () {
 
   // ── 只读：当前节点候选 ──
 
+  function battleTimerFor(m, me) {
+    try { return num(me.state) === 3 && typeof m.getTimerByRole === 'function' ? m.getTimerByRole(me, null) : null; }
+    catch (e) { traceException('battle.timer.exception', e); return null; }
+  }
+  function battleKey(m, me) {
+    var timer = battleTimerFor(m, me);
+    try {
+      var battle=typeof m.seasonMapFindBattleByRoleId==='function' && m.seasonMapFindBattleByRoleId(me.id);
+      if(battle && num(battle.startTime)>0)return num(battle.startTime)+':'+num(battle.tId);
+    } catch(error){traceException('battle.identity.exception',error);}
+    return timer && num(timer.startTime)>0 ? String(num(timer.startTime)) :
+      (timer && num(timer.endTime)>0 ? 'end:'+num(timer.endTime) : '');
+  }
+  function latencyNow() {
+    return g.performance && typeof g.performance.now==='function' ? g.performance.now() : Date.now();
+  }
+  function attackLatencyStats() {
+    var now=latencyNow();
+    state.attackLatencySamples=state.attackLatencySamples.filter(function(sample){return now-sample.at<10000;});
+    var count=state.attackLatencySamples.length;
+    var sum=state.attackLatencySamples.reduce(function(total,sample){return total+sample.rtt;},0);
+    return {window_ms:10000,sample_count:count,mean_rtt_ms:count?sum/count:null,
+      mean_one_way_ms:count?sum/count/2:null};
+  }
+  function effectiveAttackLead(args) {
+    var configured=Math.max(0,Math.min(10000,num(args && args.lead_ms)));
+    if(configured===0 || !args || args.dynamic_lead!==true)return configured;
+    var stats=attackLatencyStats();
+    return stats.sample_count ? Math.min(10000,Math.ceil(stats.mean_one_way_ms)) : configured;
+  }
+  function attackContext(m, me, args, now) {
+    var lead = effectiveAttackLead(args), data = mapData();
+    var phase = num(me.state), timer = battleTimerFor(m, me);
+    var move = phase === 2 && data && data.moveInfos && data.moveInfos.get(me.id);
+    var end = phase === 2 ? num(move && move.arrive) : num(timer && timer.endTime);
+    var early = lead > 0 && now > 0 && end > 0 && end - now <= lead && (phase === 2 || phase === 3);
+    var position = early && phase === 2 && move && move.to ? move.to : me.position;
+    return {x:num(position && position.x), y:num(position && position.y), early:early, lead_ms:lead,
+      kind:early ? (phase === 2 ? 'arrival' : 'battle') : '', end:end,
+      battle_key:battleKey(m,me)};
+  }
+
   async function candidates(args) {
-    await libs();
+    await libs();await serverNow(true);
+    return candidateSnapshot(args || {});
+  }
+  function candidateSnapshot(args) {
     var m = module_();
     if (!m) return bad('血月模块尚未初始化');
     var me = myRole();
     if (!me) return bad('当前没有自己的战场角色');
-    var x = num(me.position && me.position.x), y = num(me.position && me.position.y);
+    var clock = num(lib.clock && lib.clock.serverTime), context = attackContext(m, me, args, clock);
+    var x = context.x, y = context.y;
     var snap = null;
-    // Automation only needs state/timing while marching or fighting. Keep the
-    // full queue path for standby selection, diagnostics and final attack guards.
-    try { snap = args && args.compact && num(me.state) !== 1
+    // Outside the lead window busy scans only need timing. Inside it build a
+    // fresh queue at the destination/current node for every attempt.
+    try { snap = args.compact && num(me.state) !== 1 && !context.early
       ? {attackQueue:[], defenseQueue:[]} : m.getBuildingOpSnapshot(x, y);
     } catch (e) { traceException('queue.snapshot.exception', e, {x:x,y:y}); snap = null; }
     if (!snap) return bad('当前节点没有可用的队列快照');
@@ -439,149 +480,339 @@ await (async function () {
     try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { traceException('building.read.exception', e, {x:x,y:y}); building = null; }
     var inMembers = false;
     try { inMembers = !!(building && building.members && building.members.has && building.members.has(me.id)); } catch (e) { traceException('membership.self.exception', e, {roleId:me.id}); inMembers = false; }
-    var mySide = num(me.lId, 0);
+    var mySide = typeof m.getSeasonMapMySideId==='function' ? num(m.getSeasonMapMySideId()) : num(me.lId);
+    if (mySide<=0) mySide=num(me.lId);
     function rows(list) {
       var out = [];
       (list || []).forEach(function (item) {
         var role = item && item.role;
         if (!role) return;
+        var targetMove = data && data.moveInfos && data.moveInfos.get(role.id);
+        var targetLead = context.lead_ms;
+        var approaching=clock>0 && num(role.state)===2 && targetMove && targetMove.to &&
+          num(targetMove.to.x)===x && num(targetMove.to.y)===y && num(targetMove.arrive)>0;
+        var incoming=targetLead>0 && approaching && num(targetMove.arrive)-clock<=targetLead;
+        var arrivalWindow=targetLead>0 && approaching && num(role.id)!==num(me.id) &&
+          !(mySide>0 && num(role.lId)===mySide)?Math.max(0,num(targetMove.arrive)-clock-targetLead):0;
         var reasons = [];
+        if (num(role.id)<=0) reasons.push('无效玩家ID');
         if (num(role.id) === num(me.id)) reasons.push('自己');
         if (mySide > 0 && num(role.lId, 0) === mySide) reasons.push('同阵营');
-        if (num(me.state) !== 1) reasons.push('自己不是待命状态');
-        if (!inMembers) reasons.push('自己不在此节点驻留');
+        if (num(me.state) !== 1 && !context.early) reasons.push('自己不是待命状态');
+        if (!inMembers && context.kind !== 'arrival') reasons.push('自己不在此节点驻留');
         var inBuilding = false;
         try { inBuilding = !!(building && building.members && building.members.has && building.members.has(role.id)); } catch (e) { traceException('membership.target.exception', e, {roleId:role.id}); inBuilding = false; }
-        if (!inBuilding) reasons.push('目标不在此节点驻留');
-        if (num(role.state) === 2 || num(item.arriveAt) > 0) reasons.push('目标正在行军');
+        if (!inBuilding && !incoming) reasons.push('目标不在此节点驻留');
+        if (!incoming && (num(role.state) === 2 || num(item.arriveAt) > clock)) reasons.push('目标正在行军');
         // 隐匿只作为展示信息：可见队列里的目标能不能打，仍按上面的公开资格判断。
         out.push({
           roleId: num(role.id), name: role.name || '', power: num(role.power),
           planPower: Array.isArray(role.planPower) ? num(role.planPower[0]) : 0,
           legionId: num(role.lId), flagId: num(role.flagId), flag: flagName(role.flagId),
           state: num(role.state), stateName: stateName(role.state), stealth: isStealth(role),
-          arriveAt: num(item.arriveAt), attackable: reasons.length === 0, reasons: reasons
+          arriveAt: num(item.arriveAt), attackable: reasons.length === 0, reasons: reasons,
+          arrival_window_ms:arrivalWindow,incoming:!!incoming, retry_deferred:!!state.lastAttackRejection && state.lastAttackRejection.roleId===num(role.id)
         });
       });
       return out;
     }
-    var battleTimer = null;
-    if (num(me.state) === 3 && typeof m.getTimerByRole === 'function') {
-      try { battleTimer = m.getTimerByRole(me, null); } catch (e) { traceException('battle.timer.exception',e); }
-    }
-    var observation=state.attackObservation;
-    if(observation && observation.accepted && !observation.completed &&
-        String(m.enteredMapId)===observation.warId && num(me.id)===observation.selfId){
-      if(num(me.state)===3)observation.seenBattle=true;
-      if(observation.seenBattle && num(me.state)===1){observation.completed=true;detachBattleObserver();}
-    }
-    var clock = await serverNow(true);
+    var battleTimer = battleTimerFor(m, me);
+    var enteredBattle = observeAttackPhase(m, me, context);
     return done({
       server_now: clock, battle_end_time: battleTimer ? num(battleTimer.endTime) : 0,
+      march_end_time:num(me.state)===2 ? context.end : 0, battle_key:context.battle_key,
+      early_attack:context.early, early_kind:context.kind,
+      effective_lead_ms:context.lead_ms, attack_latency:attackLatencyStats(),
       node: { x: x, y: y }, in_members: inMembers, self_state: num(me.state),
       self_state_name: stateName(me.state), self_power: num(me.power),
       self_plan_power: Array.isArray(me.planPower) ? num(me.planPower[0]) : 0,
       attack: rows(snap.attackQueue), defense: rows(snap.defenseQueue),
-      battles: state.battles, attack_observation: state.attackObservation
+      battles: state.battles, entered_battle: enteredBattle, attack_wave: state.attackWave,
+      latest_request_seq: state.attackSeq, attack_last_rejection: state.lastAttackRejection,
+      attack_requests: state.attackRequests.slice(-16).map(function(row){return Object.assign({},row);})
     });
   }
 
   // ── 动作：正常挑战 ──
 
+  function observeAttackPhase(m, me, context) {
+    var identity = String(m.enteredMapId)+':'+num(me.id)+':'+context.x+'_'+context.y;
+    var phase = num(me.state), scope = identity+':'+phase;
+    if (phase===3) scope+=':'+context.battle_key;
+    if (scope!==state.attackScope) {
+      state.attackScope=scope;state.attackWave++;
+      state.lastAttackRejection=null;
+    }
+    var key=phase===3 ? identity+':'+(context.battle_key || 'phase-'+state.attackWave) : '';
+    var entered=!!key && key!==state.lastBattleIdentity;
+    if (entered && !state.countedBattleKeys[key] && state.attackRequests.some(function(row){
+      return row.warId===String(m.enteredMapId) && row.selfId===num(me.id);
+    })) { state.countedBattleKeys[key]=true;state.battles++; }
+    state.lastBattleIdentity=key;
+    return entered;
+  }
+
+  function dispatchAttack(m, me, fresh, roleId) {
+    var sentTick=latencyNow();
+    var sequence=++state.attackSeq, wave=state.attackWave;
+    state.lastAttackRejection=null;
+    var record={request_id:String(m.enteredMapId)+':'+num(me.id)+':'+sequence,
+      seq:sequence,wave:wave,warId:String(m.enteredMapId),selfId:num(me.id),roleId:roleId,
+      node:fresh.node.x+'_'+fresh.node.y,sent_at:Date.now(),status:'sent',finished:false};
+    state.attackRequests.push(record);
+    if(state.attackRequests.length>128)state.attackRequests.shift();
+    state.latestTargetRequest[roleId]=sequence;
+    state.lastAttackAt=record.sent_at;
+    state.outstanding++;
+    var timer=setTimeout(function(){
+      if(!record.finished){record.status='timeout';trace('attack.packetTimeout',record);
+        if(automation && automation.config)automationEvent('challenge_timeout',{request_seq:record.seq,roleId:record.roleId,stopped:false},'WARNING');}
+    },8000);
+    function settle(value, error) {
+      if(record.finished)return;
+      record.finished=true;clearTimeout(timer);state.outstanding--;
+      var late=record.status==='timeout';record.settled_at=Date.now();
+      if(!error && value && Object.prototype.hasOwnProperty.call(value,'err') &&
+          (value.err===null || value.err)){
+        var receivedTick=latencyNow();
+        record.rtt_ms=Math.max(0,receivedTick-sentTick);
+        state.attackLatencySamples.push({at:receivedTick,rtt:record.rtt_ms});
+        attackLatencyStats();
+      }
+      if(error){record.status='network_error';record.message=String(error);}
+      else if(!value || !Object.prototype.hasOwnProperty.call(value,'err') || value.err===undefined){
+        record.status='malformed';
+      } else if(value.err){
+        record.status=late?'late_rejected':'rejected';record.message=String(value.err.error || value.err.code || value.err);
+        // A reply from an earlier wave/request cannot rewrite newer selection.
+        if(wave===state.attackWave && sequence===state.attackSeq && state.latestTargetRequest[roleId]===sequence){
+          if(sequence===state.attackSeq)state.lastAttackRejection={seq:sequence,wave:wave,roleId:roleId};
+        }
+      } else if(value.err===null)record.status=late?'late_accepted':'accepted';
+      else record.status='malformed';
+      trace('attack.packetReceipt',record);
+      if(automation && automation.config && (record.status==='network_error' || record.status==='malformed'))
+        automationEvent('challenge_error',{request_seq:record.seq,roleId:record.roleId,status:record.status,message:record.message,stopped:false},'ERROR');
+    }
+    try {
+      Promise.resolve(m.startPVPBattle({targetId:roleId,warId:m.enteredMapId})).then(
+        function(value){settle(value,null);},function(error){settle(null,error);});
+    } catch(error){settle(null,error);}
+    // This acknowledges dispatch only. It never awaits the game's response.
+    return done({dispatched:true,request_sent:true,request_id:record.request_id,
+      request_seq:sequence,attack_wave:wave,roleId:roleId,battles:state.battles});
+  }
+
   async function attack(args) {
     args = args || {};
     var roleId = num(args.roleId, 0);
-    if (state.pending) return bad('上一条命令尚未结束', 'uncertain');
-    if (state.uncertain) return bad('前次操作结果未知，已停止自动操作', 'uncertain');
-    if (!roleId) return bad('缺少目标 roleId', 'rejected');
-    state.pending = true; state.dispatched = false;
+    if (roleId<=0) return bad('缺少有效目标 roleId', 'waiting');
     try {
-      await libs();
-      var m = module_();
-      if (!m) return bad('血月模块尚未初始化');
-      var me = myRole();
-      if (!me) return bad('当前没有自己的战场角色');
-      var warId = m.enteredMapId;
-      var x = num(me.position && me.position.x), y = num(me.position && me.position.y);
-      var snap = null;
-      try { snap = m.getBuildingOpSnapshot(x, y); } catch (e) { traceException('queue.snapshot.exception', e, {x:x,y:y}); snap = null; }
-      if (!snap) return bad('当前节点没有可用的队列快照', 'waiting');
-      var data = mapData(), building = null;
-      try { building = data && data.buildings ? data.buildings.get(x + '_' + y) : null; } catch (e) { traceException('building.read.exception', e, {x:x,y:y}); building = null; }
-      var hasMe = false, hasTarget = false;
-      try { hasMe = !!(building && building.members && building.members.has(me.id)); } catch (e) { traceException('membership.self.exception', e, {roleId:me.id}); }
-      try { hasTarget = !!(building && building.members && building.members.has(roleId)); } catch (e) { traceException('membership.target.exception', e, {roleId:roleId}); }
-      if (!hasMe) return bad('自己不在此节点驻留，不发起挑战', 'waiting');
-      if (!hasTarget) return bad('目标不在此节点驻留，不发起挑战', 'waiting');
-      if (num(me.state) !== 1) return bad('自己不是待命状态（' + stateName(me.state) + '）', 'waiting');
-      var target = null, tab = 0;
-      [['attackQueue', 0], ['defenseQueue', 1]].forEach(function (pair) {
-        if (target) return;
-        ((snap[pair[0]] || [])).forEach(function (item) {
-          if (target || !item || !item.role) return;
-          if (num(item.role.id) === roleId) { target = item.role; tab = pair[1]; }
-        });
-      });
-      if (!target) return bad('目标不在当前可见队列里，不发起挑战', 'waiting');
-      var side = num(me.lId, 0);
-      if (side > 0 && num(target.lId, 0) === side) return bad('目标与己方同阵营，不发起挑战', 'waiting');
-      trace('attack.preflight', { roleId: roleId, args: args, warId: m.enteredMapId, me: me, target: target, hasMe: hasMe, hasTarget: hasTarget, side: side, tab: tab });
-      // Use the game module's eligibility method; no queue UI module or instance.
+      // The bridge may have taken time since Python selected the role. Read
+      // one current local snapshot here; validation and dispatch below are synchronous.
+      var fresh = await candidates({lead_ms:num(args.lead_ms),dynamic_lead:args.dynamic_lead===true});
+      if (!fresh.ok) return fresh;
+      if (fresh.entered_battle) return bad('已进入新战斗，结束本轮发送','battle_started');
+      var m = module_(), me = myRole();
+      if (!m || !me) return bad('当前没有可用的战场角色','waiting');
       if (typeof m.canAttack !== 'function' || typeof m.startPVPBattle !== 'function')
-        return bad('原生挑战接口或资格函数不可用，未发送', 'unavailable');
-      var fresh = await candidates();
+        return bad('原生挑战接口或资格函数不可用，未发送','unavailable');
+      var x = fresh.node.x, y = fresh.node.y;
       var current = (fresh.attack || []).concat(fresh.defense || []).find(function (r) { return r.roleId === roleId; });
       var mine = num(fresh.self_plan_power) || num(fresh.self_power);
       var power = current && (num(current.planPower) || num(current.power));
       var ceiling = num(args.power_limit) > 0 ? Math.min(mine, num(args.power_limit)) : mine;
-      var role = mapData() && mapData().roles && mapData().roles.get(roleId);
-      if (!fresh.ok || !fresh.node || fresh.node.x !== x || fresh.node.y !== y ||
-          String(m.enteredMapId) !== String(warId) || !current || !current.attackable ||
-          mine <= 0 || power <= 0 || power >= ceiling || !role || !m.canAttack(x, y, role))
+      var data = mapData(), role = data && data.roles && data.roles.get(roleId);
+      if (!current || !current.attackable ||
+          mine <= 0 || power <= 0 || power >= ceiling || !role || roleId===num(me.id) ||
+          (fresh.early_kind !== 'arrival' && !current.incoming && !m.canAttack(x, y, role)))
         return bad('当前节点、目标资格或战力已变化，未发送', 'waiting');
-      if (state.attackObservation && state.attackObservation.accepted && !state.attackObservation.completed)
-        return bad('上一场挑战尚未确认结束', 'waiting');
-      var params = {targetId:roleId, warId:warId};
-      state.lastAttackAt = Date.now();
-      detachBattleObserver();
-      state.attackObservation = { token: String(state.lastAttackAt) + ':' + String(state.battles + 1),
-        warId: String(warId), selfId: num(me.id), targetId: roleId,
-        buildingId: x + '_' + y, completed: false };
-      bindBattleObserver();
-      state.dispatched = true; state.outstanding++;
-      trace('attack.directRequest', {params:params});
-      var pending;
-      try { pending = Promise.resolve(m.startPVPBattle(params)); }
-      catch (e) { state.outstanding--; throw e; }
-      var settled = pending.then(function (value) { state.outstanding--; return value; },
-        function (error) { state.outstanding--; throw error; });
-      var response = await new Promise(function (resolve, reject) {
-        var timer = setTimeout(function () { reject(new Error('挑战请求超时，结果未知')); },8000);
-        settled.then(function(value){clearTimeout(timer);resolve(value);},
-          function(error){clearTimeout(timer);reject(error);});
-      });
-      trace('attack.directReceipt', {response:response});
-      var error = response && response.err;
-      var code = error && (num(error.code) || num(error._raw && error._raw.code));
-      if (code === 350018) return {ok:false,status:'target_unavailable',roleId:roleId,
-        retry_after_ms:1000,message:'目标正在行军，暂缓此目标并继续扫描当前节点'};
-      var failure = checkReceipt({called:true,settled:true,count:1,error:'',value:response}, '挑战');
-      if (failure) {
-        if (failure.status === 'rejected') return {ok:false,status:'retry_later',roleId:roleId,
-          retry_after_ms:1000,message:failure.message};
-        return failure;
-      }
-      state.attackObservation.accepted = true;
-      state.battles += 1;
-      return done({ confirmed: true, roleId: roleId, name: target.name || '', tab: tab, battles: state.battles, mode:'direct',
-        attack_token: state.attackObservation.token });
-    } catch (e) {
-      trace('action.exception', {message: String(e), stack: e && e.stack, outstanding: state.outstanding});
-      return bad((e && e.message) || e, (e && e.status) || (state.dispatched ? 'uncertain' : 'unavailable'));
-    } finally {
-      state.pending = false;
+      if (current.incoming && (fresh.attack || []).concat(fresh.defense || []).some(function(row){
+        var p=num(row.planPower)||num(row.power);
+        return !row.incoming && row.attackable && p>0 && p<ceiling;
+      })) return bad('已有当前可攻击玩家，重新选敌，不锁定即将到达者', 'waiting');
+      if (current.retry_deferred && (fresh.attack || []).concat(fresh.defense || []).some(function(row){
+        var p=num(row.planPower)||num(row.power);
+        return !row.retry_deferred && (!row.incoming || current.incoming) && row.attackable && p>0 && p<ceiling;
+      })) return bad('优先尝试其他合格玩家，重新选敌', 'waiting');
+      return dispatchAttack(m,me,fresh,roleId);
+    } catch(error) {
+      traceException('attack.preflightException',error,{roleId:roleId});
+      return {ok:false,status:'unavailable',request_sent:false,message:String(error)};
     }
   }
+
+  // Timers, selection and dispatch live entirely in the game context.
+  var automation = {stream:VERSION+':'+Date.now()+':'+Math.random().toString(36).slice(2),epoch:0, revision:-1, controller:null, controllers:{}, config:null, attackTimer:null, speedTimer:null,
+    lastAttack:-Infinity, wave:null, target:null, attackStatus:'未启用', speedStatus:'未启用',
+    speedBusy:false, speedSeq:0, speedStopped:'', eventSeq:0, events:[], keys:{}, lastDebug:-Infinity};
+
+  function automationEvent(kind, detail, level) {
+    var key=JSON.stringify(detail || {});
+    if(automation.keys[kind]===key)return;
+    automation.keys[kind]=key;
+    automation.events.push({seq:++automation.eventSeq,at:Date.now(),kind:kind,level:level || 'INFO',detail:detail || {}});
+    if(automation.events.length>4096)automation.events.shift();
+  }
+  function automationStatus(channel, status) {
+    automation[channel+'Status']=status;
+    automationEvent(channel+'_state',{status:status},/等待|剩余|道具不足/.test(status)?'DEBUG':'INFO');
+  }
+  function stopAutomation(reason) {
+    if(automation.config)automationEvent('automation_stopped',{reason:reason || '配置变更',attack:automation.config.attack.enabled,speed:automation.config.speed_up.enabled});
+    automation.epoch++;
+    if(automation.attackTimer!==null)clearTimeout(automation.attackTimer);
+    if(automation.speedTimer!==null)clearTimeout(automation.speedTimer);
+    automation.attackTimer=automation.speedTimer=null;
+    automation.config=null;
+    automation.target=null;
+    automationStatus('attack','未启用');automationStatus('speed','未启用');
+  }
+  function automationEvents(args) {
+    var after=args && args.stream_id && args.stream_id!==automation.stream?0:num(args && args.after_seq), config=automation.config;
+    var batch=automation.events.filter(function(e){return e.seq>after;}).slice(0,512);
+    return done({stream_id:automation.stream,revision:automation.revision, running:!!(config && (config.attack.enabled || config.speed_up.enabled)),
+      events:batch, cursor:batch.length?batch[batch.length-1].seq:automation.eventSeq,
+      dropped:automation.events.length?Math.max(0,automation.events[0].seq-after-1):0,
+      attack_status:automation.attackStatus,speed_status:automation.speedStatus,
+      battles:state.battles, speed_times:state.speedTimes,
+      attack_latency:attackLatencyStats(),effective_lead_ms:config?effectiveAttackLead(config.attack):0});
+  }
+  function pickAttackTarget(snapshot, args) {
+    var mine=num(snapshot.self_plan_power)||num(snapshot.self_power), limit=num(args.power_limit);
+    var ceiling=limit>0?Math.min(mine,limit):mine;
+    if(mine<=0)return null;
+    var m=module_(), data=mapData(), best=null, bestRank=null;
+    if(!m || typeof m.canAttack!=='function' || typeof m.startPVPBattle!=='function')return null;
+    (snapshot.attack || []).concat(snapshot.defense || []).forEach(function(row){
+      var power=num(row.planPower)||num(row.power),role=data && data.roles && data.roles.get(row.roleId);
+      if(!row.attackable || power<=0 || power>=ceiling || !role)return;
+      try {if(snapshot.early_kind!=='arrival' && !row.incoming && !m.canAttack(snapshot.node.x,snapshot.node.y,role))return;}
+      catch(error){automationEvent('eligibility_error',{roleId:row.roleId,message:String(error)},'ERROR');return;}
+      var rank=[row.incoming?1:0,row.retry_deferred?1:0,args.lowest_power_first?power:-power];
+      if(!bestRank || rank[0]<bestRank[0] || (rank[0]===bestRank[0] &&
+          (rank[1]<bestRank[1] || (rank[1]===bestRank[1] && rank[2]<bestRank[2])))){
+        best=row;bestRank=rank;
+      }
+    });
+    return best;
+  }
+  function attackTick(epoch) {
+    if(epoch!==automation.epoch || !automation.config || !automation.config.attack.enabled)return;
+    automation.attackTimer=null;
+    var args=automation.config.attack, delay=Math.min(100,args.interval_ms);
+    try {
+      // One synchronous local snapshot, selection and dispatch: no bridge or await.
+      var snapshot=candidateSnapshot(Object.assign({compact:true},args));
+      if(!snapshot.ok){automationStatus('attack','等待战场数据');return;}
+      if(latencyNow()-automation.lastDebug>=1000){
+        automation.lastDebug=latencyNow();
+        var rows=(snapshot.attack || []).concat(snapshot.defense || []);
+        automationEvent('attack_scan',{node:snapshot.node,self_state:snapshot.self_state,lead_ms:snapshot.effective_lead_ms,
+          self_power:num(snapshot.self_plan_power)||num(snapshot.self_power),count:rows.length,
+          sample:rows.slice(0,32).map(function(r){return {roleId:r.roleId,power:r.planPower||r.power,
+            incoming:r.incoming,attackable:r.attackable,reasons:r.reasons};})},'DEBUG');
+      }
+      if(automation.wave!==snapshot.attack_wave){
+        automation.wave=snapshot.attack_wave;automation.lastAttack=-Infinity;automation.target=null;
+      }
+      if(snapshot.entered_battle){
+        automationEvent('battle_entered',{battles:state.battles,battle_key:snapshot.battle_key});
+        automationStatus('attack','已进入战斗');return;
+      }
+      if(snapshot.self_state!==1 && !snapshot.early_attack){
+        var end=num(snapshot.battle_end_time)||num(snapshot.march_end_time);
+        var remaining=end-num(snapshot.server_now)-snapshot.effective_lead_ms;
+        if(remaining>0)delay=Math.min(delay,remaining);
+        automationStatus('attack','等待'+(snapshot.self_state_name || '状态变化')+'的提前窗口');return;
+      }
+      if(args.max_battles>0 && state.battles>=args.max_battles){
+        automationStatus('attack','已达单轮上限 '+args.max_battles+' 场');return;
+      }
+      var now=latencyNow(), due=automation.lastAttack+args.interval_ms-now;
+      if(due>0){delay=Math.min(delay,due);return;}
+      var target=pickAttackTarget(snapshot,args);
+      if(!target){
+        var mine=num(snapshot.self_plan_power)||num(snapshot.self_power);
+        var cap=args.power_limit>0?Math.min(mine,args.power_limit):mine;
+        (snapshot.attack || []).concat(snapshot.defense || []).forEach(function(r){
+          var power=num(r.planPower)||num(r.power);
+          if(r.arrival_window_ms>0 && power>0 && power<cap)delay=Math.min(delay,r.arrival_window_ms);
+        });
+      }
+      if(!target){automation.target=null;automationStatus('attack','当前没有合法目标，持续扫描');return;}
+      if(automation.target!==target.roleId){
+        automation.target=target.roleId;
+        automationEvent('target_changed',{roleId:target.roleId,name:target.name,incoming:target.incoming});
+      }
+      var receipt=dispatchAttack(module_(),myRole(),snapshot,target.roleId);
+      automation.lastAttack=now;
+      automationEvent('challenge_sent',{message:'发起挑战',request_seq:receipt.request_seq,roleId:target.roleId,
+        name:target.name,power:target.planPower||target.power,node:snapshot.node,incoming:target.incoming,
+        early_kind:snapshot.early_kind,lead_ms:snapshot.effective_lead_ms,interval_ms:args.interval_ms});
+      automationStatus('attack','持续挑战 '+target.roleId+'；间隔 '+args.interval_ms+'ms');
+      delay=Math.min(100,args.interval_ms);
+    } catch(error){automationStatus('attack','扫描异常，继续重试');automationEvent('attack_error',{message:String(error),stack:error && error.stack,stopped:false},'ERROR');}
+    finally {
+      if(epoch===automation.epoch && automation.config && automation.config.attack.enabled)
+        automation.attackTimer=setTimeout(function(){attackTick(epoch);},Math.max(1,Math.ceil(delay)));
+    }
+  }
+  async function speedTick(epoch) {
+    if(epoch!==automation.epoch || !automation.config || !automation.config.speed_up.enabled)return;
+    automation.speedTimer=null;
+    if(automation.speedBusy){automation.speedTimer=setTimeout(function(){speedTick(epoch);},100);return;}
+    automation.speedBusy=true;
+    var delay=100;
+    try {
+      if(automation.speedStopped){automationStatus('speed','已停止：'+automation.speedStopped);return;}
+      var args=automation.config.speed_up;
+      // The native action reads local march state once; no Python call or extra preflight.
+      var result=await speedUp(Object.assign({_automation_epoch:epoch},args));
+      if(epoch!==automation.epoch)return;
+      if(result.wait_ms>0)delay=Math.min(100,result.wait_ms);
+      if(result.confirmed){automationEvent('speed_succeeded',{times:state.speedTimes,march_key:state.marchKey});automationStatus('speed','已加速 '+state.speedTimes+' 次');}
+      else if(!result.ok && result.status!=='waiting' && result.status!=='retry_later' &&
+          !(result.status==='unavailable' && !state.dispatched)){
+        automation.speedStopped=result.message || result.status;
+        automationEvent('speed_stopped',{reason:automation.speedStopped,march_key:state.marchKey,times:state.speedTimes,stopped:true},'ERROR');
+      } else automationStatus('speed',result.message || '等待赶路条件');
+    } catch(error){automationEvent('speed_error',{message:String(error),stack:error && error.stack,stopped:false},'ERROR');}
+    finally {
+      automation.speedBusy=false;
+      if(epoch===automation.epoch && automation.config && automation.config.speed_up.enabled)
+        automation.speedTimer=setTimeout(function(){speedTick(epoch);},Math.max(1,Math.ceil(delay)));
+    }
+  }
+  async function automationConfigure(args) {
+    args=args || {};
+    var controller=String(args.controller || 'local');
+    if(controller!==automation.controller){
+      if(automation.controllers[controller])return automationEvents(args);
+      automation.controllers[controller]=true;automation.controller=controller;automation.revision=-1;
+    }
+    if(num(args.revision)<automation.revision)return automationEvents(args);
+    var a=args.attack || {},s=args.speed_up || {};
+    var config={attack:{enabled:!!args.enabled && !!a.enabled,lead_ms:num(a.lead_ms,400),
+      dynamic_lead:a.dynamic_lead===true,interval_ms:Math.max(1,Math.min(10000,num(a.interval_ms,200))),
+      power_limit:num(a.power_limit),max_battles:num(a.max_battles),lowest_power_first:a.lowest_power_first===true},
+      speed_up:{enabled:!!args.enabled && !!s.enabled,max_times:num(s.max_times),interval_seconds:num(s.interval_seconds)}};
+    automation.revision=num(args.revision);
+    if(JSON.stringify(config)===JSON.stringify(automation.config))return automationEvents(args);
+    var previousLast=automation.lastAttack;
+    stopAutomation();
+    var epoch=automation.epoch;
+    automation.config=config;automation.lastAttack=previousLast;
+    automationEvent('configured',{attack:config.attack,speed_up:config.speed_up});
+    if(!config.attack.enabled && !config.speed_up.enabled)return automationEvents(args);
+    try {await libs();await serverNow(true);}
+    catch(error){if(epoch===automation.epoch){automationEvent('initialization_error',{message:String(error),stopped:true},'ERROR');stopAutomation('初始化异常');}throw error;}
+    if(epoch!==automation.epoch)return automationEvents(args);
+    if(config.attack.enabled)attackTick(epoch);
+    if(config.speed_up.enabled)speedTick(epoch);
+    return automationEvents(args);
+  }
+
 
   // ── 隐匿显示：原生队列头像、行军路线及状态标注 ──
 
@@ -750,6 +981,7 @@ await (async function () {
                    MarchSpeedUpMinTime: num(conf.MarchSpeedUpMinTime, 0),
                    MarchSpeedUpItem: conf.MarchSpeedUpItem || null, PreEnterMinutes: num(conf.PreEnterMinutes, 0) },
       pending: state.pending, uncertain: state.uncertain, outstanding: state.outstanding,
+      attack_latency:attackLatencyStats(),
       marks_enabled: !!state.markTimer, mark_count: state.marks.length,
       routes_enabled: !!revealHelper && revealHelper.shouldHideStealthMarch === revealHideMarch,
       rendered_marches: marchScene && marchScene._flyFishManager && marchScene._flyFishManager._flyFishMap
@@ -759,6 +991,8 @@ await (async function () {
   }
 
   function stop() {
+    stopAutomation('用户停用或会话关闭');
+    state.attackWave++;state.attackScope='';state.lastAttackRejection=null;
     ++marksEpoch;
     if (state.markTimer) { clearInterval(state.markTimer); state.markTimer = null; }
     clearMarks();
@@ -769,12 +1003,16 @@ await (async function () {
   function reset() {
     if (state.pending || state.outstanding) return bad('仍有操作或请求在途，不能复位', 'uncertain');
     state.uncertain = false; state.speedTimes = 0; state.marchKey = ''; state.battles = 0; state.finalSpeedAttempted = false;
-    detachBattleObserver(); state.attackObservation = null;
+    state.attackWave++;state.attackScope='';state.lastBattleIdentity='';
+    state.countedBattleKeys={};state.lastAttackRejection=null;
+    automation.speedStopped='';automation.lastAttack=-Infinity;
+    detachBattleObserver();
     return done({ reset: true });
   }
 
   g.e0e1Season = { ready: true, version: VERSION, detachBattleObserver: detachBattleObserver, pendingState: function(){return {pending:state.pending,uncertain:state.uncertain,outstanding:state.outstanding};} };
   var methods = { flags: flags, march: march, speedUp: speedUp, candidates: candidates,
+    automationConfigure:automationConfigure, automationEvents:automationEvents,
     attack: attack, marks: marks, diagnose: diagnose, stop: stop, reset: reset };
   Object.keys(methods).forEach(function (name) { g.e0e1Season[name] = exportCall(name, methods[name]); });
   log('血月战场脚本已就绪：战旗探测/加速/挑战/隐匿状态标注');

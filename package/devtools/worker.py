@@ -2285,6 +2285,10 @@ class AsyncDevtoolsWorker:
 
     def handle_bridge_status(self, status: dict) -> None:
         """把 bridge 连通性变化合并进全局调试状态。"""
+        diagnostic = status.get('hook_diagnostic')
+        if isinstance(diagnostic, dict):
+            self.emit({'type': 'hook_diagnostic', 'payload': dict(diagnostic)})
+            return
         previous_miniapp_connected = bool(self.state.get("miniapp"))
         next_miniapp_connected = bool(status.get("miniapp", False))
         owner_key = str(self.state.get("owner_key") or "")

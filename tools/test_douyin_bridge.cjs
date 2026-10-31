@@ -42,6 +42,11 @@ function command(id,action,args={},extra={}){files.set(base+'command.json',JSON.
   context.ROLE={heroId:789};pulse();assert.equal(state().player_id,'789');
   context.ROLE={};pulse();assert.equal(state().player_id,'');
   command('install','install',{id:'resident'});await tick();assert.equal(response().value.resident_id,'resident');
+  context.e0e1Season={automationConfigure:args=>({ok:true,enabled:args.enabled}),automationEvents:()=>({ok:true,events:[]})};
+  command('season-config','season-call',{name:'automationConfigure',payload:{enabled:true}});await tick();
+  assert.equal(response().value.enabled,true);
+  command('season-events','season-call',{name:'automationEvents'});await tick();
+  assert.deepEqual(JSON.parse(JSON.stringify(response().value.events)),[]);
   command('one','call',{id:'resident',op:'count'});await tick();
   assert.equal(response().value.value,42);assert.equal(context.executed,1);
   await tick();assert.equal(context.executed,1,'same command never executes twice');

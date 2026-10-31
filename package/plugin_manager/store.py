@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -95,7 +96,8 @@ def default_config() -> dict:
                           "speed_up": {"enabled": False, "max_times": 15,
                                        "safety_margin_seconds": 0, "poll_seconds": 2, "interval_seconds": 0},
                           "attack": {"enabled": False, "power_ratio": 100, "power_limit": 0,
-                                     "max_battles": 20, "wait_seconds": 0},
+                                     "max_battles": 20, "wait_seconds": 0, "lowest_power_first": False,
+                                     "lead_ms": 400, "dynamic_lead": False, "interval_ms": 200},
                           "stealth_mark": {"enabled": False}}}
 
 
@@ -285,15 +287,26 @@ def _validate_bloodmoon(raw) -> dict:
         raise ValueError("bloodmoon.speed_up 只接受 enabled/max_times/safety_margin_seconds/poll_seconds/interval_seconds")
     if type(speed["enabled"]) is not bool:
         raise ValueError("bloodmoon.speed_up.enabled 必须是布尔开关")
-    for label, low, high in (("max_times", 0, 99), ("safety_margin_seconds", 0, 60), ("poll_seconds", 1, 60), ("interval_seconds", 0, 3600)):
+    for label, low, high in (("max_times", 0, 99), ("safety_margin_seconds", 0, 60), ("poll_seconds", 1, 60)):
         value = speed[label]
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"bloodmoon.speed_up.{label} 必须是{low}至{high}的整数")
+    interval = speed["interval_seconds"]
+    if type(interval) not in (int, float) or not 0 <= interval <= 3600 or not math.isfinite(interval):
+        raise ValueError("bloodmoon.speed_up.interval_seconds 必须是0至3600的有限数值（秒，支持小数）")
     attack = merged["attack"]
-    if not isinstance(attack, dict) or set(attack) - {"enabled", "power_ratio", "power_limit", "max_battles", "wait_seconds"}:
-        raise ValueError("bloodmoon.attack 只接受 enabled/power_ratio/power_limit/max_battles/wait_seconds")
+    if not isinstance(attack, dict) or set(attack) - {"enabled", "power_ratio", "power_limit", "max_battles", "wait_seconds", "lowest_power_first", "lead_ms", "dynamic_lead", "interval_ms"}:
+        raise ValueError("bloodmoon.attack 只接受 enabled/power_ratio/power_limit/max_battles/wait_seconds/lowest_power_first/lead_ms/dynamic_lead/interval_ms")
     if type(attack["enabled"]) is not bool:
         raise ValueError("bloodmoon.attack.enabled 必须是布尔开关")
+    if type(attack["lowest_power_first"]) is not bool:
+        raise ValueError("bloodmoon.attack.lowest_power_first 必须是布尔开关")
+    if type(attack["interval_ms"]) is not int or not 1 <= attack["interval_ms"] <= 10000:
+        raise ValueError("bloodmoon.attack.interval_ms 必须是1至10000的整数毫秒")
+    if type(attack["dynamic_lead"]) is not bool:
+        raise ValueError("bloodmoon.attack.dynamic_lead 必须是布尔开关")
+    if type(attack["lead_ms"]) is not int or not 0 <= attack["lead_ms"] <= 10000:
+        raise ValueError("bloodmoon.attack.lead_ms 必须是0至10000的整数毫秒（0关闭提前尝试）")
     if type(attack["power_ratio"]) is not int or not 10 <= attack["power_ratio"] <= 200:
         raise ValueError("自动攻击战力比例必须是10至200的整数百分数")
     if type(attack["power_limit"]) is not int or not 0 <= attack["power_limit"] <= BLOODMOON_POWER_MAX:

@@ -154,6 +154,21 @@ class DebugEngine:
             self.status["miniapp_epoch"] = int(self.status.get("miniapp_epoch") or 0) + 1
         self._notify_status("miniapp", bool(value))
 
+    def _emit_hook_diagnostic(self, payload: dict) -> None:
+        """Forward launch diagnostics to the UI process without replacing link state."""
+        def publish():
+            snapshot = {**self.status, 'hook_diagnostic': dict(payload)}
+            for callback in self._status_callbacks:
+                try:
+                    callback(snapshot)
+                except Exception:
+                    pass
+        loop = getattr(self, '_frida_loop', None)
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(publish)
+        else:
+            publish()
+
     def _fail_pending_miniapp_responses(self) -> None:
         """稳定断连后统一失败所有等待中的 CDP 请求。"""
         for future in list(self._pending_responses.values()):
@@ -332,6 +347,7 @@ class DebugEngine:
             nonlocal scripts_injected
             engine.miniapp_clients.add(websocket)
             engine.miniapp_connection.mark_connected()
+            engine._emit_hook_diagnostic({'event': 'miniapp-connected', 'level': 'info'})
             logger.info("[miniapp] miniapp client connected")
 
             if userscripts and not scripts_injected:
@@ -433,6 +449,7 @@ class DebugEngine:
                 logger.error(f"[miniapp] miniapp client err: {exc}")
             finally:
                 engine.miniapp_clients.discard(websocket)
+                engine._emit_hook_diagnostic({'event': 'miniapp-disconnected', 'level': 'info'})
                 if not engine.miniapp_clients:
                     engine.handle_last_miniapp_socket_closed()
                 logger.info("[miniapp] miniapp client disconnected")
@@ -683,10 +700,18 @@ class DebugEngine:
         session = None
         script = None
 
-        def on_message(message, data) -> None:
+        def on_message(message, data, pid=None) -> None:
             """接收 Frida 脚本消息并转发到 worker 日志。"""
             if message.get("type") == "error":
                 logger.error("[frida client]", message)
+                self._emit_hook_diagnostic({'event': 'script-error', 'level': 'error', 'pid': pid,
+                    'message': str(message.get('stack') or message.get('description') or message)})
+                return
+            payload = message.get('payload')
+            if message.get('type') == 'send' and isinstance(payload, dict) and payload.get('type') == 'e0e1-hook-diagnostic':
+                diagnostic = {key: value for key, value in payload.items() if key != 'type'}
+                diagnostic['pid'] = pid
+                self._emit_hook_diagnostic(diagnostic)
                 return
             logger.frida_debug("[frida client]", message.get("payload", ""))
 
@@ -697,7 +722,7 @@ class DebugEngine:
                 current_session = prepared_session if prepared_session is not None and pid==pids[0] else device.attach(pid)
                 if current_session is prepared_session:prepared_session=None
                 current_script = current_session.create_script(final_script)
-                current_script.on("message", on_message)
+                current_script.on("message", lambda message, data, attached_pid=pid: on_message(message, data, attached_pid))
                 current_script.load()
                 def invalidated(*args,attached=current_session,loaded=current_script):
                     def publish():

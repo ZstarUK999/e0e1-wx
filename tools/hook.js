@@ -4,6 +4,10 @@ const ARCH = Process.arch;          // 'arm64' | 'x64' | 'x86_64' | ...
 
 // 新版 flue 需要显式写回连地址，端口与 package/devtools/constants.py 的 DEBUG_PORT 一致。
 const DEBUG_PORT = 9421;
+// Low-volume launch diagnostics are forwarded separately from noisy Frida traces.
+const hookTrace = (event, details = {}) => send({
+    type: 'e0e1-hook-diagnostic', event, pid: Process.id, ...details,
+});
 
 // ── Module Resolution ──
 
@@ -143,11 +147,14 @@ const darwinPatchLoadStart2 = (base, offset, structOffset) => {
 const winRewriteScene = (scenePtr) => {
     const scene = scenePtr.readInt();
     send(`[hook] scene: ${scene}`);
+    hookTrace('scene', {scene, accepted: SCENE_WHITELIST.includes(scene),
+        level: SCENE_WHITELIST.includes(scene) ? 'info' : 'warning'});
     if (!SCENE_WHITELIST.includes(scene)) {
         return false;
     }
     send("[hook] hook scene -> 1101");
     scenePtr.writeInt(1101);
+    hookTrace('scene-rewritten', {scene, target: 1101});
     return true;
 };
 
@@ -169,6 +176,7 @@ const winWriteWebSocketUrl = (stringPtr) => {
         stringPtr.add(23).writeU8(url.length);
     }
     send(`[hook] websocket url -> ${url}`);
+    hookTrace('websocket-written', {url});
 };
 
 // 新版配置：MiniAppConfigStructOffsets，按上游 evi0s/WMPFDebugger 的链路走。
@@ -191,6 +199,7 @@ const winHijackMiniAppConfig = (a1, structOffsets) => {
     const remoteDebugModePtr = remoteDebugPtr.add(structOffsets.RemoteDebugModeOffset);
     send(`[hook] remote debug mode: ${remoteDebugModePtr.readInt()} -> 1`);
     remoteDebugModePtr.writeInt(1);
+    hookTrace('debug-mode-written', {mode: remoteDebugModePtr.readInt()});
 };
 
 const winPatchLoadStart = (base, config) => {
@@ -198,6 +207,7 @@ const winPatchLoadStart = (base, config) => {
     // Windows combines debug flag + scene hijack in one hook
     Interceptor.attach(base.add(config.LoadStartHookOffset), {
         onEnter() {
+            hookTrace('load-enter');
             // Microsoft x64 ABI: second param = RDX, force debug mode
             if ((this.context.rdx & 0xff) !== 1) {
                 this.context.rdx = (this.context.rdx & ~0xff) | 0x1;
@@ -210,10 +220,12 @@ const winPatchLoadStart = (base, config) => {
                 }
             } catch (e) {
                 send(`[hook] scene hook error: ${e}`);
+                hookTrace('load-error', {level: 'error', message: String(e)});
             }
         },
         onLeave() {},
     });
+    hookTrace('load-hook-installed', {offset: String(config.LoadStartHookOffset)});
 };
 
 // ── Config Parsing ──
@@ -275,6 +287,7 @@ const main = () => {
     const config = resolveArchConfig(rawConfig);
 
     if (!config) {
+        hookTrace('install-error', {level: 'error', message: `no config for platform=${PLATFORM} arch=${ARCH}`});
         console.error(`[frida] no config for platform=${PLATFORM} arch=${ARCH}`);
         return;
     }
@@ -282,6 +295,7 @@ const main = () => {
     const mainModule = getMainModule(config.Version);
     if (!mainModule) {
         const expected = PLATFORM === "darwin" ? "WeChatAppEx Framework" : "flue.dll / WeChatAppEx.exe";
+        hookTrace('install-error', {level: 'error', message: `module not found: ${expected}`});
         console.error(`[frida] module not found: ${expected}`);
         return;
     }
@@ -290,6 +304,7 @@ const main = () => {
     console.log(`[frida] module base: ${mainModule.base}`);
 
     const base = mainModule.base;
+    hookTrace('install-start', {version: config.Version, module: mainModule.name, arch: ARCH});
 
     // CDP filter patch — both platforms
     patchCDPFilter(base, config);
@@ -303,6 +318,7 @@ const main = () => {
     } else {
         winPatchLoadStart(base, config);
     }
+    hookTrace('hook-ready', {version: config.Version, module: mainModule.name});
 };
 
 main();

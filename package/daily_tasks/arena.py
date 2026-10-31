@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import replace
 from datetime import datetime
 
 from .scheduler import BEIJING, ExecutionUncertain, RetryableTaskError, TaskContext, TaskResult
@@ -89,6 +90,8 @@ class ArenaTask:
             await self.game.home()
         except RetryableTaskError as exc:
             LOG.warning("斗法结束后返回主界面暂不可用：%s", exc)
+        else:
+            result = replace(result, safe_to_resume=True)
         return result
 
     async def _loop(self, ctx: TaskContext, force_trigger: bool) -> TaskResult:

@@ -21,6 +21,7 @@ from .gate import PHASE_INIT, StartupGate
 from .feature_flags import panel_enabled, task_enabled
 from .panels import BloodmoonPanel, DailyPanel, DamagePanel, DebugPanel, DesirePanel, GlobalPanel, PlayerPanel, TaskPanel, TreasurePanel
 from .store import PluginConfigStore
+from .wheel_focus import install_wheel_focus_guard
 from .legion import LegionPanel
 from .season_insight import SeasonInsightPanel
 from .flag_upgrade import FlagUpgradePanel
@@ -73,6 +74,7 @@ class PluginWindow(QMainWindow):
 
     def __init__(self, store: PluginConfigStore | None = None):
         super().__init__()
+        install_wheel_focus_guard()
         self.store = store or PluginConfigStore(parent=self)
         self.game_connected = False
         self.runtime_ready = False

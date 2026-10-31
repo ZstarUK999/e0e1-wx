@@ -406,11 +406,40 @@ function e0e1ParseAttributes(snapshot) {
   var lines = [];
   // attribute 实际有 50+ 条（含 PVP增伤/减免等），上限要够大
   e0e1ForEachMap(snapshot.attribute, 80, function (value, attrId) {
+    if (e0e1IsSeasonAttr(attrId)) return;
     var name = e0e1ResolveName("AttrCfg", attrId);
     if (!name) return;
     lines.push("· " + name + " " + e0e1FormatAttr(attrId, value));
   });
   return lines;
+}
+
+var E0E1_SEASON_ATTRS = {
+  200101:'深渊攻击力',200102:'深渊防御力',200103:'赛季最终增伤',200104:'赛季最终减伤',
+  200105:'致命一击率',200106:'致命一击率抵抗',200107:'致命一击伤害',200108:'致命一击伤害抵抗',
+  200109:'群攻致命一击率',200110:'群攻致命一击率抵抗',200111:'群攻致命一击伤害',200112:'群攻致命一击伤害抵抗'
+};
+function e0e1IsSeasonAttr(id) {
+  return !!E0E1_SEASON_ATTRS[Number(id)] || !!e0e1Row('SeasonAttrCfg',id);
+}
+function e0e1ParseSeasonAttributes(snapshot) {
+  // 不调用本人的 SEASON 模块：对方数据缺失时明确标记，不以本人数据补齐。
+  var attributes=snapshot.attribute;
+  var ids=new Set([200101,200103,200105,200107]);
+  var rows=e0e1CfgModule && e0e1CfgModule.SeasonAttrCfg && e0e1CfgModule.SeasonAttrCfg.list || [];
+  rows.forEach(function(row){if(row.show>0)ids.add(Number(row.id));});
+  if(e0e1IsMap(attributes))attributes.forEach(function(_,id){if(e0e1IsSeasonAttr(id))ids.add(Number(id));});
+  return Array.from(ids).sort(function(a,b){
+    var left=e0e1Row('SeasonAttrCfg',a),right=e0e1Row('SeasonAttrCfg',b);
+    return (left && left.namesort!==undefined?left.namesort:a)-(right && right.namesort!==undefined?right.namesort:b);
+  }).map(function(id){
+    var row=e0e1Row('SeasonAttrCfg',id);
+    var name=row && e0e1IsCjk(row.note)?row.note:E0E1_SEASON_ATTRS[id] || ('赛季属性'+id);
+    var value=e0e1IsMap(attributes)?attributes.get(id) ?? attributes.get(String(id)):undefined;
+    if(value===undefined || value===null)return '· '+name+'：未下发';
+    var style=row && row.style!==undefined?Number(row.style):id===200101 || id===200102?1:2;
+    return '· '+name+' '+(style===2?String(Math.round(Number(value))/100)+'%':String(value));
+  });
 }
 
 function e0e1ParseModules(snapshot) {
@@ -498,6 +527,7 @@ async function e0e1BuildDump(snapshot, isSelf) {
     { label: "属性", lines: e0e1ParseAttributes(snapshot) },
     { label: "玩法", lines: e0e1ParseModules(snapshot) }
   ]);
+  add("赛季属性", [{ label: "目标玩家快照", lines: e0e1ParseSeasonAttributes(snapshot) }]);
   return dump;
 }
 
@@ -549,8 +579,9 @@ async function e0e1DumpPlayerInfoText() {
     await new Promise(function (resolve) { setTimeout(resolve, 250); });
     snapshot = ui.info;
   }
-  if (!snapshot) snapshot = e0e1SelfSnapshot(game);
-  if (!snapshot) return "没拿到快照数据";
+  if (ui !== e0e1FindSettingUi()) return "玩家信息界面已切换，请重新读取";
+  if (ui.isSelf === true) snapshot = e0e1SelfSnapshot(game) || snapshot;
+  if (!snapshot) return "目标玩家快照未下发";
   return e0e1RenderText(await e0e1BuildDump(snapshot, ui.isSelf));
 }
 
@@ -579,6 +610,9 @@ function e0e1FindSettingUi() {
 
 function e0e1SelfSnapshot(game) {
   var snapshot = (game && game.ROLE) || null;
+  if (snapshot) snapshot = Object.assign({},snapshot,{
+    attribute:snapshot.hero && snapshot.hero.attribute && snapshot.hero.attribute.attributes || snapshot.attribute
+  });
   if (snapshot && snapshot.previewHide === undefined) {
     var stats = snapshot.stats && snapshot.stats.statistics;
     snapshot.previewHide = stats && typeof stats.get === "function" ? stats.get(94) || 0 : 0;
@@ -596,7 +630,8 @@ async function e0e1DumpPlayerInfo() {
     await new Promise(function (resolve) { setTimeout(resolve, 250); });
     snapshot = ui.info;
   }
-  if (!snapshot) snapshot = e0e1SelfSnapshot(game);
+  if (ui !== e0e1FindSettingUi()) return e0e1Fail("玩家信息界面已切换，请重新读取");
+  if (ui.isSelf === true) snapshot = e0e1SelfSnapshot(game) || snapshot;
   if (!snapshot) return e0e1Fail("没拿到快照数据（info 为空且不是本人界面）");
   return e0e1Emit(await e0e1BuildDump(snapshot, ui.isSelf));
 }

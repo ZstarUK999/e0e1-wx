@@ -22,12 +22,16 @@ class TaskResult:
     status: str = "success"
     message: str = ""
     next_delay_seconds: float | None = None
+    # Explicit receipt that the handler confirmed all effects and completed cleanup.
+    safe_to_resume: bool = False
 
     def __post_init__(self):
         if self.status not in ("success", "skipped", "waiting"):
             raise ValueError("任务结果仅允许 success/skipped/waiting")
         if not isinstance(self.message, str):
             raise ValueError("任务结果message必须是字符串")
+        if type(self.safe_to_resume) is not bool:
+            raise ValueError("safe_to_resume必须是布尔值")
         if self.next_delay_seconds is not None:
             _seconds(self.next_delay_seconds, "next_delay_seconds")
 

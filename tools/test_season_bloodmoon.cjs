@@ -250,15 +250,15 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
   }
   await test('correct rendered target and current threshold permit challenge',async()=>{
     const f=fixture();f.me.state=1; const r=await f.run(f.api.attack({roleId:2,power_ratio:100}));
-    assert.equal(r.confirmed,true);assert.equal(r.roleId,2);
+    assert.equal(r.dispatched,true);assert.equal(r.roleId,2);
   });
   await test('direct attack does not depend on recycled UI row',async()=>{
     const f=fixture({wrongRow:true});f.me.state=1;
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);assert.equal(f.sent[0].params.targetId,2);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);assert.equal(f.sent[0].params.targetId,2);
   });
   await test('direct request targets explicit role despite UI recycling',async()=>{
     const f=fixture({rebindDuringCheck:true});f.me.state=1;
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);assert.equal(f.sent[0].params.targetId,2);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);assert.equal(f.sent[0].params.targetId,2);
   });
   await test('threshold recheck prevents stale or over-limit target',async()=>{
     const f=fixture();f.me.state=1;
@@ -314,7 +314,7 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     f.api.version='old-fixture';
     await f.run(vm.runInNewContext('(async()=>{'+source+'})()',f.context));
     const updated=f.context.e0e1Season;
-    assert.equal(updated.version,'2026-10-24-routes-v17');assert.notEqual(updated,f.api);
+    assert.equal(updated.version,'2026-10-31-js-runtime-v24');assert.notEqual(updated,f.api);
     assert.equal((await f.run(updated.march())).speed_up.times,1);
     assert.equal((await f.run(updated.speedUp({max_times:1}))).ok,false);
     assert.equal(f.sent.length,1);
@@ -333,6 +333,20 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     assert.equal((await f.run(f.api.speedUp({interval_seconds:1}))).confirmed,true);
     assert.equal(f.sent.length,2);
   });
+  await test('fractional speed interval preserves the millisecond dispatch boundary',async()=>{
+    const f=fixture();
+    assert.equal((await f.run(f.api.speedUp({interval_seconds:0.25}))).confirmed,true);
+    const first=await f.run(f.api.march({interval_seconds:0.25}));
+    assert.equal(first.speed_up.interval_seconds,0.25);
+    const wait=first.speed_up.cool_down_until-first.server_now;
+    assert(wait>0);
+    await f.run(new Promise(r=>f.context.setTimeout(r,wait-1)));
+    assert.equal((await f.run(f.api.speedUp({interval_seconds:0.25}))).status,'waiting');
+    assert.equal(f.sent.length,1);
+    await f.run(new Promise(r=>f.context.setTimeout(r,1)));
+    assert.equal((await f.run(f.api.speedUp({interval_seconds:0.25}))).confirmed,true);
+    assert.equal(f.sent.length,2);
+  });
   await test('final window rejection is attempted once and does not affect next march',async()=>{
     const options={reject:true};const f=fixture(options);f.move.arrive=109000;
     assert.equal((await f.run(f.api.speedUp({interval_seconds:1}))).status,'retry_later');
@@ -341,50 +355,104 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     f.me.state=1;await f.run(f.api.march());f.me.state=2;f.move.arrive=500000;options.reject=false;
     assert.equal((await f.run(f.api.speedUp({interval_seconds:1}))).confirmed,true);assert.equal(f.sent.length,2);
   });
-  await test('accepted challenge blocks duplicate then immediately chains after matching end',async()=>{
-    const f=fixture();f.me.state=1;
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);
-    assert.equal((await f.run(f.api.attack({roleId:2}))).status,'waiting');assert.equal(f.sent.length,1);
-    f.exitSignal.emit({buildingId:'1_1',other:2,isRobot:false,isMeAtk:true});
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);assert.equal(f.sent.length,2);
-  });
-  await test('battle state transition releases next challenge without end event',async()=>{
-    const f=fixture();f.me.state=1;await f.run(f.api.attack({roleId:2}));
-    f.me.state=3;await f.run(f.api.candidates({compact:true}));
-    f.me.state=1;await f.run(f.api.candidates({compact:true}));
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);assert.equal(f.sent.length,2);
-  });
-  await test('direct timeout stops replay until outstanding request settles',async()=>{
-    const f=fixture({delay:20000});f.me.state=1;
-    const result=await f.run(f.api.attack({roleId:2}));assert.equal(result.status,'uncertain');
-    assert.equal((await f.run(f.api.attack({roleId:2}))).status,'uncertain');
-    assert.equal(f.sent.length,1);assert.equal((await f.run(f.api.reset())).ok,false);
-  });
+
+
+
+
+
+
+
+
+
   await test('native battle timer supports 200ms preparation without premature request',async()=>{
     const f=fixture({battleRemainingMs:200});f.me.state=3;
     const snapshot=await f.run(f.api.candidates());
     assert.equal(snapshot.battle_end_time-snapshot.server_now,200);
     assert.equal((await f.run(f.api.attack({roleId:2}))).ok,false);assert.equal(f.sent.length,0);
   });
-  await test('known moving target response does not poison future attacks',async()=>{
-    const f=fixture({reject:true,rejectCode:350018});f.me.state=1;
-    const result=await f.run(f.api.attack({roleId:2}));
-    assert.equal(result.status,'target_unavailable');assert.equal(result.roleId,2);
-    assert.equal(result.request_sent,true);assert.equal((await f.run(f.api.diagnose())).uncertain,false);
+
+  await test('arrival lead uses destination queue and permits pre-arrival request at exact boundary',async()=>{
+    const f=fixture();f.move.arrive=100401;
+    f.data.buildings.set('2_2',{members:new Set([2])});
+    f.data.buildings.get('1_1').members=new Set([1]);
+    const reads=[];
+    f.module.getBuildingOpSnapshot=(x,y)=>{reads.push([x,y]);return {attackQueue:x===2&&y===2?[{role:f.enemy,arriveAt:0}]:[],defenseQueue:[]};};
+    assert.equal((await f.run(f.api.candidates({compact:true,lead_ms:400,dynamic_lead:true}))).early_attack,false);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    await f.run(new Promise(r=>f.context.setTimeout(r,1)));
+    const snapshot=await f.run(f.api.candidates({compact:true,lead_ms:400,dynamic_lead:true}));
+    assert.equal(snapshot.early_kind,'arrival');assert.equal(snapshot.node.x,2);
+    assert.equal(snapshot.attack[0].attackable,true);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+    assert.equal(f.sent.length,1);assert(reads.some(p=>p[0]===2&&p[1]===2));
+    assert.equal(f.me.state,2);assert.equal(f.data.buildings.get('2_2').members.has(1),false);
   });
-  await test('definite challenge rejection permits later retry without resetting success count',async()=>{
-    const options={reject:true};const f=fixture(options);f.me.state=1;
-    const rejected=await f.run(f.api.attack({roleId:2}));
-    assert.equal(rejected.status,'retry_later');assert.equal(rejected.request_sent,true);
-    options.reject=false;
-    assert.equal((await f.run(f.api.attack({roleId:2}))).battles,1);
+  await test('shared zero lead disables both early windows and missing clock prevents early dispatch',async()=>{
+    for(const phase of [2,3]){
+      const f=fixture();f.me.state=phase;f.move.arrive=100100;
+      f.module.getTimerByRole=()=>({startTime:99000,endTime:100100});
+      assert.equal((await f.run(f.api.candidates({lead_ms:0}))).early_attack,false);
+      assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:0}))).request_sent,false);
+    }
+    const f=fixture({noClock:true});f.move.arrive=100100;
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
   });
+  await test('early requests retain qualification and use current destination after the bridge',async()=>{
+    for(const kind of ['sameSide','targetAbsent','moving','unknownPower']){
+      const f=fixture();f.move.arrive=100300;f.data.buildings.set('2_2',{members:new Set([2])});
+      if(kind==='sameSide')f.enemy.lId=10;
+      if(kind==='targetAbsent')f.data.buildings.get('2_2').members.clear();
+      if(kind==='moving')f.enemy.state=2;
+      if(kind==='unknownPower'){f.enemy.power=0;f.enemy.planPower=[0];}
+      assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+      assert.equal(f.sent.length,0);
+    }
+    const f=fixture();f.move.arrive=100300;f.data.buildings.set('2_2',{members:new Set([2])});
+    assert.equal((await f.run(f.api.candidates({lead_ms:400}))).early_kind,'arrival');
+    f.move.to={x:9,y:9}; // State changed while Python would be crossing the bridge.
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+  });
+
+  await test('expired arrival record no longer blocks a resident idle target',async()=>{
+    const f=fixture();f.me.state=1;
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy,arriveAt:99999}],defenseQueue:[]});
+    assert.equal((await f.run(f.api.candidates())).attack[0].attackable,true);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+  });
+  await test('incoming target is eligible only within shared lead and on this node',async()=>{
+    const f=fixture();f.me.state=1;f.enemy.state=2;
+    f.data.buildings.get('1_1').members.delete(2);
+    const move={id:2,from:{x:9,y:9},to:{x:1,y:1},start:90000,arrive:100401};
+    f.data.moveInfos.set(2,move);
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy,arriveAt:move.arrive}],defenseQueue:[]});
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).attack[0].attackable,false);
+    await f.run(new Promise(r=>f.context.setTimeout(r,1)));
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).attack[0].incoming,true);
+    assert.equal((await f.run(f.api.candidates({lead_ms:0}))).attack[0].attackable,false);
+    move.to={x:2,y:2};
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    move.to={x:1,y:1};
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+  });
+  await test('incoming dispatch yields to fresh legal resident but not an over-limit resident',async()=>{
+    const f=fixture();f.me.state=1;f.enemy.state=2;
+    f.data.buildings.get('1_1').members.delete(2);
+    const move={id:2,to:{x:1,y:1},start:90000,arrive:100300};f.data.moveInfos.set(2,move);
+    const resident={id:3,lId:20,state:1,power:400,planPower:[400]};
+    f.data.roles.set(3,resident);f.data.buildings.get('1_1').members.add(3);
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy,arriveAt:move.arrive},{role:resident,arriveAt:0}],defenseQueue:[]});
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    resident.power=2000;resident.planPower=[2000];
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+  });
+
+
   await test('visible resident stealth role remains attackable without changing visibility',async()=>{
     const f=fixture();f.me.state=1;f.enemy.ext=new Map([[4,1]]);
     const snapshot=await f.run(f.api.candidates());
     assert.equal(snapshot.attack[0].stealth,true);assert.equal(snapshot.attack[0].attackable,true);
     f.ui.findOpen=()=>{throw Error('must not require UI');};
-    assert.equal((await f.run(f.api.attack({roleId:2}))).confirmed,true);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
     assert.equal(f.enemy.ext.get(4),1);
   });
   await test('map sidebar uses its own cell type without opening full queue',async()=>{
@@ -416,39 +484,8 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
       assert.equal((await f.run(f.api.speedUp({}))).confirmed,true);
     }
   });
-  await test('native end event confirms only this challenge and survives stop/upgrade',async()=>{
-    const f=fixture();f.me.state=1;
-    const receipt=await f.run(f.api.attack({roleId:2}));
-    const event={buildingId:'1_1',other:2,isRobot:false,isMeAtk:true};
-    for(const patch of [{other:3},{buildingId:'2_2'},{isRobot:true},{isMeAtk:false}]){
-      f.exitSignal.emit({...event,...patch});
-      assert.equal((await f.run(f.api.candidates())).attack_observation.completed,false);
-    }
-    await f.run(f.api.stop());assert.equal(f.listeners.size,1);
-    f.api.version='old-fixture';await f.run(vm.runInNewContext('(async()=>{'+source+'})()',f.context));
-    const api=f.context.e0e1Season;await f.run(api.candidates());assert.equal(f.listeners.size,1);
-    f.exitSignal.emit(event);
-    const snapshot=await f.run(api.candidates());
-    assert.equal(snapshot.attack_observation.token,receipt.attack_token);
-    assert.equal(snapshot.attack_observation.completed,true);assert.equal(f.listeners.size,0);
-    await f.run(api.reset());assert.equal((await f.run(api.candidates())).attack_observation,null);
-    assert.equal(f.sent.length,1);
-  });
-  await test('fast battle end before successful receipt is retained; wrong war ignored',async()=>{
-    const f=fixture({delay:2200});f.me.state=1;
-    f.context.setTimeout(()=>{
-      const event={buildingId:'1_1',other:2,isRobot:false,isMeAtk:true};
-      f.module.enteredMapId=8;f.exitSignal.emit(event);assert.equal(f.listeners.size,1);
-      f.module.enteredMapId=7;f.exitSignal.emit(event);
-    },1000);
-    const receipt=await f.run(f.api.attack({roleId:2}));
-    assert.equal(receipt.confirmed,true);
-    const snapshot=await f.run(f.api.candidates());
-    assert.equal(snapshot.self_state,1);
-    assert.equal(snapshot.attack_observation.token,receipt.attack_token);
-    assert.equal(snapshot.attack_observation.completed,true);
-    assert.equal(f.sent.length,1);
-  });
+
+
   await test('reveal restores native march and route data and stop restores original filter',async()=>{
     const f=fixture();f.me.state=1;f.enemy.ext=new Map([[4,1]]);f.enemy.state=2;
     const hidden={id:2,from:{x:3,y:4},to:{x:5,y:6},start:90000,arrive:200000};
@@ -491,6 +528,404 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     assert.equal(info.rendered_marches,0);assert.equal(info.mark_error,null);
     await f.run(f.api.stop());assert.equal(f.helper.shouldHideStealthMarch,f.originalHide);
   });
+  function controlledFixture(options={}) {
+    const f=fixture(options);f.me.state=1;const packets=[];
+    f.module.startPVPBattle=params=>new Promise((resolve,reject)=>packets.push({params,resolve,reject}));
+    return {...f,packets};
+  }
+  async function advance(f,ms){await f.run(new Promise(r=>f.context.setTimeout(r,ms)));await f.run(new Promise(r=>f.context.setTimeout(r,0)));}
+  await test('pipeline dispatch returns immediately and sends N while first packet is unresolved',async()=>{
+    const f=controlledFixture();
+    const first=await f.run(f.api.attack({roleId:2}));
+    assert.equal(first.dispatched,true);assert.equal(f.context.Date.now(),100000);
+    for(let n=0;n<3;n++){await advance(f,200);assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);}
+    assert.equal(f.packets.length,4);
+    const snapshot=await f.run(f.api.candidates());
+    assert(snapshot.attack_requests.every(r=>r.status==='sent'));
+    assert.equal((await f.run(f.api.diagnose())).pending,false);
+    assert.equal((await f.run(f.api.diagnose())).outstanding,4);
+  });
+  await test('Nth response first then first rejection cannot stop dispatch or rewrite selection',async()=>{
+    const f=controlledFixture();
+    for(let n=0;n<3;n++){if(n)await advance(f,200);await f.run(f.api.attack({roleId:2}));}
+    f.packets[2].resolve({err:null,resp:{}});await f.run(f.api.candidates());
+    f.packets[0].resolve({err:{code:7,error:'old rejection'},resp:{}});
+    const snapshot=await f.run(f.api.candidates());
+    assert.equal(snapshot.attack_requests[0].status,'rejected');
+    assert.equal(snapshot.attack_requests[2].status,'accepted');
+    assert.equal(snapshot.attack_last_rejection,null);
+    assert.equal(snapshot.attack[0].retry_deferred,false);
+    assert.equal(snapshot.battles,0);
+    await advance(f,200);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+  });
+  await test('timeouts network errors and malformed old responses never latch attack uncertainty',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,8000);
+    assert.equal((await f.run(f.api.candidates())).attack_requests[0].status,'timeout');
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    f.packets[0].resolve({err:{code:7},resp:{}});f.packets[1].reject(new Error('old network failure'));
+    await f.run(f.api.candidates());await advance(f,200);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    f.packets[2].resolve({});await f.run(f.api.candidates());await advance(f,200);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    const snapshot=await f.run(f.api.candidates());
+    assert.equal(snapshot.attack_requests[0].status,'late_rejected');
+    assert.equal(snapshot.attack_requests[1].status,'network_error');
+    assert.equal(snapshot.attack_requests[2].status,'malformed');
+    assert.equal((await f.run(f.api.diagnose())).uncertain,false);
+  });
+  await test('accepted response is not battle entry and does not stop next packet',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    f.packets[0].resolve({err:null,resp:{}});await f.run(f.api.candidates());
+    await advance(f,200);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    assert.equal((await f.run(f.api.candidates())).battles,0);
+  });
+  await test('actual battle entry ends burst then shared local timer opens next burst',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    f.me.state=3;f.module.getTimerByRole=()=>({startTime:100000,endTime:200000});
+    const started=await f.run(f.api.candidates({lead_ms:400,compact:true}));
+    assert.equal(started.entered_battle,true);assert.equal(started.battles,1);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    await advance(f,99700);
+    const next=await f.run(f.api.candidates({lead_ms:400,compact:true}));
+    assert.equal(next.early_kind,'battle');assert.equal(next.entered_battle,false);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+    assert.equal(f.packets.length,2);
+    f.packets[0].resolve({err:{code:7},resp:{}});
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).attack_last_rejection,null);
+  });
+  await test('latest rejection deprioritizes its target without awaiting any older packet',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}));
+    const next={id:3,lId:20,state:1,power:300,planPower:[300]};
+    f.data.roles.set(3,next);f.data.buildings.get('1_1').members.add(3);
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy,arriveAt:0},{role:next,arriveAt:0}],defenseQueue:[]});
+    await advance(f,100);
+    f.packets[0].resolve({err:{code:350018},resp:{}});
+    const snapshot=await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}));
+    assert.equal(snapshot.attack_last_rejection.seq,1);
+    assert.equal((await f.run(f.api.attack({roleId:3,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+    assert.equal(f.context.Date.now(),100100);
+    assert.equal(f.packets.length,2);
+  });
+  await test('each packet rechecks target and empty queue never dispatches a stale target',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,200);f.data.buildings.get('1_1').members.delete(2);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).request_sent,false);
+    f.data.buildings.get('1_1').members.add(2);f.enemy.state=2;
+    f.data.moveInfos.set(2,{id:2,to:{x:1,y:1},arrive:100500});
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).dispatched,true);
+    f.data.moveInfos.get(2).to={x:9,y:9};await advance(f,200);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    assert.equal(f.packets.length,2);
+  });
+  await test('speed uncertainty does not block independent freshly qualified attack packets',async()=>{
+    const f=fixture({networkError:true});await f.run(f.api.speedUp({}));
+    assert.equal((await f.run(f.api.diagnose())).uncertain,true);
+    f.me.state=1;
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+  });
+  await test('UI end-time correction does not invent another battle or end the active burst',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    f.me.state=3;let end=200000;
+    f.module.getTimerByRole=()=>({startTime:100000,endTime:end});
+    assert.equal((await f.run(f.api.candidates())).battles,1);
+    end=210000;
+    const corrected=await f.run(f.api.candidates());
+    assert.equal(corrected.entered_battle,false);assert.equal(corrected.battles,1);
+  });
+  await test('10-second latency average matches each request even when replies arrive out of order',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,200);await f.run(f.api.attack({roleId:2}));
+    await advance(f,100);f.packets[1].resolve({err:null,resp:{}});await f.run(f.api.candidates());
+    await advance(f,100);f.packets[0].resolve({err:{code:7},resp:{}});
+    const snapshot=await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}));
+    assert.equal(snapshot.attack_latency.sample_count,2);
+    assert.equal(snapshot.attack_latency.mean_rtt_ms,250);
+    assert.equal(snapshot.attack_latency.mean_one_way_ms,125);
+    assert.equal(snapshot.effective_lead_ms,125);
+    assert.equal(snapshot.attack_last_rejection,null);
+    f.me.state=2;f.move.arrive=f.context.Date.now()+126;
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).early_attack,false);
+    await advance(f,1);
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).early_kind,'arrival');
+    f.me.state=3;const end=f.context.Date.now()+126;
+    f.module.getTimerByRole=()=>({startTime:99000,endTime:end});
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).early_attack,false);
+    await advance(f,1);
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).early_kind,'battle');
+    f.me.state=1;f.enemy.state=2;f.data.buildings.get('1_1').members.delete(2);
+    f.data.moveInfos.set(2,{id:2,to:{x:1,y:1},arrive:f.context.Date.now()+126});
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).attack[0].incoming,false);
+    await advance(f,1);
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).attack[0].incoming,true);
+    assert.equal((await f.run(f.api.candidates({lead_ms:0}))).attack[0].incoming,false);
+  });
+  await test('latency samples expire exactly 10 seconds after their reply and fall back to configured lead',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,101);f.packets[0].resolve({err:null,resp:{}});await f.run(f.api.candidates());
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).effective_lead_ms,51);
+    await advance(f,9999);
+    assert.equal((await f.run(f.api.candidates())).attack_latency.sample_count,1);
+    await advance(f,1);
+    const expired=await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}));
+    assert.equal(expired.attack_latency.sample_count,0);assert.equal(expired.effective_lead_ms,400);
+    assert.equal(expired.attack_latency.mean_rtt_ms,null);
+  });
+  await test('missing malformed and network-error replies are not latency samples; valid late reply is',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,200);f.packets[0].reject(new Error('network'));
+    await f.run(f.api.attack({roleId:2}));f.packets[1].resolve({});
+    assert.equal((await f.run(f.api.candidates())).attack_latency.sample_count,0);
+    await advance(f,200);await f.run(f.api.attack({roleId:2}));
+    await advance(f,9000);
+    assert.equal((await f.run(f.api.candidates())).attack_latency.sample_count,0);
+    f.packets[2].resolve({err:null,resp:{}});
+    const late=await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}));
+    assert.equal(late.attack_latency.sample_count,1);assert.equal(late.effective_lead_ms,4500);
+    assert.equal((await f.run(f.api.candidates({lead_ms:0}))).effective_lead_ms,0);
+    assert.equal((await f.run(f.api.diagnose())).uncertain,false);
+  });
+  await test('latency uses monotonic clock independently of wall-clock movement',async()=>{
+    const f=controlledFixture();let tick=100;f.context.performance={now:()=>tick};
+    await f.run(f.api.attack({roleId:2}));await advance(f,200);tick=350;
+    f.packets[0].resolve({err:null,resp:{}});
+    assert.equal((await f.run(f.api.candidates())).attack_latency.mean_rtt_ms,250);
+    await advance(f,20000);
+    assert.equal((await f.run(f.api.candidates())).attack_latency.sample_count,1);
+    tick=10350;
+    assert.equal((await f.run(f.api.candidates())).attack_latency.sample_count,0);
+  });
+  await test('latency window includes all replies independently of the packet diagnostic ring size',async()=>{
+    const f=controlledFixture();let current;
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:current,arriveAt:0}],defenseQueue:[]});
+    for(let id=2;id<152;id++){
+      current={id,lId:20,state:1,power:300,planPower:[300]};
+      f.data.roles.set(id,current);f.data.buildings.get('1_1').members.add(id);
+      assert.equal((await f.run(f.api.attack({roleId:id}))).dispatched,true);
+    }
+    await advance(f,100);for(const packet of f.packets)packet.resolve({err:null,resp:{}});
+    const snapshot=await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}));
+    assert.equal(snapshot.attack_latency.sample_count,150);
+    assert.equal(snapshot.effective_lead_ms,50);
+  });
+
+  await test('dynamic lead is opt-in and toggles immediately without discarding samples',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2}));
+    await advance(f,100);f.packets[0].resolve({err:null,resp:{}});
+    const disabled=await f.run(f.api.candidates({lead_ms:400}));
+    assert.equal(disabled.effective_lead_ms,400);
+    assert.equal(disabled.attack_latency.mean_one_way_ms,50);
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:true}))).effective_lead_ms,50);
+    assert.equal((await f.run(f.api.candidates({lead_ms:400,dynamic_lead:false}))).effective_lead_ms,400);
+    await advance(f,100);f.me.state=2;f.data.moveInfos.set(1,{to:{x:1,y:1},arrive:100400});
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:true}))).request_sent,false);
+    assert.equal((await f.run(f.api.attack({roleId:2,lead_ms:400,dynamic_lead:false}))).dispatched,true);
+  });
+
+  await test('JS dispatch has no second cadence or response barrier',async()=>{
+    const f=controlledFixture();
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    assert.equal(f.packets.length,2); // The Python loop alone owns y; neither reply has arrived.
+    assert.equal(f.context.Date.now(),100000);
+  });
+
+  await test('incoming target never bypasses a legal resident due to recent dispatch or rejection',async()=>{
+    const f=controlledFixture();await f.run(f.api.attack({roleId:2,lead_ms:400}));
+    const incoming={id:3,lId:20,state:2,power:300,planPower:[300]};
+    f.data.roles.set(3,incoming);f.data.moveInfos.set(3,{to:{x:1,y:1},arrive:100150});
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy,arriveAt:0},{role:incoming,arriveAt:100150}],defenseQueue:[]});
+    await advance(f,100);f.packets[0].resolve({err:{code:7},resp:{}});
+    const blocked=await f.run(f.api.attack({roleId:3,lead_ms:400}));
+    assert.equal(blocked.request_sent,false);assert.equal(f.packets.length,1);
+    f.data.buildings.get('1_1').members.delete(2);
+    assert.equal((await f.run(f.api.attack({roleId:3,lead_ms:400}))).dispatched,true);
+  });
+
+  await test('one local queue snapshot per dispatch with no repeated eligibility pass',async()=>{
+    const f=controlledFixture();let reads=0,checks=0;
+    const snapshot=f.module.getBuildingOpSnapshot,canAttack=f.module.canAttack;
+    f.module.getBuildingOpSnapshot=(...args)=>{reads++;return snapshot(...args);};
+    f.module.canAttack=(...args)=>{checks++;return canAttack.apply(f.module,args);};
+    assert.equal((await f.run(f.api.attack({roleId:2}))).dispatched,true);
+    assert.equal(reads,1);assert.equal(checks,1);
+    assert.equal(f.context.Date.now(),100000);assert.equal(f.packets.length,1);
+  });
+
+
+  function autoConfig(attack={},speed_up={},extra={}) {
+    return {enabled:true,attack:{enabled:true,lead_ms:400,interval_ms:200,...attack},
+      speed_up:{enabled:false,...speed_up},...extra};
+  }
+  await test('autonomous JS sends repeatedly with one configure call and unresolved replies',async()=>{
+    const f=controlledFixture();let reads=0;const original=f.module.getBuildingOpSnapshot;
+    f.module.getBuildingOpSnapshot=(...args)=>{reads++;return original(...args);};
+    await f.run(f.api.automationConfigure(autoConfig({interval_ms:75})));
+    assert.equal(f.packets.length,1);assert.equal(reads,1);
+    await advance(f,224);assert.equal(f.packets.length,3);
+    await advance(f,1);assert.equal(f.packets.length,4);
+    assert(f.packets.every(p=>p.params.targetId===2));
+    const summary=await f.run(f.api.automationEvents());
+    assert.equal(summary.attack,undefined);assert.equal(summary.defense,undefined);
+    assert.equal(summary.attack_requests,undefined);
+    assert.equal(summary.events.filter(e=>e.kind==='target_changed').length,1);
+    assert(summary.events.filter(e=>e.kind==='attack_state').length<=2);
+  });
+  await test('autonomous JS honors phase windows and actual battle entry without Python polling',async()=>{
+    const f=controlledFixture();f.me.state=2;f.move.arrive=100400;
+    f.data.buildings.set('2_2',{members:new Set([2])});
+    await f.run(f.api.automationConfigure(autoConfig({lead_ms:100,interval_ms:75})));
+    await advance(f,299);assert.equal(f.packets.length,0);
+    await advance(f,1);assert.equal(f.packets.length,1);
+    await advance(f,75);assert.equal(f.packets.length,2);
+    f.me.state=3;f.me.position={x:2,y:2};f.data.buildings.get('2_2').members.add(1);
+    f.module.getTimerByRole=()=>({startTime:100400,endTime:101000});
+    await advance(f,100);const before=f.packets.length;
+    await advance(f,424);assert.equal(f.packets.length,before);
+    await advance(f,1);assert.equal(f.packets.length,before+1);
+    assert.equal((await f.run(f.api.automationEvents())).battles,1);
+  });
+  await test('autonomous JS selects power order and incoming only after legal residents disappear',async()=>{
+    const f=controlledFixture(),weak={id:3,lId:20,state:1,power:200,planPower:[200]};
+    const incoming={id:4,lId:20,state:2,power:800,planPower:[800]};
+    f.data.roles.set(3,weak);f.data.roles.set(4,incoming);f.data.buildings.get('1_1').members.add(3);
+    f.data.moveInfos.set(4,{to:{x:1,y:1},arrive:100300});
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy},{role:weak},{role:incoming}],defenseQueue:[]});
+    await f.run(f.api.automationConfigure(autoConfig({lowest_power_first:true})));
+    assert.equal(f.packets[0].params.targetId,3);
+    await advance(f,200);assert.equal(f.packets[1].params.targetId,3);
+    await f.run(f.api.automationConfigure(autoConfig({lowest_power_first:false},{},{revision:1})));
+    await advance(f,200);assert.equal(f.packets[2].params.targetId,2);
+    f.data.buildings.get('1_1').members.delete(2);f.data.buildings.get('1_1').members.delete(3);
+    await advance(f,200);assert.equal(f.packets[3].params.targetId,4);
+    incoming.state=1;f.data.moveInfos.delete(4);
+    await advance(f,200);assert.equal(f.packets.length,4);
+    f.data.buildings.get('1_1').members.add(4);
+    await advance(f,100);assert.equal(f.packets.length,5);
+  });
+  await test('autonomous rejection and old late errors do not reset y or stop new packets',async()=>{
+    const f=controlledFixture(),other={id:3,lId:20,state:1,power:300,planPower:[300]};
+    f.data.roles.set(3,other);f.data.buildings.get('1_1').members.add(3);
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy},{role:other}],defenseQueue:[]});
+    await f.run(f.api.automationConfigure(autoConfig()));
+    await advance(f,50);f.packets[0].resolve({err:{code:7},resp:{}});
+    await advance(f,149);assert.equal(f.packets.length,1);
+    await advance(f,1);assert.equal(f.packets[1].params.targetId,3);
+    await advance(f,200);assert.equal(f.packets.length,3);
+    f.packets[1].reject(new Error('old failure'));
+    await advance(f,200);assert.equal(f.packets.length,4);
+  });
+  await test('autonomous limits resume on config change and stale config cannot restart a stopped loop',async()=>{
+    const f=controlledFixture();await f.run(f.api.automationConfigure(autoConfig({}, {}, {revision:1})));
+    f.me.state=3;f.module.getTimerByRole=()=>({startTime:100000,endTime:100500});
+    await advance(f,100);
+    await f.run(f.api.automationConfigure(autoConfig({max_battles:1},{},{revision:2})));
+    await advance(f,400);assert.equal(f.packets.length,1);
+    await f.run(f.api.automationConfigure(autoConfig({max_battles:2},{},{revision:3})));
+    assert.equal(f.packets.length,2);
+    await f.run(f.api.automationConfigure(autoConfig({}, {}, {enabled:false,revision:4})));
+    await f.run(f.api.automationConfigure(autoConfig({}, {}, {revision:2})));
+    await advance(f,1000);assert.equal(f.packets.length,2);
+    await f.run(f.api.stop());await advance(f,500);assert.equal(f.packets.length,2);
+  });
+  await test('autonomous speed uses fractional interval and needs no per-operation bridge calls',async()=>{
+    const f=fixture(),times=[];const service=f.manager.service;
+    f.manager.service=(fn,args)=>{if(fn===f.rpc.moveSpeedUp)times.push(f.context.Date.now());return service(fn,args);};
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false},{enabled:true,interval_seconds:.25,max_times:2})));
+    await advance(f,700);
+    assert.equal(f.sent.length,2);assert.deepEqual(times,[100000,100250]);
+    assert.equal((await f.run(f.api.automationEvents())).speed_times,2);
+    await advance(f,1000);assert.equal(f.sent.length,2);
+  });
+  await test('slow or uncertain speed response does not block autonomous attack timer',async()=>{
+    const f=controlledFixture({delay:30000});f.me.state=2;f.move.arrive=110000;
+    f.data.buildings.set('2_2',{members:new Set([2])});
+    await f.run(f.api.automationConfigure(autoConfig({lead_ms:10000,interval_ms:75},
+      {enabled:true,interval_seconds:.25,max_times:1})));
+    await advance(f,500);
+    assert(f.sent.length>=1);assert(f.packets.length>=6);
+    await advance(f,8000);assert(f.packets.length>=100);
+    assert.equal((await f.run(f.api.diagnose())).uncertain,true);
+    assert((await f.run(f.api.automationEvents())).events.some(e=>e.kind==='speed_stopped' && e.level==='ERROR'));
+    await f.run(f.api.stop());const count=f.packets.length;
+    await advance(f,1000);assert.equal(f.packets.length,count);
+  });
+  await test('events have bounded storage and cursor reads never gate the JS timer',async()=>{
+    const f=controlledFixture();await f.run(f.api.automationConfigure(autoConfig()));
+    const first=await f.run(f.api.automationEvents());
+    await advance(f,1000);
+    const next=await f.run(f.api.automationEvents({after_seq:first.cursor}));
+    assert(next.events.every(e=>e.seq>first.cursor));assert.equal(f.packets.length,6);
+    assert(next.events.some(e=>e.kind==='challenge_sent' && e.level==='INFO'));
+    assert(first.events.some(e=>e.level==='DEBUG'));
+    assert.equal((await f.run(f.api.automationEvents({after_seq:next.cursor}))).events.length,0);
+  });
+
+  await test('incoming window starts at x even between normal idle scan ticks',async()=>{
+    const f=controlledFixture();f.enemy.state=2;f.data.buildings.get('1_1').members.delete(2);
+    f.data.moveInfos.set(2,{to:{x:1,y:1},arrive:100501});
+    await f.run(f.api.automationConfigure(autoConfig({lead_ms:400})));
+    await advance(f,100);assert.equal(f.packets.length,0);
+    await advance(f,1);assert.equal(f.packets.length,1);
+  });
+  await test('JS dynamic x uses reply RTT while selection and dispatch stay local',async()=>{
+    const f=controlledFixture();
+    await f.run(f.api.automationConfigure(autoConfig({dynamic_lead:true,lead_ms:400})));
+    await advance(f,100);f.packets[0].resolve({err:null,resp:{}});
+    f.me.state=2;f.move.arrive=100500;f.data.buildings.set('2_2',{members:new Set([2])});
+    await advance(f,349);assert.equal(f.packets.length,1);
+    await advance(f,1);assert.equal(f.packets.length,2);
+    const summary=await f.run(f.api.automationEvents());
+    assert.equal(summary.effective_lead_ms,50);assert.equal(summary.attack_latency.mean_one_way_ms,50);
+  });
+  for(const [mine,power,cap] of [[0,100,0],[-1,100,0],[1000,0,0],[1000,-1,0],[1000,1000,0],[1000,500,500]]){
+    await test('autonomous eligibility excludes unknown/equal/over-limit power '+[mine,power,cap],async()=>{
+      const f=controlledFixture();f.me.power=mine;f.me.planPower=[mine];f.enemy.power=power;f.enemy.planPower=[power];
+      await f.run(f.api.automationConfigure(autoConfig({power_limit:cap})));
+      await advance(f,400);assert.equal(f.packets.length,0);
+    });
+  }
+  await test('one broken native target check cannot prevent selecting another legal player',async()=>{
+    const f=controlledFixture(),other={id:3,lId:20,state:1,power:300,planPower:[300]};
+    f.data.roles.set(3,other);f.data.buildings.get('1_1').members.add(3);
+    f.module.getBuildingOpSnapshot=()=>({attackQueue:[{role:f.enemy},{role:other}],defenseQueue:[]});
+    const check=f.module.canAttack;
+    f.module.canAttack=(x,y,role)=>{if(role.id===2)throw Error('bad target');return check.call(f.module,x,y,role);};
+    await f.run(f.api.automationConfigure(autoConfig()));assert.equal(f.packets[0].params.targetId,3);
+    assert((await f.run(f.api.automationEvents())).events.some(e=>e.kind==='eligibility_error' && e.level==='ERROR'));
+  });
+  await test('configuration stopped during async initialization cannot restart either timer',async()=>{
+    const f=fixture();let release;
+    const original=f.context.System.import;f.context.System.import=name=>{f.context.System.import=original;return new Promise(r=>{release=()=>original(name).then(r);});};
+    const configuring=f.api.automationConfigure(autoConfig({}, {enabled:true}));
+    await f.run(f.api.stop());release();await f.run(configuring);
+    await advance(f,1000);assert.equal(f.sent.length,0);
+  });
+  await test('new controller can take over and old controllers cannot resume automation',async()=>{
+    const f=controlledFixture();await f.run(f.api.automationConfigure(autoConfig({}, {}, {controller:'old',revision:50})));
+    await f.run(f.api.automationConfigure(autoConfig({}, {}, {controller:'new',revision:0,enabled:false})));
+    await f.run(f.api.automationConfigure(autoConfig({}, {}, {controller:'old',revision:51})));
+    await advance(f,1000);assert.equal(f.packets.length,1);
+  });
+  await test('log cursor batches cannot skip a backlog, and overflow is explicitly reported',async()=>{
+    const f=controlledFixture();await f.run(f.api.automationConfigure(autoConfig({interval_ms:1})));
+    for(let i=0;i<5;i++)await advance(f,1000);
+    const first=await f.run(f.api.automationEvents());
+    assert(first.dropped>0);assert.equal(first.events.length,512);
+    const second=await f.run(f.api.automationEvents({after_seq:first.cursor}));
+    assert.equal(second.events[0].seq,first.cursor+1);assert.equal(second.dropped,0);
+    assert(f.packets.length>=5000);
+  });
+
+  await test('stop during asynchronous local speed read prevents native dispatch',async()=>{
+    const f=fixture();const role=f.module.getSeasonMapMyRole;let armed=true;
+    f.module.getSeasonMapMyRole=()=>{if(armed){armed=false;f.api.stop();}return role();};
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false},{enabled:true})));
+    await advance(f,1000);assert.equal(f.sent.length,0);
+  });
+
   console.log('Original UI eligibility source: '+(process.env.BLOODMOON_GAME_SOURCE || (originalSpeedCheck ? 'verified from output game.js' : 'not available; fallback fixture')));
   console.log('All offline bloodmoon JS fixtures passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

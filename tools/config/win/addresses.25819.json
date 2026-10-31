@@ -1,7 +1,7 @@
 {
-  "LoadStartHookOffset": "0x2d5a240",
-  "CDPFilterHookOffset": "0x385e1d0",
-  "CastToJsonHookOffset": "0x9f0abb0",
+  "LoadStartHookOffset": "0x2d5a200",
+  "CDPFilterHookOffset": "0x385e190",
+  "CastToJsonHookOffset": "0x9f0ab70",
   "MiniAppConfigStructOffsets": {
     "LaunchConfigOffsets": [
       64,

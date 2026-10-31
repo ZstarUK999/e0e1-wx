@@ -2,9 +2,9 @@
 
 当前运行规则：
   1. 赶路与挑战直接调用游戏接口；赶路间隔可调，剩余低于8秒停止；
-  2. 请求没有明确回执就是 uncertain，停止本轮自动动作，不重试不重放；
-  3. 临时条件等待恢复；明确拒绝按间隔再检查，结果未知不重发；
-  4. 隐匿显示使用客户端已同步数据；自动挑战仍须满足原生驻留资格。
+  2. JS自主执行攻击与赶路循环；Python仅下发配置和读取低频摘要；
+  3. 旧攻击的超时、拒绝、异常独立记录，不停止后续扫描或挑战；
+  4. 隐匿显示使用客户端已同步数据；提前窗口允许请求，由服务端判定开战资格。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import asyncio
 import logging
 import json
 import time
+import uuid
 from datetime import datetime
 
 LOG = logging.getLogger('plugin_manager')
@@ -36,9 +37,6 @@ def _decision(name: str, payload: dict) -> None:
         LOG.log(level, '血月决策 %s %s', name, encoded)
         _DECISION_LOG[name] = (encoded, now)
 
-ATTACK_PROBE_SECONDS = 0     # 挑战后核对状态同步的间隔
-ATTACK_SYNC_TIMEOUT = 60     # 同步延迟提示阈值；继续观察，不把迟到通知永久锁死。
-
 SOURCE_TEXT = {
     'season_map': '战场同步数据（含战旗）',
     'preview_signup': '入场前报名名单（战旗未下发）',
@@ -55,20 +53,17 @@ class SeasonFeature:
         self._injected = False
         self._probing = False
         self._next_probe = 0.0
-        self._next_speed = 0.0
-        self._next_attack = 0.0
-        self.scan_interval_ms = 100
-        self._deferred_targets = {}
+        self.scan_interval_ms = 1000
         self._marks = None
         self._next_mark_check = 0.0
         self._lock = asyncio.Lock()
-        self._speed_stopped = ''       # 加速停止原因（空表示可以继续）
-        self._attack_stopped = ''      # 攻击停止原因
-        self._attack_wait_until = 0.0  # 上一场结束后等待到什么时候
-        self._attack_pending = False   # 已发起挑战，等服务端把状态同步成战斗
-        self._attack_token = None
-        self._attack_seen_battle = False
-        self._attack_since = 0.0
+        self._automation_lock = asyncio.Lock()
+        self._automation_config = None
+        self._controller_id = uuid.uuid4().hex
+        self._event_stream = None
+        self._event_cursor = 0
+        self._next_events = 0.0
+        self._config_task = None
         self._battles = 0
         self._snapshot = None
         self._config_epoch = 0
@@ -76,6 +71,23 @@ class SeasonFeature:
 
     def _configuration_changed(self, _state) -> None:
         self._config_epoch += 1
+        if self._injected and self.state.installed and not self.state.closing:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            if self._config_task is None or self._config_task.done():
+                self._config_task = loop.create_task(self._push_configuration())
+
+    async def _push_configuration(self) -> None:
+        try:
+            while self._injected and self.state.installed and not self.state.closing:
+                epoch = self._config_epoch
+                await self._sync_automation(self.store.snapshot().get('bloodmoon') or {})
+                if epoch == self._config_epoch:
+                    return
+        except Exception as exc:
+            LOG.warning('血月配置下发失败，下次重试：%s', exc)
 
     # ── 面板入口 ──
 
@@ -86,7 +98,7 @@ class SeasonFeature:
         asyncio.create_task(self.handle(op, args or {}))
 
     async def handle(self, op: str, args: dict) -> None:
-        LOG.info('血月面板操作：op=%s args=%r injected=%s stopped=(%r,%r) pending=%s battles=%s', op, args, self._injected, self._speed_stopped, self._attack_stopped, self._attack_pending, self._battles)
+        LOG.info('血月面板操作：op=%s args=%r injected=%s battles=%s', op,args,self._injected,self._battles)
         if op == 'probe' and args.get('on') and not (self.store.snapshot().get('bloodmoon') or {}).get('enabled'):
             LOG.info('血月探测未启动：总开关关闭 op=%s args=%r', op, args)
             self.panel.set_message('请先开启血月总开关，再开始战旗探测')
@@ -123,14 +135,9 @@ class SeasonFeature:
             self.panel.set_message(f'血月操作失败：{exc}')
 
     def _reset_local(self) -> None:
-        self._attack_token = None
-        self._deferred_targets.clear()
-        self._speed_stopped = self._attack_stopped = ''
-        self._attack_pending = False
-        self._attack_seen_battle = False
-        self._attack_since = 0.0
-        self._attack_wait_until = 0.0
         self._battles = 0
+        self._automation_config = None
+        self._next_events = 0.0
 
     def set_probing(self, on: bool) -> None:
         self._probing = bool(on)
@@ -153,15 +160,13 @@ class SeasonFeature:
 
     def reset(self) -> None:
         """会话结束后丢弃注入标记与运行态。"""
-        self._attack_token = None
         self._injected = False
         self._probing = False
         self._marks = None
-        self._speed_stopped = self._attack_stopped = ''
-        self._attack_pending = False
-        self._attack_seen_battle = False
-        self._attack_since = 0.0
-        self._attack_wait_until = 0.0
+        self._automation_config = None
+        self._event_stream = None
+        self._event_cursor = 0
+        self._next_events = 0.0
         self._battles = 0
         self._snapshot = None
         self.panel.set_probe_running(False)
@@ -181,11 +186,15 @@ class SeasonFeature:
             if self._injected and not bloodmoon.get('enabled'):
                 # 总开关关掉就顺手停掉标注，不在页面里继续跑
                 try:
-                    await self.transport.season_call('stop')
+                    result = await self.transport.season_call('stop')
+                    if not isinstance(result,dict) or result.get('ok') is not True:
+                        raise RuntimeError('JS停止未确认')
+                    LOG.info('血月JS循环及反隐已停止：总开关关闭')
                 except Exception as exc:
                     LOG.exception('停止血月脚本失败：%s', exc)
                     return  # Retry cleanup while the switch remains off.
                 self._injected = False
+                self._automation_config = None
                 self._marks = None
             return
         try:
@@ -195,11 +204,7 @@ class SeasonFeature:
             async with self._lock:
                 if config_epoch != self._config_epoch or self.state.closing:
                     return
-                # 抵达后优先发现并挑战，不让加速、诊断、探测阻塞首次选敌。
-                await self._poll_attack(bloodmoon)
-                if config_epoch != self._config_epoch or self.state.closing:
-                    return
-                await self._poll_speed(bloodmoon)
+                await self._sync_automation(bloodmoon)
             if config_epoch != self._config_epoch or self.state.closing:
                 return
             await self._sync_marks(bloodmoon)
@@ -307,261 +312,60 @@ class SeasonFeature:
             min=constants.get('MarchSpeedUpMinTime'), item=constants.get('MarchSpeedUpItem') or '-',
             pre=constants.get('PreEnterMinutes'))
 
-    # ── 自动加速 ──
+    # JS runs both realtime loops. These calls carry configuration/events only.
 
-    async def _poll_speed(self, bloodmoon: dict) -> None:
-        config_epoch = self._config_epoch
-        speed = bloodmoon.get('speed_up') or {}
-        _decision('speed', {'config': speed, 'stopped': self._speed_stopped, 'due': time.monotonic() >= self._next_speed})
-        if not speed.get('enabled'):
-            self.panel.set_speed_status('未启用' + (f'；保留停止状态：{self._speed_stopped}' if self._speed_stopped else ''))
-            return
-        if self._speed_stopped:
-            return
-        if time.monotonic() < self._next_speed:
-            return
-        self._next_speed = time.monotonic() + 0.1  # 扫描频率；请求间隔由JS按游戏配置/自定义值执行。
-        interval_seconds = int(speed.get('interval_seconds') or 0)
-        state = await self.transport.season_call('march', {'interval_seconds': interval_seconds})
-        if config_epoch != self._config_epoch or self.state.closing:
-            return
-        _decision('march_snapshot', {'snapshot': state})
-        if not isinstance(state, dict) or not state.get('ok'):
-            LOG.warning('行军状态读取失败：%r', state)
-            result = state if isinstance(state, dict) else {}
-            self.panel.set_speed_status(f"读取行军状态失败：{result.get('message') or '未知原因'}")
-            return
-        move = state.get('move')
-        info = state.get('speed_up') or {}
-        if not move:
-            self.panel.set_speed_status('当前没有行军，等待下一次行军')
-            return
-        times = int(info.get('times') or 0)
-        limit = int(speed.get('max_times') or 0)
-        remain = max(0, int(move.get('remain_ms') or 0)) // 1000
-        if limit and times >= limit:
-            LOG.debug('自动加速等待：达到行军上限 times=%s limit=%s remain=%s', times, limit, remain)
-            self.panel.set_speed_status(f"已达到本次行军上限 {limit} 次，剩余 {remain} 秒不再加速")
-            return
-        if not info.get('available'):
-            reason = '；'.join(info.get('reasons') or []) or '当前不可加速'
-            LOG.debug('自动加速等待：%s remain=%s', reason, remain)
-            self.panel.set_speed_status(f"等待合法时机：{reason}（剩余 {remain} 秒）")
-            return
-        if int(move.get('remain_ms') or 0) < 8000:
-            self.panel.set_speed_status('剩余不足8秒，不再赶路')
-            return
-        LOG.info('准备直接赶路：times=%s limit=%s remain=%s interval=%s', times, limit, remain, info.get('interval_seconds'))
-        try:
-            receipt = await self.transport.season_call('speedUp', {'interval_seconds': interval_seconds, 'max_times': limit})
-        except Exception as exc:
-            LOG.exception('行军加速传输失败，停止自动加速')
-            receipt = {'ok': False, 'status': 'uncertain', 'message': f'加速回执未取得：{exc}'}
-        LOG.info('行军加速回执：%r', receipt)
-        if not isinstance(receipt, dict) or receipt.get('ok') is not True or receipt.get('confirmed') is not True:
-            result = receipt if isinstance(receipt, dict) else {}
-            status = result.get('status') or 'uncertain'
-            message = result.get('message') or '未取得明确成功回执'
-            if status == 'retry_later' and result.get('request_sent') is True:
-                self.panel.set_speed_status(f'本次赶路被拒绝，等待间隔/下一次行军：{message}')
+    async def _sync_automation(self, bloodmoon: dict) -> None:
+        epoch = self._config_epoch
+        payload = {'enabled': bool(bloodmoon.get('enabled')),
+                   'attack': dict(bloodmoon.get('attack') or {}),
+                   'speed_up': dict(bloodmoon.get('speed_up') or {})}
+        # Legacy display-only fields are not sent to the game loop.
+        payload['attack'] = {k: payload['attack'][k] for k in
+            ('enabled','lead_ms','dynamic_lead','interval_ms','power_limit','max_battles','lowest_power_first')
+            if k in payload['attack']}
+        payload['speed_up'] = {k: payload['speed_up'][k] for k in
+            ('enabled','interval_seconds','max_times') if k in payload['speed_up']}
+        key = json.dumps(payload, sort_keys=True)
+        async with self._automation_lock:
+            if epoch != self._config_epoch or self.state.closing:
                 return
-            if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
-                self.panel.set_speed_status(f'等待赶路条件：{message}')
-                return
-            if status == 'uncertain':
-                self._speed_stopped = message
-                LOG.error('加速结果未知，停止本次行军的自动加速：%s', message)
-                self.panel.set_speed_status(f"结果未知，已停止：{message}（可在面板点复位后继续）")
-            else:
-                self._speed_stopped = message
-                LOG.info('加速被拒绝，停止本次行军自动加速：%s', message)
-                self.panel.set_speed_status(f"已停止：{message}")
-            return
-        LOG.info('行军加速成功：第%s次，剩余约%s秒', receipt.get('times'), remain)
-        self.panel.set_speed_status(f"已加速 {receipt.get('times')} 次（上限 {limit or '不限'}），等待冷却")
+            if key != self._automation_config:
+                result = await self.transport.season_call('automationConfigure',
+                    dict(payload, controller=self._controller_id, revision=epoch, after_seq=self._event_cursor,stream_id=self._event_stream))
+                if not isinstance(result, dict) or result.get('ok') is not True:
+                    raise RuntimeError('JS自动循环配置未确认')
+                if epoch != self._config_epoch:
+                    return
+                self._automation_config = key
+                self._next_events = time.monotonic() + 1
+                self._display_automation(result)
+            elif time.monotonic() >= self._next_events:
+                self._next_events = time.monotonic() + 1
+                result = await self.transport.season_call('automationEvents', {'after_seq': self._event_cursor,'stream_id':self._event_stream})
+                if epoch == self._config_epoch and isinstance(result, dict) and result.get('ok'):
+                    self._display_automation(result)
 
-    # ── 自动攻击 ──
-
-    async def _poll_attack(self, bloodmoon: dict) -> None:
-        config_epoch = self._config_epoch
-        attack = bloodmoon.get('attack') or {}
-        _decision('attack', {'config': attack, 'stopped': self._attack_stopped, 'pending': self._attack_pending, 'seen_battle': self._attack_seen_battle, 'since': self._attack_since, 'battles': self._battles, 'due': time.monotonic() >= self._attack_wait_until, 'sync_expired': bool(self._attack_since and time.monotonic() - self._attack_since > ATTACK_SYNC_TIMEOUT), 'sync_timeout': ATTACK_SYNC_TIMEOUT, 'probe_seconds': ATTACK_PROBE_SECONDS})
-        if not attack.get('enabled'):
-            self.panel.set_attack_status('未启用' + (f'；保留停止状态：{self._attack_stopped}' if self._attack_stopped else ''))
-            return
-        if self._attack_stopped:
-            return
-        if time.monotonic() < self._attack_wait_until:
-            return
-        wait = 0  # 不设两场间隔；每次轮询仍核对真实战斗状态与按钮资格。
-        self._attack_wait_until = time.monotonic()
-        snapshot = await self.transport.season_call('candidates', {'compact': True})
-        if config_epoch != self._config_epoch or self.state.closing:
-            return
-        _decision('candidate_snapshot', {'snapshot': snapshot})
-        if not isinstance(snapshot, dict) or not snapshot.get('ok'):
-            LOG.warning('节点队列读取失败：%r', snapshot)
-            result = snapshot if isinstance(snapshot, dict) else {}
-            self.panel.set_attack_status(f"读取节点队列失败：{result.get('message') or '未知原因'}")
-            return
-        state = snapshot.get('self_state')
-        self.scan_interval_ms = 100
-        end_time = int(snapshot.get('battle_end_time') or 0)
-        server_now = int(snapshot.get('server_now') or 0)
-        if state == 3 and end_time > 0 and server_now > 0:
-            # 预计结束前200ms进入高频扫描；只在服务端回到idle后发送。
-            self.scan_interval_ms = max(50, min(100, end_time - server_now - 200))
-        observation = snapshot.get('attack_observation') or {}
-        if (self._attack_pending and self._attack_token and
-                observation.get('token') == self._attack_token and observation.get('completed') is True):
-            self._attack_pending = False
-            self._attack_seen_battle = True
-            LOG.info('挑战结算通知已确认：token=%s；按当前状态继续等待/选敌', self._attack_token)
-        if self._attack_pending:
-            LOG.debug('挑战同步决策：self_state=%r state_name=%r elapsed=%s timeout=%s wait=%s', state, snapshot.get('self_state_name'), time.monotonic() - self._attack_since, ATTACK_SYNC_TIMEOUT, wait)
-            # 无匹配结算通知时，只有明确战斗状态确认进入；缺失/行军不能代替。
-            if state == 3:
-                self._attack_pending = False
-                self._attack_seen_battle = True
-                self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-                self.panel.set_attack_status(f"战斗中（{snapshot.get('self_state_name') or state}），结束后再选目标")
-                return
-            if time.monotonic() - self._attack_since > ATTACK_SYNC_TIMEOUT:
-                _decision('attack_sync_delayed', {'token': self._attack_token, 'state': state})
-                self.panel.set_attack_status('挑战已受理，尚未观察到战斗或结算；持续核对同步，避免重复发起')
-                return
-            self.panel.set_attack_status('已发起挑战，等待服务端同步战斗状态')
-            self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-            return
-        if state == 3:
-            self._attack_seen_battle = True
-            self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-            self.panel.set_attack_status('战斗中，等待结束后继续挑战')
-            return
-        if self._attack_seen_battle:
-            if state != 1:
-                self.panel.set_attack_status(f"等待战斗结束的待命确认（当前 {snapshot.get('self_state_name') or state}）")
-                self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-                return
-            self._attack_seen_battle = False
-            self._attack_wait_until = time.monotonic() + wait
-            LOG.info('战斗结束已确认：wait_seconds=%s wait_until=%s', wait, self._attack_wait_until)
-            self.panel.set_attack_status('战斗结束，待命后继续扫描选敌')
-            if wait > 0:
-                return
-        if state != 1:
-            self.panel.set_attack_status(f"等待战斗/行军结束（当前 {snapshot.get('self_state_name') or state}）")
-            return
-        limit = int(attack.get('max_battles') or 0)
-        if limit and self._battles >= limit:
-            self.panel.set_attack_status(f"已达到单轮上限 {limit} 场；提高上限或复位后继续")
-            return
-        now = time.monotonic()
-        self._deferred_targets = {role_id:until for role_id,until in self._deferred_targets.items() if until > now}
-        selectable = dict(snapshot)
-        for key in ('attack', 'defense'):
-            selectable[key] = [row for row in snapshot.get(key, []) if row.get('roleId') not in self._deferred_targets]
-        target = self._pick(selectable, attack)
-        if target is None:
-            LOG.debug('自动攻击未选到目标：mine=%s ratio=%s absolute=%s reason=%s', snapshot.get('self_plan_power') or snapshot.get('self_power'), attack.get('power_ratio'), attack.get('power_limit'), self._no_target_reason(snapshot, attack))
-            self.panel.set_attack_status(self._no_target_reason(snapshot, attack))
-            return
-        LOG.info('准备挑战：roleId=%s power=%s mine=%s ratio=%s absolute=%s battles=%s limit=%s', target['roleId'], target.get('planPower') or target.get('power'), snapshot.get('self_plan_power') or snapshot.get('self_power'), attack.get('power_ratio'), attack.get('power_limit'), self._battles, limit)
-        try:
-            receipt = await self.transport.season_call('attack', {'roleId': target['roleId'], 'power_ratio': 100, 'power_limit': int(attack.get('power_limit') or 0)})
-        except Exception as exc:
-            LOG.exception('挑战传输失败，停止自动攻击：roleId=%s', target['roleId'])
-            receipt = {'ok': False, 'status': 'uncertain', 'message': f'挑战回执未取得：{exc}'}
-        LOG.info('挑战回执：roleId=%s receipt=%r', target['roleId'], receipt)
-        if not isinstance(receipt, dict) or receipt.get('ok') is not True or receipt.get('confirmed') is not True:
-            result = receipt if isinstance(receipt, dict) else {}
-            status = result.get('status') or 'uncertain'
-            message = result.get('message') or '未取得明确成功回执'
-            if status == 'target_unavailable' and result.get('roleId') == target['roleId']:
-                delay = max(1.0, float(result.get('retry_after_ms') or 1000) / 1000)
-                self._deferred_targets[target['roleId']] = time.monotonic() + delay
-                self.panel.set_attack_status('目标正在行军，暂缓该目标，继续扫描当前节点')
-                LOG.info('挑战目标暂不可用：roleId=%s，暂缓%s秒，继续节点扫描', target['roleId'], delay)
-                return
-            if status == 'retry_later' and result.get('request_sent') is True:
-                self._attack_wait_until = time.monotonic() + max(1.0, float(result.get('retry_after_ms') or 1000) / 1000)
-                self.panel.set_attack_status(f'本次挑战被拒绝，稍后重新扫描：{message}')
-                LOG.info('挑战明确未成功，短暂退避后继续扫描：%s', message)
-                return
-            if status in ('waiting', 'unavailable') and result.get('request_sent') is False:
-                self.panel.set_attack_status(f'等待挑战条件：{message}')
-                return
-            self._attack_stopped = message
-            LOG.error('挑战未成功，停止自动攻击：%s（%s）', message, status)
-            self.panel.set_attack_status(f"已停止：{message}")
-            return
-        self._battles += 1
-        self._attack_token = receipt.get('attack_token')
-        self._attack_pending = True
-        self._attack_since = time.monotonic()
-        self._attack_wait_until = time.monotonic() + ATTACK_PROBE_SECONDS
-        LOG.info('已发起挑战：%s（战力 %s）第%s场', receipt.get('name') or target['roleId'], target.get('power'), self._battles)
-        self.panel.set_attack_status(f"已挑战 {receipt.get('name') or target['roleId']}（第{self._battles}场），等待战斗状态同步")
-
-    @staticmethod
-    def _pick(snapshot: dict, attack: dict):
-        """挑一个能打、战力够低的目标：战力最高的那个（打得过里最强的）。"""
-        mine = int(snapshot.get('self_plan_power') or snapshot.get('self_power') or 0)
-        if mine <= 0:
-            LOG.debug('选敌停止：self_plan_power=%r self_power=%r effective_mine=%s', snapshot.get('self_plan_power'), snapshot.get('self_power'), mine)
-            return None
-        ratio = 100
-        absolute = int(attack.get('power_limit') or 0)
-        ceiling = mine * ratio // 100 if mine > 0 else 0
-        if absolute and (ceiling <= 0 or absolute < ceiling):
-            ceiling = absolute
-        _decision('target_threshold', {'mine': mine, 'ratio': ratio, 'absolute': absolute, 'ceiling': ceiling})
-        if ceiling <= 0:
-            return None
-        best = None
-        for row in list(snapshot.get('attack') or []) + list(snapshot.get('defense') or []):
-            _decision('target_' + str(row.get('roleId')), {'roleId': row.get('roleId'), 'attackable': row.get('attackable'), 'planPower': row.get('planPower'), 'power': row.get('power'), 'reasons': row.get('reasons'), 'ceiling': ceiling})
-            if not row.get('attackable'):
-                continue
-            power = int(row.get('planPower') or row.get('power') or 0)
-            if power <= 0:
-                continue
-            if ceiling and power >= ceiling:
-                continue
-            if best is None or power > int(best.get('planPower') or best.get('power') or 0):
-                best = row
-        _decision('target_selected', {'target': best})
-        return best
-
-    @staticmethod
-    def _no_target_reason(snapshot: dict, attack: dict) -> str:
-        rows = list(snapshot.get('attack') or []) + list(snapshot.get('defense') or [])
-        if not rows:
-            return '当前节点没有可见的其他玩家'
-        mine = int(snapshot.get('self_plan_power') or snapshot.get('self_power') or 0)
-        ratio = 100
-        if mine <= 0:
-            return '我方战力尚未可靠读取，暂停选敌'
-        ceiling = mine * ratio // 100
-        absolute = int(attack.get('power_limit') or 0)
-        if absolute:
-            ceiling = min(ceiling, absolute)
-        blocked = [r for r in rows if not r.get('attackable')]
-        too_strong = [r for r in rows if r.get('attackable')
-                      and int(r.get('planPower') or r.get('power') or 0) >= ceiling]
-        unknown = [r for r in rows if r.get('attackable')
-                   and int(r.get('planPower') or r.get('power') or 0) <= 0]
-        if not blocked and not too_strong and not unknown:
-            return '当前节点没有可见的其他玩家'
-        bits = []
-        if unknown:
-            bits.append(f"{len(unknown)} 人战力尚未可靠读取")
-        if too_strong:
-            bits.append(f"{len(too_strong)} 人战力不低于阈值")
-        if blocked:
-            reasons = {}
-            for row in blocked:
-                for reason in row.get('reasons') or []:
-                    reasons[reason] = reasons.get(reason, 0) + 1
-            bits.append('、'.join(f"{k}×{v}" for k, v in reasons.items()))
-        return '无可挑战目标：' + '；'.join(bits)
+    def _display_automation(self, result: dict) -> None:
+        stream = result.get('stream_id')
+        if stream is not None and stream != self._event_stream:
+            self._event_stream = stream
+            self._event_cursor = 0
+        for event in result.get('events') or []:
+            if int(event.get('seq') or 0) > self._event_cursor:
+                level = {'DEBUG':logging.DEBUG,'INFO':logging.INFO,'WARNING':logging.WARNING,'ERROR':logging.ERROR}.get(event.get('level'),logging.INFO)
+                LOG.log(level,'血月JS事件：%s game_at_ms=%s seq=%s %s',
+                        event.get('kind'),event.get('at'),event.get('seq'),event.get('detail'))
+        if result.get('dropped'):
+            LOG.warning('血月事件缓冲已覆盖 %s 条较早事件', result['dropped'])
+        self._event_cursor = int(result.get('cursor') or self._event_cursor)
+        self._battles = int(result.get('battles') or 0)
+        self.panel.set_attack_status(result.get('attack_status') or 'JS循环已配置')
+        self.panel.set_speed_status(result.get('speed_status') or 'JS循环已配置')
+        latency = result.get('attack_latency') or {}
+        count = int(latency.get('sample_count') or 0)
+        lead = int(result.get('effective_lead_ms') or 0)
+        if count:
+            self.panel.attack_latency_status.setText(
+                f"RTT/2：{float(latency.get('mean_one_way_ms') or 0):.1f}ms；近10秒 {count} 个回包；实际提前量 {lead}ms")
+        else:
+            self.panel.attack_latency_status.setText(f'RTT/2：暂无回包样本；实际提前量 {lead}ms')

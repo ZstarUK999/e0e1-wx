@@ -32,7 +32,21 @@ def save(kind,value):
     elif kind=='entry':
         if not {'pid','processStart','hwnd','width','height','dpi','x','y','runtimeId'}.issubset(value):return
     else:raise ValueError('Unknown position cache')
-    data=load();data.update(schema=1);data[kind]=value
+    data=load()
+    previous=data.get('native',{})
+    if kind=='native' and all(previous.get(k)==value.get(k) for k in
+            ('pid','processCreatedAt','hwnd','clientSize','version','scaleX','scaleY')):
+        # A different page may omit 小程序; keep its last known position for the fast path.
+        merged=[]
+        labels={c.get('label') for c in value['controls']}
+        for control in previous.get('controls',[]):
+            if control.get('label') not in ('发现','小程序') or control.get('label') in labels:continue
+            center=control.get('screenCenter')
+            if not center:continue
+            merged.append({**control,'screenCenter':{
+                axis:center[axis]-previous['origin'][axis]+value['origin'][axis] for axis in ('x','y')}})
+        value['controls']=merged+value['controls']
+    data.update(schema=1);data[kind]=value
     path=cache_path();path.parent.mkdir(parents=True,exist_ok=True)
     fd,tmp=tempfile.mkstemp(dir=path.parent,prefix=path.name,suffix='.tmp')
     try:

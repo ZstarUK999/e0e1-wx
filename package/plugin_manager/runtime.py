@@ -301,7 +301,8 @@ class PluginRuntime(QObject):
             self.automation.reset_handlers()
             self.automation.begin('pet_fodder', manual=True)
         else:
-            if not self.window.store.snapshot()['daily']['enabled']:
+            daily = self.window.store.snapshot()['daily']
+            if not daily['enabled'] and not any(task['enabled'] for task in daily['tasks'].values()):
                 return False
             self.automation.reset_handlers()
             self.automation.set_automation(True)
@@ -320,7 +321,8 @@ class PluginRuntime(QObject):
 
     def _on_config(self, state):
         self.timer.setInterval(100 if state.get('bloodmoon', {}).get('enabled') else 1000)
-        LOG.info('插件配置更新：总开关=%s，启用任务=%s，玩家信息=%s',state['daily']['enabled'],[k for k,v in state['daily']['tasks'].items() if v['enabled']],state['player']['enabled'])
+        tasks_enabled = any(task['enabled'] for task in state['daily']['tasks'].values())
+        LOG.info('插件配置更新：存在启用任务=%s，启用任务=%s，玩家信息=%s',tasks_enabled,[k for k,v in state['daily']['tasks'].items() if v['enabled']],state['player']['enabled'])
         self.state.configured = None
         self._next_overlay_sync = 0
         self._next_controls_sync = 0
@@ -328,7 +330,7 @@ class PluginRuntime(QObject):
             if self._recovery_job and not self._recovery_job.done():self._recovery_job.cancel()
             self.blank_recovery.candidate = None
             self.blank_recovery.samples = 0
-        if not state['daily']['enabled']:
+        if not tasks_enabled:
             self.restart_resume.cancel('daily')
             # 全部任务被反选时自动化没有意义，按钮同步回到“开始”。
             self.state.stop_operation = True
@@ -463,6 +465,15 @@ class PluginRuntime(QObject):
 
     async def _ensure_startup(self):
         if getattr(self,'_startup_checked',True):return True
+        if self.platform_name == '微信':
+            # Keep the launcher available for explicit restart flows, but platform
+            # selection only prepares debugging and waits for a manual game launch.
+            self.session.request_debug()
+            self._startup_checked = True
+            self._next_startup_retry = 0.0
+            self.window.action_label.setText('等待手动打开微信中的《遗弃之地》')
+            LOG.info('微信自动启动游戏已关闭；调试监听已请求，等待手动打开游戏')
+            return True
         now=time.monotonic()
         if now<getattr(self,'_next_startup_retry',0.0):return False
         self._next_startup_retry=now+20

@@ -121,6 +121,64 @@ test('selected scan player uses public preview API without changing game UI',asy
   assert.notEqual(failed.status,'ok');assert.match(failed.message,/未找到对方数据.*330015/);
 });
 
+test('season attributes use the selected target and SeasonAttrCfg, beyond the normal attribute limit',async()=>{
+  const f=fixture(),original=f.g.System.import;
+  const configs=await original('chunks:///_virtual/configs.ts');
+  configs.SeasonAttrCfg={list:[{id:200103,note:'赛季最终增伤',style:2,show:1,namesort:2}],
+    getById:id=>id===200103?{note:'赛季最终增伤',style:2}:null};
+  // 本人与目标故意设为不同值，防止错误读取 ROLE 或本地赛季模块。
+  f.role.hero.attribute.attributes=new Map([[200101,99999],[200103,9900]]);
+  const attribute=new Map(Array.from({length:90},(_,i)=>[i+1,0]));
+  attribute.set(200101,10300);attribute.set('200103',5000);
+  attribute.set(200105,3300);attribute.set(200107,26500);
+  const snapshot={id:12300123,name:'目标玩家',attribute};
+  f.g.System.import=async name=>{
+    const module=await original(name);
+    return name.includes('define-index')?{...module,GameService:{getRolePreviewInfo:async()=>({code:0,getData:()=>({preview:snapshot})})}}:module;
+  };
+  const result=await f.runtime.dispatch('player_information',{target_id:12300123});
+  assert.equal(result.status,'ok');
+  assert.match(result.value.text,/── 赛季属性 ──/);
+  for(const expected of ['深渊攻击力 10300','赛季最终增伤 50%','致命一击率 33%','致命一击伤害 265%'])
+    assert.ok(result.value.text.includes(expected),expected);
+  assert.doesNotMatch(result.value.text,/99999|99%/);
+  assert.equal(f.requests.length,0);assert.equal(f.inputs.length,0);
+});
+
+test('player page season attributes never fill missing target data with local values',async()=>{
+  const f=fixture();f.cfg.Setting={id:'Setting'};
+  f.role.hero.attribute.attributes=new Map([[200101,99999],[200103,9900],[200105,8800]]);
+  const snapshot={id:777,name:'目标',attribute:new Map([[200103,0],[200107,26550]])};
+  const page={isPersonal:false,node:{activeInHierarchy:true},info:snapshot};
+  const screen={isValid:true,isSelf:false,view:{page_info:page},info:snapshot};
+  f.windows.set(f.cfg.Setting,screen);
+  let result=await f.runtime.dispatch('player_information');
+  assert.equal(result.status,'ok');
+  assert.match(result.value.text,/深渊攻击力：未下发/);
+  assert.match(result.value.text,/赛季最终增伤 0%/);
+  assert.match(result.value.text,/致命一击伤害 265\.5%/);
+  assert.doesNotMatch(result.value.text,/99999|99%|88%/);
+  delete snapshot.attribute;
+  result=await f.runtime.dispatch('player_information');
+  assert.match(result.value.text,/致命一击率：未下发/);
+  screen.info=null;page.info=null;
+  result=await f.runtime.dispatch('player_information');
+  assert.equal(result.value,null);
+  assert.equal(f.requests.length,0);assert.equal(f.inputs.length,0);
+});
+
+test('self season attributes use the ROLE hero attributes and do not mutate the role',async()=>{
+  const f=fixture();f.cfg.Setting={id:'Setting'};
+  f.role.hero.attribute.attributes=new Map([[200101,10300],[200103,5000],[200105,3300],[200107,26500]]);
+  const page={isPersonal:true,node:{activeInHierarchy:true}};
+  f.windows.set(f.cfg.Setting,{isValid:true,isSelf:true,view:{page_info:page}});
+  const result=await f.runtime.dispatch('player_information');
+  assert.equal(result.status,'ok');
+  assert.match(result.value.text,/深渊攻击力 10300/);
+  assert.match(result.value.text,/致命一击率 33%/);
+  assert.equal(f.role.attribute,undefined);
+});
+
 test('PVP inputs use raw permanent attributes, plan differences and complete Erlang gear',async()=>{
   const f=fixture(),original=f.g.System.import;
   const snapshot={id:12324803,name:'测试',attribute:new Map([[117,10000],[118,5000]]),

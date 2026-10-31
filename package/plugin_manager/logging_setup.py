@@ -1,4 +1,4 @@
-"""非阻塞本地文件日志；操作与错误落盘，循环查询不逐次记录。"""
+"""非阻塞本地日志：DEBUG只写文件，INFO及以上同时进入现有控制台。"""
 from __future__ import annotations
 
 import logging
@@ -39,9 +39,17 @@ class FileLogging:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.logger=logging.getLogger('plugin_manager')
         self.original_level=self.logger.level
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.DEBUG)
+        self.stream_levels=[]
+        ancestor=self.logger
+        while ancestor is not None:
+            for handler in ancestor.handlers:
+                if isinstance(handler,logging.StreamHandler) and not isinstance(handler,logging.FileHandler):
+                    self.stream_levels.append((handler,handler.level))
+                    handler.setLevel(max(logging.INFO,handler.level))
+            ancestor=ancestor.parent
         self.queue_handler=BoundedQueueHandler(queue.Queue(maxsize=4096))
-        self.file_handler=logging.handlers.RotatingFileHandler(self.path,maxBytes=5*1024*1024,backupCount=3,encoding='utf-8')
+        self.file_handler=logging.handlers.RotatingFileHandler(self.path,maxBytes=20*1024*1024,backupCount=5,encoding='utf-8')
         self.file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s',datefmt='%Y-%m-%d %H:%M:%S'))
         self.listener=BoundedQueueListener(self.queue_handler.queue,self.file_handler)
         self.logger.addHandler(self.queue_handler)
@@ -63,6 +71,8 @@ class FileLogging:
             self.file_handler.handle(record)
         self.file_handler.close()
         self.logger.setLevel(self.original_level)
+        for handler,level in self.stream_levels:
+            handler.setLevel(level)
 
 
 def start_file_logging(path: Path) -> FileLogging:
