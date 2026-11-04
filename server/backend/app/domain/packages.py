@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import zipfile
 import uuid
+import logging
+import time
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -20,6 +22,30 @@ from . import updates
 # 解压后是一个干净目录，和 build_exe.py --package 的产物保持一致
 PACKAGE_ROOT = "e0e1-wx-plugins"
 LICENSE_FILE_NAME = "license.bin"
+PACKAGE_RETENTION_SECONDS = 24 * 60 * 60
+LOG = logging.getLogger(__name__)
+
+
+def cleanup_expired_packages() -> int:
+    """只清理玩家包目录中超过 24 小时的 ZIP，保留新包和其他数据。"""
+    directory = settings.data_dir / "packages"
+    if not directory.is_dir():
+        return 0
+    cutoff = time.time() - PACKAGE_RETENTION_SECONDS
+    removed = 0
+    for path in directory.glob(f"{PACKAGE_ROOT}-*.zip"):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass  # 另一个请求或清理进程已删除。
+        except OSError:
+            LOG.exception("无法清理过期玩家包：%s", path.name)
+    if removed:
+        LOG.info("已清理 %d 个超过 24 小时的玩家包", removed)
+    return removed
 
 
 def package_dir() -> Path:

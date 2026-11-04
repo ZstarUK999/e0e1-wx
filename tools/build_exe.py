@@ -64,6 +64,7 @@ RESOURCES: tuple[tuple[str, str], ...] = (
     ("package/plugin_manager/auction_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/legion_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/plugin_runtime.js", "package/plugin_manager"),
+    ("package/plugin_manager/exception_capture.js", "package/plugin_manager"),
     ("package/plugin_manager/legion_boss_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/season_insight_runtime.js", "package/plugin_manager"),
     ("package/plugin_manager/flag_upgrade_runtime.js", "package/plugin_manager"),

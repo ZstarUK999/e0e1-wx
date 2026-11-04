@@ -108,7 +108,6 @@ class PackageIn(BaseModel):
 @router.post("/package")
 def download_selected_package(payload: PackageIn, session: Session = Depends(db_session), _admin: str = Depends(current_admin)):
     from fastapi.responses import FileResponse
-    from starlette.background import BackgroundTask
     from ...domain import packages
 
     ids = list(dict.fromkeys(value.strip() for value in payload.player_ids))
@@ -123,7 +122,7 @@ def download_selected_package(payload: PackageIn, session: Session = Depends(db_
         target, version = packages.build_player_package(session, ids, payload.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return FileResponse(target, filename=f"e0e1-wx-plugins-{version}-{len(ids)}players.zip", media_type="application/zip", background=BackgroundTask(target.unlink, missing_ok=True))
+    return FileResponse(target, filename=f"e0e1-wx-plugins-{version}-{len(ids)}players.zip", media_type="application/zip")
 
 
 @router.get("/{player_id}/package")
