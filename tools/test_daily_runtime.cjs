@@ -12,14 +12,14 @@ function fixture(){
  const makeItems=kind=>[1,3].map(state=>{const item={state};item.node={getComponent:Type=>Type==='MineItem'?item:button('cell:'+kind,()=>{const next=item.state===types.unlock_idle?types.unlock_work:types.unlock_idle;for(const entry of pages[kind].items)entry.state=next;})};return item;});
  const pages={};for(const kind of ['sanshi','artifact']){pages[kind]={node:{activeInHierarchy:true},items:[]};pages[kind].items=makeItems(kind);pages[kind].mine_content={node_items:{children:pages[kind].items.map(i=>i.node)}};}
  const logs=[];
- const list={_curSelect:0,_dataList:[{id:10,siteNum:16,name:'甲',sName:'561服',legionName:'无',fightPower:1000},
+ const list={mineType:0,_curSelect:0,_dataList:[{id:10,siteNum:16,name:'甲',sName:'561服',legionName:'无',fightPower:1000},
   {id:11,siteNum:0,name:'乙',sName:'561服',legionName:'阴司A',fightPower:2000}],view:{}};
- list.view.list_record={getItemByListId:i=>({getComponent:()=>({_data:list._dataList[i],btn_goto:button('goto:'+list._dataList[i].id,()=>{other._targetId=list._dataList[i].id;other._loadedTargetId=other._targetId;windows.delete(cfg.MineListUI);windows.delete(cfg.MineUI);windows.set(cfg.MineOtherUI,{_openMineType:root._mineType,view:{mine_other_sanshi:other,mine_other_magic_artifact:other,btn_list:button('target-list',()=>{list._curSelect=0;list._dataList=list._dataList.slice();windows.set(cfg.MineListUI,list);})}});})})})};
+ list.view.list_record={getItemByListId:i=>({getComponent:()=>({_data:list._dataList[i],btn_goto:button('goto:'+list._dataList[i].id,()=>{other._targetId=list._dataList[i].id;other._loadedTargetId=other._targetId;windows.delete(cfg.MineListUI);windows.delete(cfg.MineUI);windows.set(cfg.MineOtherUI,{_openMineType:root._mineType,view:{mine_other_sanshi:other,mine_other_magic_artifact:other,btn_list:button('target-list',()=>{list._curSelect=0;list._dataList=list._dataList.slice();list.mineType=root._mineType;windows.set(cfg.MineListUI,list);})}});})})})};
  list.view.btnTabGroup={children:[0,1].map(index=>({getComponent:()=>button('list-tab:'+index,()=>{list._curSelect=index;other._sameLegion=index===1;list._dataList=list._dataList.slice();})}))};
  let refreshIndex=0,refreshProvider=null;
  list.view.btn_refresh=button('list-refresh',()=>{refreshIndex++;list._dataList=refreshProvider?refreshProvider(refreshIndex):[list._dataList[0]];});
  const other={_sameLegion:false,btn_help:button('help',()=>{if(other._sameLegion)(root._mineType===0?ROLE.mine:ROLE.artifactMine).helpNumDay++;else{windows.set(cfg.MineBattleUI,battle);}})};
- for(const kind of ['sanshi','artifact']){pages[kind].btn_other=button('open-list:'+kind,()=>{windows.set(cfg.MineListUI,list);});pages[kind].btn_recruit=button('open-recruit',()=>{windows.set(cfg.ChatUI,chat);windows.set(cfg.ChatRecruitUI,recruit);});}
+ for(const kind of ['sanshi','artifact']){pages[kind].btn_other=button('open-list:'+kind,()=>{list.mineType=root._mineType;windows.set(cfg.MineListUI,list);});pages[kind].btn_recruit=button('open-recruit',()=>{windows.set(cfg.ChatUI,chat);windows.set(cfg.ChatRecruitUI,recruit);});}
  const root={_mineType:0,view:{mine_sanshi:pages.sanshi,mine_magic_artifact:pages.artifact}};
  root.view.btn_sanshi=button('kind:sanshi',()=>root._mineType=0);root.view.btn_magic_artifact=button('kind:artifact',()=>root._mineType=1);
  const chat={view:{btn_close:button('close-chat',()=>windows.delete(cfg.ChatUI))}};
@@ -39,7 +39,7 @@ function fixture(){
   open:async c=>{events.push('open:'+c.id);if(c===cfg.MineUI){windows.set(cfg.MineUI,root);return root;}if(c===cfg.ArenaUI)return arena;throw Error('未知页面');},
   click:async b=>{assert.ok(b&&b.run,'UI按钮存在');events.push(b.name||'skip');await b.run();},
   uiClass:async(module,name)=>name,listNode:async(list,i)=>list.getItemByListId(i),
-  wait:async predicate=>{const value=predicate();assert.ok(value,'正常UI响应未完成');return value;},bounded:async promise=>await promise,
+  wait:async predicate=>{const value=predicate();assert.ok(value,'正常UI响应未完成');return value;},bounded:async promise=>await promise,waitPage:async(c,message,ready)=>await h.wait(()=>{const root=ui.findOpen(c);return root && root.view && (!ready||ready(root)) && root;},message),
   observe:async(expected,action,verify)=>{assert.ok(expected.every(fn=>typeof fn==='function'));await action();assert.ok(verify());return {items:[]};},
   dismissRewards:async()=>{},home:async()=>{},log:message=>logs.push(String(message))};
  const g={ROLE,System:{import:async()=>({MineItemState:types})}};

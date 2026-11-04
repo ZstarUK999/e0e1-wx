@@ -106,7 +106,7 @@ class LegionScanPanel(QWidget):
             title+=' · '+(top['name'] if top else task['name'])
             total=task['range_high']-task['range_low']+1
             complete=task['cursor']>=total
-            state='完成' if complete else ('暂停' if task['paused'] else '待扫描')
+            state='血月同步 · 每日更新' if task.get('source')=='bloodmoon' else '完成' if complete else ('暂停' if task['paused'] else '待扫描')
             root=roots.get(task['id'])
             if root is None:root=QTreeWidgetItem(self.tree)
             for column,value in enumerate([title,f"{task['cursor']}/{total} · {state}",'',f"{task['range_low']}–{task['range_high']}",'']):root.setText(column,value)
@@ -191,7 +191,7 @@ class LegionScanner:
     def __init__(self, transport, state, panel, auto_start=False):
         self.transport,self.state,self.panel=transport,state,panel
         self.db=panel.db;panel.feature=self
-        panel.set_platform('douyin' if getattr(transport,'platform_name','微信')!='微信' else 'wechat')
+        panel.set_platform({'微信':'wechat','抖音':'douyin','应用宝':'androws'}.get(getattr(transport,'platform_name','微信'),'douyin'))
         self.job=None;self.next_request=0;self.next_ui=0
         self.refreshed_legions=set()
         self.pending_create=None
@@ -342,6 +342,13 @@ class LegionScanner:
             if self.priority_requested and not failed and not self.halted:
                 self.next_request=time.monotonic()
                 self.priority_requested=False
+
+    def import_bloodmoon(self, groups):
+        count=self.db.import_bloodmoon(groups)
+        if count:
+            self.enable_session()
+            self.panel.refresh()
+        return count
 
     def insert_member_update(self,lid):
         self.enable_session()

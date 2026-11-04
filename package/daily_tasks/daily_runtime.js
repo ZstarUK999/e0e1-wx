@@ -9,9 +9,9 @@ function createDailyRuntime(g,h) {
       try {await action();return await h.wait(ready,message);}
       catch(e) {
         const guard=g.__e0e1EnergyGuard || {};
-        if(guard.pending || guard.callback_count || guard.uncertain)throw e;
+        if(guard.pending || guard.action_pending || guard.callback_count || guard.uncertain)throw e;
         if(ready())return ready();
-        if(attempt===3)throw fail(message+'（已尝试3次）','uncertain');
+        if(attempt===3)throw Object.assign(fail(message+'（已尝试3次）','uncertain'),{navigation:true});
         if(g.console?.warn)g.console.warn('[plugin.ui]',message+'，重试 '+(attempt+1)+'/3');
       }
     }
@@ -27,9 +27,11 @@ function createDailyRuntime(g,h) {
   const mineService=kind=>kind==='sanshi'?config().defs.MineService:config().defs.MagicService;
   const self=kind=>kind==='sanshi'?g.ROLE.mine:g.ROLE.artifactMine;
   async function minePage(kind) {
-    const {cfg}=config(), index=kindNumber(kind), root=await h.open(cfg.MineUI);
-    const view=h.ui().find(cfg.MineUI);
-    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏页面打开尚未完成');
+    const {cfg}=config(), index=kindNumber(kind);
+    await h.open(cfg.MineUI);
+    const root=await h.waitPage(cfg.MineUI,'墓藏页面打开尚未完成',screen=>
+      !!screen.view.mine_sanshi && !!screen.view.mine_magic_artifact &&
+      !!screen.view.btn_sanshi && !!screen.view.btn_magic_artifact);
     const page=index===0?root.view.mine_sanshi:root.view.mine_magic_artifact;
     await retryUI(()=>h.click(index===0?root.view.btn_sanshi:root.view.btn_magic_artifact),
       ()=>root._mineType===index && page && page.node.activeInHierarchy!==false,'墓藏页面未就绪');
@@ -165,21 +167,22 @@ function createDailyRuntime(g,h) {
       await closeScreen(cfg.MineListUI);existing=null;
     }
     if (!existing) {
-      await h.observe([mineService(kind).getNeighbors],async()=>{
-        if (otherRoot && otherRoot._openMineType===kindNumber(kind)) await h.click(otherRoot.view.btn_list);
-        else {
-          if (otherRoot) await closeScreen(cfg.MineOtherUI);
-          const page=await minePage(kind);
-          await h.click(page.btn_other);
-        }
-      },()=>{
+      // Navigation has its own deadline. Do not spend the request observation window opening parent pages.
+      let control;
+      if (otherRoot && otherRoot._openMineType===kindNumber(kind)) control=otherRoot.view.btn_list;
+      else {
+        if (otherRoot) await closeScreen(cfg.MineOtherUI);
+        const page=await minePage(kind);
+        control=page.btn_other;
+      }
+      await h.observe([mineService(kind).getNeighbors],()=>h.click(control),()=>{
         const screen=h.ui().findOpen(cfg.MineListUI);
         return screen && screen._curSelect>=0 && Array.isArray(screen._dataList);
       });
     }
-    const screen=await h.wait(()=>h.ui().findOpen(cfg.MineListUI),'墓葬目标列表未打开');
-    const view=h.ui().find(cfg.MineListUI);
-    if (view && view.waitAfterOpen) await h.bounded(view.waitAfterOpen,'墓藏列表打开尚未完成');
+    const screen=await h.waitPage(cfg.MineListUI,'墓藏列表打开尚未完成',screen=>
+      screen.mineType===kindNumber(kind) && screen._curSelect>=0 && Array.isArray(screen._dataList) &&
+      !!screen.view.btn_refresh && !!screen.view.btnTabGroup?.children?.[tab]);
     await settleList(screen);
     if (screen._curSelect!==tab) {
       const before=screen._dataList;
@@ -233,8 +236,11 @@ function createDailyRuntime(g,h) {
     return !!h.ui().findOpen(which) || !!(retained && (retained.loading || retained.showing));
   }
   async function readyOther(_root,kind,id) {
-    const cfg=config().cfg, view=h.ui().find(cfg.MineOtherUI);
-    if(view && view.waitAfterOpen)await h.bounded(view.waitAfterOpen,'目标墓藏打开尚未完成');
+    const cfg=config().cfg;
+    await h.waitPage(cfg.MineOtherUI,'目标墓藏打开尚未完成',root=>{
+      const page=otherPage(root,kind);
+      return page && page._targetId===id && page._loadedTargetId===id && !page._helpBusy && !!page.btn_help;
+    });
     // The native list callback destroys the previous MineOtherUI before asynchronously creating its replacement.
     // Reacquire it on every observation; never retain the pre-transition component or dereference its released view.
     return await h.wait(()=>{

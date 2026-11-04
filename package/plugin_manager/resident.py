@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from package.daily_tasks.scheduler import RetryableTaskError
+from package.daily_tasks.scheduler import RetryableTaskError, TaskDeferredError
 
 LOG = logging.getLogger('plugin_manager')
 
@@ -29,6 +29,8 @@ class ResidentGame:
         for attempt in range(attempts):
             try:
                 return await self.transport.call(op, payload)
+            except TaskDeferredError:
+                raise
             except RetryableTaskError as exc:
                 LOG.warning('UI操作未获准（第%d/%d次）：%s，%s', attempt + 1, attempts, op, exc)
         LOG.error('UI操作连续%d次未执行，返回主界面后结束本轮：%s', attempts, op)

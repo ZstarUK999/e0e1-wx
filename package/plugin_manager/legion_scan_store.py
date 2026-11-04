@@ -52,6 +52,9 @@ class LegionScanStore:
             CREATE TABLE IF NOT EXISTS scan_settings(platform TEXT PRIMARY KEY,min_power REAL NOT NULL DEFAULT 300000000);
             ''')
             columns={r['name'] for r in db.execute('PRAGMA table_info(scan_tasks)')}
+            if 'source' not in columns:
+                db.execute("ALTER TABLE scan_tasks ADD COLUMN source TEXT NOT NULL DEFAULT 'scan'")
+            db.execute('CREATE TABLE IF NOT EXISTS scan_imported_players(platform TEXT,pid INTEGER,PRIMARY KEY(platform,pid))')
             if 'anchor_cursor' not in columns:
                 db.execute('ALTER TABLE scan_tasks ADD COLUMN anchor_cursor INTEGER NOT NULL DEFAULT 0')
                 db.execute('ALTER TABLE scan_tasks ADD COLUMN anchor_low INTEGER')
@@ -171,6 +174,7 @@ class LegionScanStore:
 
     @staticmethod
     def candidate(task):
+        if 'source' in task.keys() and task['source']=='bloodmoon':return None
         cursor = task['cursor']
         width = task['seed_high'] - task['seed_low'] + 1
         if cursor >= task['range_high'] - task['range_low'] + 1:
@@ -214,6 +218,9 @@ class LegionScanStore:
                        (self.platform,str(info['id']),info.get('name',''),low,high,start,end,now()))
             task = dict(db.execute('SELECT * FROM scan_tasks WHERE platform=? AND legion_id=?',(self.platform,str(info['id']))).fetchone())
             db.execute('INSERT OR IGNORE INTO scan_seed_bounds VALUES(?)',(task['id'],))
+            if task['source']=='bloodmoon':
+                db.execute("UPDATE scan_tasks SET source='scan',seed_low=?,seed_high=?,range_low=?,range_high=?,cursor=0,anchor_cursor=0,anchor_low=NULL,anchor_high=NULL WHERE id=?",
+                    (low,high,low,high,task['id']))
             self._legion(db, info)
             for member in info['members']:
                 if str(member.get('id','')).isdigit():
@@ -222,6 +229,35 @@ class LegionScanStore:
                     db.execute('INSERT OR IGNORE INTO scan_task_players VALUES(?,?)',(task['id'],int(row['id'])))
         self.calibrate()
         return next(t for t in self.tasks() if t['id']==task['id'])
+
+    def import_bloodmoon(self, groups):
+        """Save historical identity leads without replacing live player snapshots."""
+        count=0
+        with self.connect() as db:
+            for group in groups:
+                lid=str(group['id'])
+                if not lid.isascii() or not lid.isdigit() or int(lid)<=0:continue
+                members={int(r['id']):r for r in group.get('members',[])
+                    if str(r.get('id','')).isascii() and str(r.get('id','')).isdigit()
+                    and 100000<=int(r['id'])<=9007199254740991}
+                if not members:continue
+                db.execute("INSERT INTO scan_legions(platform,id,name,marked) VALUES(?,?,?,1) ON CONFLICT(platform,id) DO UPDATE SET marked=1",
+                    (self.platform,lid,group.get('name','')))
+                low,high=min(members),max(members)
+                db.execute("INSERT OR IGNORE INTO scan_tasks(platform,legion_id,name,seed_low,seed_high,range_low,range_high,cursor,created_at,source) VALUES(?,?,?,?,?,?,?,?,?,'bloodmoon')",
+                    (self.platform,lid,group.get('name',''),low,high,low,high,high-low+1,now()))
+                task=db.execute('SELECT id FROM scan_tasks WHERE platform=? AND legion_id=?',(self.platform,lid)).fetchone()[0]
+                db.execute('INSERT OR IGNORE INTO scan_seed_bounds VALUES(?)',(task,))
+                for pid,member in members.items():
+                    old=db.execute('SELECT checked_at FROM scan_players WHERE platform=? AND id=?',(self.platform,pid)).fetchone()
+                    if old is None:
+                        self._player(db,dict(member,legionId=lid,legionName=group.get('name','')),fresh=False)
+                    db.execute('INSERT OR IGNORE INTO scan_task_players VALUES(?,?)',(task,pid))
+                    db.execute('INSERT OR IGNORE INTO scan_imported_players VALUES(?,?)',(self.platform,pid))
+                    if old is None or old['checked_at'][:10]!=now()[:10]:
+                        db.execute('INSERT OR IGNORE INTO scan_member_updates VALUES(?,?,?)',(self.platform,lid,pid))
+                    count+=1
+        return count
 
     def _legion(self, db, info):
         db.execute('''INSERT INTO scan_legions(platform,id,name,power,updated_at) VALUES(?,?,?,?,?)
@@ -264,7 +300,7 @@ class LegionScanStore:
     def calibrate(self):
         """Expand each task to include known members of its discovered legions."""
         with self.connect() as db:
-            for source in db.execute('SELECT * FROM scan_tasks WHERE platform=?',(self.platform,)).fetchall():
+            for source in db.execute('SELECT * FROM scan_tasks WHERE platform=? AND source="scan"',(self.platform,)).fetchall():
                 task=dict(source)
                 bounds=db.execute('''SELECT MIN(p.id),MAX(p.id) FROM scan_players p WHERE p.platform=? AND p.found=1
                   AND p.id BETWEEN ? AND ? AND (p.id IN (SELECT player_id FROM scan_task_players WHERE task_id=?)
@@ -364,7 +400,7 @@ class LegionScanStore:
         threshold=self.min_power()
         with self.connect() as db:
             row = db.execute('''SELECT p.* FROM scan_players p JOIN scan_legions l ON l.platform=p.platform AND l.id=p.legion_id
-              WHERE p.platform=? AND (l.marked=1 OR l.power>=?) AND substr(p.checked_at,1,10)<>? ORDER BY p.id LIMIT 1''',(self.platform,threshold,now()[:10])).fetchone()
+              WHERE p.platform=? AND (l.marked=1 OR l.power>=? OR EXISTS(SELECT 1 FROM scan_imported_players i WHERE i.platform=p.platform AND i.pid=p.id)) AND substr(p.checked_at,1,10)<>? ORDER BY p.id LIMIT 1''',(self.platform,threshold,now()[:10])).fetchone()
             return dict(row) if row else None
 
     def tree(self, task_id):

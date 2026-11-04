@@ -49,11 +49,11 @@ def test_startup_failure_is_retried_after_cooldown(monkeypatch):
         now=[1];calls=[];labels=[]
         async def start(*args,**kwargs):
             calls.append(now[0])
-            if len(calls)==1:raise RuntimeError('微信主进程尚未运行')
+            if len(calls)==1:raise RuntimeError('应用宝主进程尚未运行')
             return False
         monkeypatch.setattr(startup_launch,'ensure_game_started',start)
         monkeypatch.setattr(runtime,'time',SimpleNamespace(monotonic=lambda:now[0]))
-        controller=SimpleNamespace(_startup_checked=False,platform_name='微信',
+        controller=SimpleNamespace(_startup_checked=False,platform_name='应用宝',
             window=SimpleNamespace(action_label=SimpleNamespace(setText=labels.append)),
             state=SimpleNamespace(closing=False),session=SimpleNamespace(prepare_reopen=None))
         assert not await PluginRuntime._ensure_startup(controller)

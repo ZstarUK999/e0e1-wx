@@ -10,15 +10,17 @@ from package.plugin_manager.runtime import PluginRuntime
 from package.plugin_manager import startup_launch
 
 
-def test_wechat_prepares_debug_without_launching_and_connects_after_manual_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize('platform', ['微信', '抖音 PC'])
+def test_prepares_debug_without_launching_and_connects_after_manual_open(tmp_path, monkeypatch, platform):
     from tools.test_plugin_runtime import make_controller
     app = QApplication.instance() or QApplication([])
     async def unexpected(*args, **kwargs):
-        raise AssertionError('Selecting WeChat must not navigate or open the game')
+        raise AssertionError(f'Selecting {platform} must not navigate or open the game')
     monkeypatch.setattr(startup_launch, 'ensure_game_started', unexpected)
     async def run():
         c, service, transport, window = make_controller(tmp_path, process=False)
         try:
+            c.platform_name = platform
             c._startup_checked = False
             c._next_startup_retry = float('inf')
             c.session.prepare_reopen = unexpected
@@ -46,17 +48,16 @@ def test_wechat_prepares_debug_without_launching_and_connects_after_manual_open(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('platform', ['抖音', '应用宝'])
-def test_other_platforms_keep_their_existing_startup_flow(monkeypatch, platform):
+def test_androws_keeps_its_existing_startup_flow(monkeypatch):
     calls = []
     async def ready():pass
     async def launch(name, **kwargs):
         calls.append((name, kwargs.get('before_open')))
     monkeypatch.setattr(startup_launch, 'ensure_game_started', launch)
     runtime = SimpleNamespace(_startup_checked=False, _next_startup_retry=0,
-        platform_name=platform, state=SimpleNamespace(closing=False),
+        platform_name='应用宝', state=SimpleNamespace(closing=False),
         session=SimpleNamespace(request_debug=lambda: calls.append('debug'), prepare_reopen=ready),
         window=SimpleNamespace(action_label=SimpleNamespace(setText=lambda text: None)))
     assert asyncio.run(PluginRuntime._ensure_startup(runtime))
-    assert calls[-1] == (platform, ready if platform == '应用宝' else None)
+    assert calls == [('应用宝', ready)]
     assert runtime._startup_checked

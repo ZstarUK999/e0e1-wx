@@ -44,6 +44,10 @@ class RetryableTaskError(RuntimeError):
     """处理器明确确认没有未决外部效果；允许按冷却时间重新检查。"""
 
 
+class TaskDeferredError(RetryableTaskError):
+    """导航失败后已返回大厅；结束本轮，禁止原地立即重试。"""
+
+
 @dataclass(frozen=True)
 class TaskContext:
     task: TaskConfig

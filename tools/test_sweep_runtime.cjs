@@ -100,7 +100,7 @@ function fixture() {
   modules['magic-artifact-list-item.ts']={MagicArtifactListItem:ArtifactListItem};
   modules['magic-artifact-temper-plan-item.ts']={MagicArtifactTemperPlanItem:PlanItem};
   const sandbox={setTimeout,clearTimeout,Map,Promise,console};
-  vm.runInNewContext(fs.readFileSync(sourcePath,'utf8'),sandbox);
+  vm.runInNewContext(fs.readFileSync(sourcePath,'utf8').replace('let extra=null,desire=null;','g.testHelpers=helpers; let extra=null,desire=null;'),sandbox);
   return {runtime:sandbox.createEnergyRuntime(g,{timeoutMs:50,pauseMs:1}),sandbox,g,role,requests,manager,roleService,petService,windows,cfg,inputs,petUI,uiNode,inputButton,setMode:v=>mode=v};
 }
 
@@ -686,7 +686,7 @@ test('home never closes a battle even if other closable pages exist',async()=>{
 
 test('home rechecks blocking state after normal page has loaded',async()=>{
   const f=fixture();const ui=f.g.UIManager.ins;
-  const screen={};let closed=false;
+  const screen={view:{}};let closed=false;
   screen.close=()=>{closed=true;f.windows.delete(f.cfg.ArenaUI);};
   f.cfg.ArenaUI={id:'ArenaUI'};
   f.windows.set(f.cfg.ArenaUI,screen);
@@ -759,4 +759,146 @@ test('home stops after three ineffective closes',async()=>{
   const f=fixture();let closes=0;f.petUI.close=()=>{closes++;};f.windows.set(f.cfg.PetUI,f.petUI);
   const result=await f.runtime.dispatch('home',{});
   assert.equal(result.status,'uncertain');assert.match(result.message,/已尝试3次/);assert.equal(closes,3);
+});
+
+function navigationFixture(){
+  const f=fixture(),ui=f.g.UIManager.ins,originalFind=ui.find.bind(ui);
+  f.cfg.Setting={id:'Setting'};
+  const screen={view:{btn_close:{}},node:{isValid:true,activeInHierarchy:true},state:1};
+  const retained={cfg:f.cfg.Setting,ui:screen,valid:true,showing:true,loading:false,waitAfterOpen:new Promise(()=>{})};
+  f.windows.set(f.cfg.Setting,screen);
+  ui.find=c=>c===f.cfg.Setting && f.windows.has(c)?retained:originalFind(c);
+  let closes=0;
+  ui.closeUI=async param=>{assert.equal(param.ui,screen);assert.equal(screen.isPlayCloseEffect,false);closes++;f.windows.delete(param.cfg);};
+  // Match native viewParams identity so cleanup can verify the exact instance disappeared.
+  Object.defineProperty(ui,'viewParams',{get:()=>Object.fromEntries([...f.windows].map(([c,u],i)=>[i,c===f.cfg.Setting?retained:{cfg:c,ui:u,valid:true,showing:true}]))});
+  return {...f,ui,screen,retained,closes:()=>closes};
+}
+
+test('missed open completion signal continues only when live page and controls match',async()=>{
+  const f=navigationFixture();await f.runtime.dispatch('capture');
+  const screen=await f.g.testHelpers.waitPage(f.cfg.Setting,'missing animation',s=>!!s.view.btn_close);
+  assert.equal(screen,f.screen);assert.equal(f.closes(),0);
+  f.screen.node.activeInHierarchy=false;
+  await assert.rejects(f.g.testHelpers.waitPage(f.cfg.Setting,'hidden page'),e=>e.navigation===true);
+});
+
+test('page mismatch forces native close and confirms hall without poisoning the next task',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.status,'unavailable');assert.equal(result.recovered_home,true);
+  assert.equal(f.closes(),1);assert.equal(f.g.__e0e1EnergyGuard.uncertain,false);
+  assert.equal((await f.runtime.dispatch('home')).status,'ok');
+});
+
+test('unsettled button callback forbids forced page cleanup',async()=>{
+  const f=navigationFixture();f.retained.loading=true;f.g.__e0e1EnergyGuard.callback_count=1;
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.status,'uncertain');assert.equal(f.closes(),0);
+});
+
+test('battle or unrecognized modal forbids forced cleanup',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  f.sandbox.createDailyRuntime=(g,h)=>({dispatch:()=>h.waitPage(f.cfg.Setting,'wrong page',()=>false)});
+  const battleCfg={id:'BattleUI'};f.windows.set(battleCfg,{battleWorld:{},view:{}});
+  // home checks blockers before navigation, so it must leave all windows untouched.
+  const result=await f.runtime.dispatch('home');
+  assert.notEqual(result.status,'ok');assert.equal(f.closes(),0);assert.ok(f.windows.has(battleCfg));
+});
+
+test('confirmed business request followed by navigation failure cannot be replayed as a recovered task',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    await h.observe([f.roleService.sweepHangUp],()=>f.manager.service(f.roleService.sweepHangUp,{}),()=>true);
+    await h.waitPage(f.cfg.Setting,'page mismatch',()=>false);
+  }});
+  const result=await f.runtime.dispatch('tomb_targets');
+  assert.equal(result.status,'uncertain');assert.equal(f.closes(),0);
+  assert.equal(f.requests.length,1);assert.equal(result.recovered_home,undefined);
+});
+
+test('failed native closure stays uncertain instead of reporting hall recovery',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  f.ui.closeUI=async()=>{throw Error('native close failed');};
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.status,'uncertain');assert.match(result.message,/恢复大厅未完成/);
+  assert.equal(result.recovered_home,undefined);
+});
+
+test('page verification reacquires a replacement instance after old opening promise stalls',async()=>{
+  const f=navigationFixture();await f.runtime.dispatch('capture');
+  const replacement={view:{btn_close:{}},node:{activeInHierarchy:true},state:2};
+  setTimeout(()=>{f.windows.set(f.cfg.Setting,replacement);f.retained.ui=replacement;},5);
+  assert.equal(await f.g.testHelpers.waitPage(f.cfg.Setting,'replaced',s=>!!s.view.btn_close),replacement);
+});
+
+test('neighbor list queries are recoverable but business requests are not',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  const defs=await f.g.System.import('chunks:///_virtual/define-index.ts');
+  const getNeighbors=()=>{};defs.MineService={getNeighbors};
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    await h.observe([getNeighbors],()=>f.manager.service(getNeighbors,{}),()=>true);
+    await h.waitPage(f.cfg.Setting,'wrong list',()=>false);
+  }});
+  const result=await f.runtime.dispatch('tomb_targets');
+  assert.equal(result.recovered_home,true);assert.equal(f.closes(),1);
+  assert.equal(f.requests.length,1);assert.equal(f.g.__e0e1EnergyGuard.uncertain,false);
+});
+
+test('an outstanding reward presentation prevents hall recovery',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  f.windows.set(f.cfg.Congrats,{view:{}});
+  f.sandbox.createDailyRuntime=(g,h)=>({dispatch:()=>h.waitPage(f.cfg.Setting,'wrong page',()=>false)});
+  const result=await f.runtime.dispatch('tomb_targets');
+  assert.equal(result.status,'uncertain');assert.equal(f.closes(),0);
+  assert.ok(f.windows.has(f.cfg.Congrats));
+});
+
+test('a native close that leaves a retained page is never reported as recovered',async()=>{
+  const f=navigationFixture();f.retained.loading=true;f.ui.closeUI=async()=>{};
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.status,'uncertain');assert.match(result.message,/页面仍残留/);
+});
+
+test('unsettled navigation action is not retried even if no request was observed',async()=>{
+  const f=fixture();
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    await h.observe([f.roleService.sweepHangUp],()=>new Promise(()=>{}),()=>true);
+  }});
+  const result=await f.runtime.dispatch('tomb_targets');
+  assert.equal(result.status,'uncertain');assert.match(result.message,/回调尚未收尾/);
+  assert.equal(f.requests.length,0);
+});
+
+test('recovery can close a full-screen page hiding the hall and verifies the hall becomes visible',async()=>{
+  const f=navigationFixture();f.retained.loading=true;
+  const main=f.windows.get(f.cfg.MainUI);main.node.activeInHierarchy=false;
+  const close=f.ui.closeUI;f.ui.closeUI=async param=>{await close(param);main.node.activeInHierarchy=true;};
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.recovered_home,true);assert.equal(f.closes(),1);
+});
+
+test('return home closes the newly verified page instead of the stale component',async()=>{
+  const f=navigationFixture();
+  const replacement={state:2,view:{btn_close:f.inputButton('close-replacement',()=>f.windows.delete(f.cfg.Setting))}};
+  setTimeout(()=>{f.windows.set(f.cfg.Setting,replacement);f.retained.ui=replacement;},5);
+  const result=await f.runtime.dispatch('home');
+  assert.equal(result.status,'ok');assert.ok(f.inputs.includes('close-replacement'));
+  assert.equal(f.closes(),0);
+});
+
+test('a synchronous business service failure is uncertain and is never replayed',async()=>{
+  const f=fixture();let attempts=0;
+  f.manager.service=()=>{attempts++;throw Error('service threw after entry');};
+  f.sandbox.createDailyRuntime=(g,h)=>({dispatch:()=>h.observe([f.roleService.sweepHangUp],()=>f.manager.service(f.roleService.sweepHangUp,{}),()=>true)});
+  assert.equal((await f.runtime.dispatch('tomb_targets')).status,'uncertain');
+  assert.equal((await f.runtime.dispatch('tomb_targets')).status,'uncertain');
+  assert.equal(attempts,1);
+});
+
+test('a plain page or tab readiness timeout also returns to the hall',async()=>{
+  const f=navigationFixture();
+  f.sandbox.createDailyRuntime=(g,h)=>({dispatch:()=>h.wait(()=>false,'tab not ready')});
+  const result=await f.runtime.dispatch('tomb_targets');
+  assert.equal(result.recovered_home,true);assert.equal(f.closes(),1);
 });

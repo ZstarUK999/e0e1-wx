@@ -24,7 +24,7 @@ from .transport import PluginTransport, ContextDestroyed
 from package.js_injection.runtime_toggle import (
     build_runtime_toggle_disable_expression, build_runtime_toggle_enable_expression,
 )
-from package.daily_tasks.scheduler import ExecutionUncertain, RetryableTaskError
+from package.daily_tasks.scheduler import ExecutionUncertain, RetryableTaskError, TaskDeferredError
 
 APPID = 'tt310e47b3ae06acc002'
 MARKER = b'/* e0e1-douyin-plugin-bridge-v1 */'
@@ -495,6 +495,8 @@ class DouyinTransport(PluginTransport):
                 if status in ('ok','unavailable','rejected'):
                     self._inflight=None
                 if status in ('unavailable','rejected'):
+                    if receipt.get('recovered_home') is True:
+                        raise TaskDeferredError(receipt.get('message','导航已恢复，本轮延后'))
                     raise RetryableTaskError(receipt.get('message','游戏操作未获准'))
                 if status!='ok':
                     raise ExecutionUncertain(receipt.get('message','游戏操作结果未知'))

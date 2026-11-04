@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from package.mcp_control.cdp_client import LocalCdpClient
-from package.daily_tasks.scheduler import ExecutionUncertain, RetryableTaskError
+from package.daily_tasks.scheduler import ExecutionUncertain, RetryableTaskError, TaskDeferredError
 from package.js_injection.runtime_toggle import (
     disable_runtime_js_file,
     enable_runtime_js_file,
@@ -390,6 +390,9 @@ return {{resident_id:id,capabilities:['lazy-v1']}};
                 if status in ('ok', 'unavailable', 'rejected'):
                     self._inflight = None
                 if status in ('unavailable', 'rejected'):
+                    if receipt.get('recovered_home') is True:
+                        LOG.warning('UI导航异常已返回大厅：%s，%s',op,receipt.get('message'))
+                        raise TaskDeferredError(receipt.get('message', '导航已恢复，本轮延后'))
                     LOG.error('UI操作未获准：%s，%s',op,receipt.get('message'))
                     raise RetryableTaskError(receipt.get('message', '操作未获准'))
                 if status != 'ok':

@@ -40,7 +40,7 @@ function createEnergyRuntime(g, timing) {
       if (value) return value;
       // 观察延时可能大于剩余等待时间；不能因为一次长暂停就判定超时。
       const remaining = end - Date.now();
-      if (remaining <= 0) throw error(message, 'uncertain');
+      if (remaining <= 0) throw Object.assign(error(message, 'uncertain'),{navigation:true});
       await new Promise(resolve => setTimeout(resolve, Math.min(stepDelay(), remaining)));
     }
   }
@@ -50,9 +50,9 @@ function createEnergyRuntime(g, timing) {
       if(ready())return ready();
       try {await action();return await wait(ready,message);}
       catch(e) {
-        if(guard.pending || guard.callback_count || guard.uncertain)throw e;
+        if(guard.pending || guard.action_pending || guard.callback_count || guard.uncertain)throw e;
         if(ready())return ready();
-        if(attempt===3)throw error(message+'（已尝试3次）','uncertain');
+        if(attempt===3)throw Object.assign(error(message+'（已尝试3次）','uncertain'),{navigation:true});
         if(g.console?.warn)g.console.warn('[plugin.ui]',message+'，重试 '+(attempt+1)+'/3');
       }
     }
@@ -126,13 +126,17 @@ function createEnergyRuntime(g, timing) {
   async function open(which) {
     if (!safe()) throw error('当前存在战斗或其他阻挡界面');
     const existing=ui().findOpen(which);
-    if (existing) return existing;
+    if (existing) return await waitPage(which,'页面尚未就绪');
     await home();
     const main=ui().findOpen(cfg.MainUI);
+    const navigate=async(action,ready,message)=>{
+      try {return await retryUI(action,ready,message);}
+      catch(e) {e.navigation=true;throw e;}
+    };
     let control;
     if (which===cfg.GameMethod) control=main.view.button_method;
     else if (which===cfg.MineUI || which===cfg.ArenaUI) {
-      const method=await retryUI(()=>click(main.view.button_method),()=>ui().findOpen(cfg.GameMethod),'玩法页面未打开');
+      const method=await navigate(()=>click(main.view.button_method),()=>ui().findOpen(cfg.GameMethod),'玩法页面未打开');
       control=which===cfg.MineUI?method.view.btn_mine:method.view.btn_arena;
     }
     else if (which===cfg.PetUI) control=main.view.button_pet;
@@ -143,16 +147,17 @@ function createEnergyRuntime(g, timing) {
       const component=main.node.getComponentInChildren(Type);
       control=component && component.btn_hang_up;
     } else if (which===cfg.MagicArtifactUI) {
-      const attr=await retryUI(()=>click(main.view.button_attrUp),()=>ui().findOpen(cfg.AttrUp),'属性页面未打开');
+      const attr=await navigate(()=>click(main.view.button_attrUp),()=>ui().findOpen(cfg.AttrUp),'属性页面未打开');
       const Type=await uiClass('attr-attr-up.ts','AttrAttrUp');
       const contents=attr.node ? attr.node.getComponentInChildren(Type) : attr;
       const item=await wait(()=>contents && contents.magicArtifactItem,'法器入口未显示');
       const Unlock=await uiClass('common-unlock-button.ts','default');
       control=(item.getComponent && item.getComponent(Unlock)) || item.getComponentInChildren(Unlock);
     } else throw error('没有核实此页面的UI导航按钮');
-    const retained=await retryUI(()=>click(control),()=>ui().find(which),'UI导航未打开目标页面');
-    if (retained.waitAfterOpen) await bounded(retained.waitAfterOpen,'页面打开动画未结束');
-    return await wait(()=>ui().findOpen(which),'页面尚未显示');
+    try {
+      await retryUI(()=>click(control),()=>ui().find(which),'UI导航未打开目标页面');
+      return await waitPage(which,'页面打开动画未结束');
+    } catch(e) {e.navigation=true;throw e;}
   }
   async function switchTab(screen,index,label) {
     try {
@@ -173,8 +178,72 @@ function createEnergyRuntime(g, timing) {
   async function bounded(promise, message) {
     let timer;
     try {
-      return await Promise.race([promise, new Promise((_,reject)=>{timer=setTimeout(()=>reject(error(message,'uncertain')),timeoutMs);})]);
+      return await Promise.race([promise, new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(error(message,'uncertain'),{navigation:true})),timeoutMs);})]);
     } finally {clearTimeout(timer);}
+  }
+  function idleCallbacks() {
+    return !guard.pending && !guard.action_pending && !guard.callback_count && !guard.uncertain;
+  }
+  function pageInstance(which, ready) {
+    const retained=ui().find(which), screen=ui().findOpen(which);
+    if (!retained || retained.valid===false || retained.loading || !screen || screen.isValid===false ||
+        !screen.view || screen.node && (screen.node.isValid===false || screen.node.activeInHierarchy===false) ||
+        screen.state===3 || screen.state===4 || retained.ui && retained.ui!==screen) return null;
+    return (!ready || ready(screen)) ? screen : null;
+  }
+  // A missed animation completion signal does not imply that the actual page is unusable.
+  async function waitPage(which, message, ready) {
+    try {
+      const retained=ui().find(which);
+      if (retained && retained.waitAfterOpen) await bounded(retained.waitAfterOpen,message);
+      return await wait(()=>pageInstance(which,ready),message);
+    } catch(e) {
+      const current=pageInstance(which,ready);
+      if (current && idleCallbacks()) {
+        log(message+'；实际页面 '+String(which.id)+' 及控件已核实就绪，继续执行');
+        return current;
+      }
+      log(message+'；页面核验未通过：'+JSON.stringify({expected:which.id,
+        pages:Object.values(ui().viewParams || {}).map(v=>({id:v.cfg && v.cfg.id,loading:!!v.loading,
+          showing:!!v.showing,state:v.ui && v.ui.state})),pending:!!guard.pending,
+        action_pending:!!guard.action_pending,callbacks:guard.callback_count || 0}));
+      e.navigation=true;
+      throw e;
+    }
+  }
+  // Only ordinary pages are eligible; native closeUI retains onClose/onAfterClose cleanup.
+  async function recoverHome() {
+    if (!idleCallbacks() || guard.effect_started || uiBusy() || blockedViews().length)
+      throw error('仍有未决请求、回调或阻挡页面，不能恢复大厅','uncertain');
+    const hall=ui().find(cfg.MainUI), main=hall && hall.ui;
+    // Full-screen pages may temporarily hide the existing hall node. It must become visible after cleanup.
+    if (!hall || hall.valid===false || hall.loading || !main || main.isValid===false || !main.view ||
+        main.node && main.node.isValid===false || main.state===3 || main.state===4)
+      throw error('大厅实例尚未就绪，不能恢复大厅','uncertain');
+    const pages=normalPages();
+    const rewardPending=()=>[cfg.Congrats,cfg.HeroLevelUp].filter(Boolean).some(which=>ui().find(which));
+    for (let round=0;round<32;round++) {
+      if (!idleCallbacks() || uiBusy() || blockedViews().length || rewardPending())
+        throw error('恢复大厅期间出现未决操作或阻挡页面','uncertain');
+      const stack=Object.values(ui().viewParams || {}).filter(v=>pages.includes(v.cfg));
+      if (!stack.length) {
+        await new Promise(resolve=>setTimeout(resolve,100));
+        if (Object.values(ui().viewParams || {}).some(v=>pages.includes(v.cfg))) continue;
+        if (pageInstance(cfg.MainUI) && safe() && idleCallbacks() && !uiBusy() && !rewardPending()) {
+          log('页面导航异常，已核实返回大厅；本轮任务延后');
+          return;
+        }
+        throw error('恢复后大厅状态尚未确认','uncertain');
+      }
+      const retained=stack[stack.length-1], screen=retained.ui;
+      if (!screen || screen.isValid===false || !screen.view || typeof ui().closeUI!=='function')
+        throw error('页面实例或原生关闭接口不可用，未强制销毁','uncertain');
+      screen.isPlayCloseEffect=false;
+      await bounded(ui().closeUI(retained),'原生关闭页面尚未完成');
+      if (Object.values(ui().viewParams || {}).includes(retained))
+        throw error('原生关闭后页面仍残留','uncertain');
+    }
+    throw error('恢复大厅的页面跳转次数异常','uncertain');
   }
   async function dismissRewards(expectedItems) {
     let view = ui().find(cfg.Congrats);
@@ -208,7 +277,7 @@ function createEnergyRuntime(g, timing) {
     await dismissRewards();
     if (!ui().findOpen(cfg.MainUI)) {
       const main=ui().find(cfg.MainUI);
-      if (main && main.waitAfterOpen) await bounded(main.waitAfterOpen,'主界面仍在加载');
+      if (main) await waitPage(cfg.MainUI,'主界面仍在加载');
       else throw error('主界面尚未加载，不能绕过UI直接创建页面');
     }
     // 关闭回调可能另开玩法/墓藏页：每次关闭后重新读取页面栈。
@@ -227,9 +296,8 @@ function createEnergyRuntime(g, timing) {
         }
       }
       const view=views[views.length-1];
+      const screen=await waitPage(view.cfg,'功能页面未完成加载');
       const retained=ui().find(view.cfg) || view;
-      if (retained.waitAfterOpen) await bounded(retained.waitAfterOpen,'功能页面未完成加载');
-      const screen=retained.ui || ui().findOpen(view.cfg);
       if (!screen) throw error('界面实例尚未加载');
       if (screen.battleWorld || screen.battleWorldOther || blockedViews().length)
         throw error('页面加载后出现战斗或阻挡状态，停止返回主界面');
@@ -325,10 +393,18 @@ function createEnergyRuntime(g, timing) {
     const original = manager.service;
     let started=false, receipt, failure;
     const wrapper = function(fn, ...args) {
-      const promise = original.call(this, fn, ...args);
-      if (expected.includes(fn) && (fn !== defs.SystemService.adCallBack || (args[0] && args[0].adId === 8))) {
+      const watched=expected.includes(fn) && (fn !== defs.SystemService.adCallBack || (args[0] && args[0].adId === 8));
+      // Even a synchronous throw after entering a business request must forbid navigation recovery.
+      if (fn!==defs.MineService?.getNeighbors && fn!==defs.MagicService?.getNeighbors)
+        guard.effect_started=true;
+      if (watched) {
         if (started) {guard.uncertain=true; throw error('同一步骤出现多个请求', 'uncertain');}
         started=true; guard.pending=true;
+      }
+      let promise;
+      try {promise=original.call(this, fn, ...args);}
+      catch(e) {if(watched)guard.pending=false;throw e;}
+      if (watched) {
         Promise.resolve(promise).then(value=>{receipt=value;guard.pending=false;},err=>{failure=err;guard.pending=false;});
       }
       return promise;
@@ -343,12 +419,17 @@ function createEnergyRuntime(g, timing) {
       while (!(receipt || failure) && Date.now()<=end)
         await new Promise(resolve=>setTimeout(resolve,Math.min(stepDelay(),100)));
       if (!(receipt || failure)) {
+        if (guard.action_pending || guard.callback_count)
+          throw error('点击回调尚未收尾，未确认请求是否发出','uncertain');
         // 区分“点击没发出请求”和“请求已发出没回来”，两者风险不同。
         throw error(started ? '正常UI请求已发出但未收到回执，结果未知' : '点击未产生正常请求，未修改任何状态',
           started ? 'uncertain' : 'unavailable');
       }
       await wait(()=>!guard.action_pending,'按钮回调尚未完成');
-      if (failure) throw error(String(failure), started?'uncertain':'unavailable');
+      if (failure) {
+        if (!started && failure.navigation) throw failure;
+        throw error(String(failure), started?'uncertain':'unavailable');
+      }
       if (!receipt || !Object.prototype.hasOwnProperty.call(receipt,'err')) throw error('响应形状未知', 'uncertain');
       if (receipt.err != null) {
         guard.pending=false;
@@ -1012,7 +1093,7 @@ function createEnergyRuntime(g, timing) {
     }
     return battleCfg;
   }
-  const helpers={ui,uiClass,click,open,wait,bounded,observe,dismissRewards,home,switchTab,closeControl,
+  const helpers={ui,uiClass,click,open,wait,waitPage,bounded,observe,dismissRewards,home,switchTab,closeControl,
     configuration:()=>({cfg,data,defs,cc,Button}),listNode,log,battleCfg:battleConfig};
   let extra=null,desire=null;
   function extraRuntime(){
@@ -1043,7 +1124,7 @@ function createEnergyRuntime(g, timing) {
     const readOnly=['inspect','capture','player_information','reward_info','desire_bag_stats','desire_compose_probe','identity','pet_fodder_state'].includes(op);
     if (guard.busy && !readOnly) return {status:'uncertain',message:'已有正常UI操作未完成'};
     if (guard.uncertain && !readOnly) return {status:'uncertain',message:'前次操作结果未知，需核对恢复记录'};
-    if (!readOnly) guard.busy=true;
+    if (!readOnly) {guard.busy=true;guard.effect_started=false;}
     try {
       await initialize();
       let value;
@@ -1086,6 +1167,14 @@ function createEnergyRuntime(g, timing) {
       }
       return {status:'ok',value:value===undefined?null:value};
     } catch (e) {
+      if (!readOnly && (e.navigation || op==='home' && e.status==='uncertain') && !guard.effect_started && idleCallbacks()) {
+        try {
+          await recoverHome();
+          return {status:'unavailable',recovered_home:true,message:String(e.message || e)+'；已返回大厅，本轮延后'};
+        } catch(recoveryError) {
+          e=error(String(e.message || e)+'；恢复大厅未完成：'+String(recoveryError.message || recoveryError),'uncertain');
+        }
+      }
       const status=guard.pending || e.status==='uncertain'?'uncertain':e.status || 'unavailable';
       if (status==='uncertain') guard.uncertain=true;
       if (g.console) g.console.error('[plugin.error]',String(e.message || e));

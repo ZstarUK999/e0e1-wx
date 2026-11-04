@@ -57,6 +57,7 @@ def report_row(report, role_id):
 
 class SeasonInsightPanel(QWidget):
     requested=Signal(str,dict)
+    sync_requested=Signal(object)
 
     def __init__(self,store):
         super().__init__()
@@ -84,6 +85,9 @@ class SeasonInsightPanel(QWidget):
         self.stop_scan.clicked.connect(lambda:self.requested.emit('stop_scan',{}))
         self.refresh_legion=QPushButton('重新拉取所选阴司');self.refresh_legion.setEnabled(False);top.addWidget(self.refresh_legion)
         self.all_roles=QPushButton('查看全场排名');top.addWidget(self.all_roles)
+        self.sync_legion=QPushButton('同步到阴司数据库');top.addWidget(self.sync_legion)
+        self.sync_legion.setToolTip('同步当前所选阴司；全场视图同步当前战场已发现成员。连接游戏后每日刷新最新资料。')
+        self.sync_legion.clicked.connect(self.sync_to_legion)
         self.export=QPushButton('导出当前页 CSV');top.addWidget(self.export)
         self.message=QLabel('连接游戏后拉取本阴司经历过的血月战场。双击玩家查看全部战报，双击战报播放并分析。')
         self.message.setWordWrap(True);self.message.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(self.message)
@@ -105,6 +109,29 @@ class SeasonInsightPanel(QWidget):
         saved_accounts=[key for key,value in self.cache.items() if isinstance(value,dict) and value.get('wars')]
         if saved_accounts:
             self.accept_history({'account':saved_accounts[-1],'rows':[], 'note':'本地缓存；连接后可手动刷新。'})
+
+    def sync_to_legion(self):
+        if not self.war or not self.account:
+            self.message.setText('请先拉取血月成员数据');return
+        bucket=self.cache.get(self.account,{})
+        war=str(self.war['warId']);selected=str(self.selected_legion['id']) if self.selected_legion else None
+        groups={}
+        ranks=bucket.get('ranks',{}).get(war,{})
+        names={str(r['id']):r.get('name','') for r in ranks.get('legions',[])}
+        def add(row,lid=None,name=''):
+            lid=str(lid or row.get('legionId') or '')
+            if not lid.isdigit() or int(lid)<=0 or (selected and lid!=selected):return
+            group=groups.setdefault(lid,dict(id=lid,name=name or names.get(lid,row.get('legionName','')),members={}))
+            if row.get('id') is not None:group['members'][str(row['id'])]=dict(row)
+        for row in ranks.get('roles',[]):add(row)
+        for row in bucket.get('battlefield_scans',{}).get(war,{}).get('rows',[]):add(row)
+        for data in bucket.get('legion_statistics',{}).values():
+            if str(data.get('warId'))==war:
+                for row in data.get('rows',[]):add(row,data['legionId'],data.get('legionName',''))
+        payload=[dict(group,members=list(group['members'].values())) for group in groups.values() if group['members']]
+        if not payload:
+            self.message.setText('没有可同步的阴司成员，请先双击阴司拉取成员数据');return
+        self.sync_requested.emit(dict(account=self.account,groups=payload))
 
     def refresh_history(self):
         self._force_ranks=True

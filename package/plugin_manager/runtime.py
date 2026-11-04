@@ -66,6 +66,7 @@ class PluginRuntime(QObject):
         from .flag_upgrade import FlagUpgradeFeature
         self.flag_upgrade = FlagUpgradeFeature(self.transport, self.state, window.pages['flag_upgrade'])
         self.legion=LegionFeature(self.transport,self.state,window.pages['legion'])
+        window.pages['season_insight'].sync_requested.connect(self.sync_season_members)
         self.legion.scanner.set_auto_start(window.store.snapshot()['ui']['legion_scan_auto_start'])
         window.store.changed.connect(lambda config: self.legion.scanner.set_auto_start(config['ui']['legion_scan_auto_start']))
         self.legion.scanner.set_control_enabled(window.store.snapshot()['ui']['legion_scan_enabled'])
@@ -151,6 +152,26 @@ class PluginRuntime(QObject):
         self._player_target_id=str(player_id)
         if self._player_request_job and not self._player_request_job.done():return
         self._player_request_job=asyncio.create_task(self._fetch_scanned_player())
+
+    def sync_season_members(self, payload):
+        panel=self.window.pages['season_insight']
+        # Legacy caches had no platform prefix and were WeChat-only.
+        account=str(payload['account'])
+        platform=account.split(':',1)[0] if account.split(':',1)[0] in ('wechat','douyin','androws','微信','抖音','应用宝') else 'wechat'
+        platform={'微信':'wechat','抖音':'douyin','应用宝':'androws'}.get(platform,platform)
+        scanner=self.legion.scanner
+        current={'微信':'wechat','抖音':'douyin','应用宝':'androws'}.get(self.platform_name,'douyin')
+        if platform!=current or platform!=scanner.db.platform:
+            panel.message.setText('缓存所属平台与当前阴司数据库不一致，请切换对应平台后同步');return
+        try:
+            count=scanner.import_bloodmoon(payload['groups'])
+            if count:panel.store.set_legion_scan_auto_start(True)
+            suffix='；请开启阴司区段扫描总开关' if not scanner.control_enabled else ''
+            if scanner.halted:suffix+='；请先在阴司透视中恢复异常停止'
+            panel.message.setText(f'已同步 {count} 名成员到阴司数据库，重复成员自动合并；连接游戏并运行扫描时每日刷新最新资料'+suffix)
+        except Exception as exc:
+            LOG.exception('血月成员同步失败')
+            panel.message.setText(f'同步失败：{exc}')
 
     async def _fetch_scanned_player(self):
         session=self.state.installed
@@ -465,14 +486,14 @@ class PluginRuntime(QObject):
 
     async def _ensure_startup(self):
         if getattr(self,'_startup_checked',True):return True
-        if self.platform_name == '微信':
+        if self.platform_name in ('微信', '抖音 PC'):
             # Keep the launcher available for explicit restart flows, but platform
             # selection only prepares debugging and waits for a manual game launch.
             self.session.request_debug()
             self._startup_checked = True
             self._next_startup_retry = 0.0
-            self.window.action_label.setText('等待手动打开微信中的《遗弃之地》')
-            LOG.info('微信自动启动游戏已关闭；调试监听已请求，等待手动打开游戏')
+            self.window.action_label.setText(f'等待手动打开{self.platform_name}中的《遗弃之地》')
+            LOG.info('%s调试监听已请求，等待手动打开游戏', self.platform_name)
             return True
         now=time.monotonic()
         if now<getattr(self,'_next_startup_retry',0.0):return False
