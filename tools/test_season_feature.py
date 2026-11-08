@@ -495,3 +495,119 @@ def test_script_log_stream_change_resets_event_cursor(app, tmp_path, caplog):
         feature._display_automation({'stream_id':'new','events':[{'seq':1,'kind':'challenge_sent'}],'cursor':1})
     assert 'challenge_sent' in caplog.text
     assert feature._event_stream=='new' and feature._event_cursor==1
+
+
+def test_overlay_controls_persist_and_update_desktop_widgets_once(app, tmp_path):
+    feature=build(FakeTransport(),tmp_path)
+    feature.store.set_bloodmoon({'enabled':True,'attack':{'enabled':True}})
+    result={'stream_id':'controls','overlay_controls':{'seq':1,'patch':{
+        'attack':{'enabled':False,'lowest_power_first':False},'speed_up':{'enabled':True}}}}
+    feature._display_automation(result)
+    state=feature.store.snapshot()['bloodmoon']
+    assert state['attack']['enabled'] is False and state['attack']['lowest_power_first'] is False
+    assert state['speed_up']['enabled'] is True
+    assert feature.panel.attack_lowest_first.isChecked() is False
+    assert PluginConfigStore(feature.store.path).snapshot()['bloodmoon']==state
+    epoch=feature._config_epoch
+    feature._display_automation(result)
+    assert feature._config_epoch==epoch and feature._overlay_control_seq==1
+
+
+def test_overlay_ack_is_sent_even_if_requested_value_was_already_saved(app, tmp_path):
+    feature=build(FakeTransport(),tmp_path)
+    feature.store.set_bloodmoon({'enabled':True,'attack':{'enabled':False}})
+    async def run():
+        await feature._sync_automation(feature.store.snapshot()['bloodmoon'])
+        feature._display_automation({'stream_id':'controls','overlay_controls':{'seq':2,'patch':{'attack':{'enabled':False}}}})
+        await feature._sync_automation(feature.store.snapshot()['bloodmoon'])
+    asyncio.run(run())
+    calls=[payload for name,payload in feature.transport.calls if name=='automationConfigure']
+    assert calls[-1]['control_ack']==2
+
+
+def test_overlay_patch_accepts_only_boolean_controls_and_resets_ack_for_new_script(app, tmp_path):
+    feature=build(FakeTransport(),tmp_path)
+    feature._display_automation({'stream_id':'old','overlay_controls':{'seq':4,'patch':{
+        'attack':{'enabled':'true','lead_ms':1},'speed_up':{'enabled':True},'enabled':False}}})
+    state=feature.store.snapshot()['bloodmoon']
+    assert state['attack']['enabled'] is False and state['speed_up']['enabled'] is True
+    assert state['attack']['lead_ms']!=1
+    feature._display_automation({'stream_id':'new','overlay_controls':{'seq':1,'patch':{'attack':{'lowest_power_first':True}}}})
+    assert feature._overlay_control_seq==1 and feature.store.snapshot()['bloodmoon']['attack']['lowest_power_first'] is True
+
+def test_player_power_round_robin_rate_limit_and_cache(app, tmp_path, monkeypatch):
+    import package.plugin_manager.features.season as season
+    clock = [100.0]
+    monkeypatch.setattr(season.time, 'monotonic', lambda: clock[0])
+    transport = FakeTransport(flags={'ok': True, 'groups': [{'members': [
+        {'roleId': 1, 'name': 'A', 'power': None}, {'roleId': 2, 'name': 'B', 'power': None}]}]})
+    original = transport.season_call
+    async def call(name, payload=None):
+        if name == 'playerPower':
+            transport.calls.append((name, payload))
+            return {'ok': True, 'roleId': payload['roleId'], 'power': payload['roleId'] * 100}
+        return await original(name, payload)
+    transport.season_call = call
+    feature = build(transport, tmp_path)
+    async def run():
+        feature.set_probing(True)
+        await feature.probe_once()
+        await feature._power_task
+        assert feature._power_cache == {1: 100}
+        for _ in range(3):
+            feature._schedule_power_query()
+        assert len([c for c in transport.calls if c[0] == 'playerPower']) == 1
+        clock[0] += 5
+        feature._schedule_power_query()
+        await feature._power_task
+        assert feature._power_cache == {1: 100, 2: 200}
+        assert feature.panel.probe_tree.topLevelItem(0).child(0).text(0) == 'B'
+        await feature.probe_once()
+        assert feature.panel.probe_tree.topLevelItem(0).child(0).text(1) == '200'
+        clock[0] += 5
+        feature._schedule_power_query()
+        await feature._power_task
+        assert [c[1]['roleId'] for c in transport.calls if c[0] == 'playerPower'] == [1, 2, 1]
+        feature.set_probing(False)
+        clock[0] += 5
+        feature._schedule_power_query()
+        assert feature._next_power_query == 115
+    asyncio.run(run())
+
+
+def test_player_power_inflight_stop_reset_and_failure_are_isolated(app, tmp_path, monkeypatch):
+    import package.plugin_manager.features.season as season
+    clock = [100.0]
+    monkeypatch.setattr(season.time, 'monotonic', lambda: clock[0])
+    transport = FakeTransport(flags={'ok': True, 'groups': [{'members': [{'roleId': 1, 'power': None}]}]})
+    feature = build(transport, tmp_path)
+    async def run():
+        gate = asyncio.Future()
+        async def call(name, payload=None):
+            if name == 'flags':
+                return transport.flags
+            return await gate
+        transport.season_call = call
+        feature.set_probing(True)
+        await feature.probe_once()
+        task = feature._power_task
+        clock[0] += 10
+        feature._schedule_power_query()
+        assert feature._power_task is task
+        feature.set_probing(False)
+        feature.set_probing(True)
+        gate.set_result({'ok': True, 'roleId': 1, 'power': 900})
+        await task
+        assert not feature._power_cache
+        async def failed(*args, **kwargs):
+            raise RuntimeError('timeout')
+        transport.season_call = failed
+        feature._schedule_power_query()
+        await feature._power_task
+        assert not feature._power_cache
+        assert feature._probing
+        feature._power_cache[1] = 1
+        feature.reset()
+        assert not feature._power_cache
+        assert not feature._probing
+    asyncio.run(run())

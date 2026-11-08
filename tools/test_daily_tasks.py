@@ -75,8 +75,8 @@ def test_default_config_contains_nine_independent_tasks():
         # 三尸门槛16，法器攒不满所以门槛10。
         assert loaded.tasks[task_id].params["minimum_tombs"] == (16 if task_id == "sanshi_raid" else 10)
         assert loaded.tasks[task_id].params["skip_failed_players"]
-    assert loaded.tasks["arena"].schedule.start.isoformat() == "10:28:00"
-    assert loaded.tasks["arena"].schedule.end.isoformat() == "10:30:00"
+    assert loaded.tasks["arena"].schedule.start.isoformat() == "22:28:00"
+    assert loaded.tasks["arena"].schedule.end.isoformat() == "22:30:00"
 
 
 @pytest.mark.parametrize("patch", [

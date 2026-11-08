@@ -132,8 +132,8 @@
       "retry_seconds": 5,
       "schedule": {
         "kind": "daily_window",
-        "start": "10:28",
-        "end": "10:30",
+        "start": "22:28",
+        "end": "22:30",
         "interval_seconds": 1
       },
       "params": {

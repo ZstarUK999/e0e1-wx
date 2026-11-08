@@ -902,3 +902,182 @@ test('a plain page or tab readiness timeout also returns to the hall',async()=>{
   const result=await f.runtime.dispatch('tomb_targets');
   assert.equal(result.recovered_home,true);assert.equal(f.closes(),1);
 });
+
+function tombTransitionFixture(){
+  const f=navigationFixture(),originalImport=f.g.System.import;
+  f.cfg.PageTurning={id:'PageTurning'};f.cfg.MineOtherUI={id:'MineOtherUI'};
+  class Turning {onOpen(loading,finish){this.loadingCall=loading;this.finishCall=finish;} async playClose(finish){if(finish)finish();return true;}}
+  f.g.System.import=async uri=>uri.endsWith('/ui-page-turning.ts')?{UIPageTurning:Turning}:originalImport(uri);
+  const page={_targetId:11,_loadedTargetId:11,_helpBusy:false,node:{activeInHierarchy:true},btn_help:{interactable:false}};
+  const root={busy:true,view:{mine_other_sanshi:page},node:{activeInHierarchy:true}};
+  const closed=[];
+  f.ui.closeUI=async retained=>{assert.equal(retained.ui.isPlayCloseEffect,false);closed.push(retained.cfg.id);f.windows.delete(retained.cfg);};
+  return {...f,Turning,page,root,closed};
+}
+
+test('stalled tomb cover and stale UI busy flag recover after the native loading callback completes',async()=>{
+  const f=tombTransitionFixture();let loaded=0,finished=0,turn;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    turn=new f.Turning();turn.view={};turn.onOpen(()=>{loaded++;},()=>{finished++;});
+    f.windows.set(f.cfg.PageTurning,turn);
+    await turn.loadingCall();
+    await h.wait(()=>false,'目标墓藏信息仍在加载、切换或目标不匹配');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.recovered_home,true);
+  assert.deepEqual(f.closed,['PageTurning','MineOtherUI','Setting']);
+  assert.equal(f.requests.length,0);assert.equal(loaded,1);
+  await turn.loadingCall();await turn.finishCall();
+  assert.equal(loaded,1);assert.equal(finished,0,'deferred callbacks cannot reopen UI after hall recovery');
+  assert.equal(f.g.__e0e1EnergyGuard.uncertain,false);
+  assert.equal((await f.runtime.dispatch('home')).status,'ok');
+});
+
+test('a running native tomb transition callback prevents cleanup with a specific diagnostic',async()=>{
+  const f=tombTransitionFixture();let release,pending;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.onOpen(()=>new Promise(r=>release=r));
+    f.windows.set(f.cfg.PageTurning,turn);pending=turn.loadingCall();
+    await h.wait(()=>false,'target not ready');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.status,'uncertain');assert.match(result.message,/墓藏过场回调仍在执行/);
+  assert.match(result.message,/"active":1/);assert.deepEqual(f.closed,[]);
+  release();await pending;
+});
+
+test('a tracked but not yet started transition can be cancelled before its animation fires',async()=>{
+  const f=tombTransitionFixture();let turn,loaded=0;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    turn=new f.Turning();turn.view={};turn.onOpen(()=>{loaded++;});
+    f.windows.set(f.cfg.PageTurning,turn);
+    await h.wait(()=>false,'animation never fired');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.recovered_home,true);assert.equal(loaded,0);
+  await turn.loadingCall();assert.equal(loaded,0);
+});
+
+test('an untracked PageTurning remains protected instead of guessing its callback state',async()=>{
+  const f=tombTransitionFixture();
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    f.windows.set(f.cfg.PageTurning,{view:{}});
+    await h.wait(()=>false,'unknown cover');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.status,'uncertain');assert.match(result.message,/阻挡页面：PageTurning/);
+  assert.deepEqual(f.closed,[]);
+});
+
+test('a tomb data reload is not mistaken for a stale UI busy flag',async()=>{
+  const f=tombTransitionFixture();f.page._helpBusy=true;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.onOpen(()=>{});
+    f.windows.set(f.cfg.PageTurning,turn);turn.loadingCall();
+    await h.wait(()=>false,'data reload pending');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.status,'uncertain');assert.match(result.message,/墓藏数据或填土回调仍在加载/);
+  assert.deepEqual(f.closed,[]);
+});
+
+test('real tomb_fill readiness timeout clears an idle tracked cover without sending legionHelp',async()=>{
+  const f=tombTransitionFixture(),logs=[];
+  f.g.ROLE.mine={helpNumDay:0};f.g.console={info:(...args)=>logs.push(args.join(' ')),error(){}};
+  f.root._mineType=0;f.root._openMineType=0;f.page._sameLegion=true;
+  const defs=await f.g.System.import('chunks:///_virtual/define-index.ts');
+  defs.MineService={legionHelp:()=>{},getNeighbors:()=>{}};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../package/daily_tasks/daily_runtime.js'),'utf8'),f.sandbox);
+  const daily=f.sandbox.createDailyRuntime;
+  f.sandbox.createDailyRuntime=(g,h)=>{
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.onOpen(()=>{});turn.loadingCall();
+    f.windows.set(f.cfg.PageTurning,turn);
+    return daily(g,h);
+  };
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.recovered_home,true);
+  assert.equal(f.requests.length,0);assert.equal(f.g.ROLE.mine.helpNumDay,0);
+  assert.ok(logs.some(line=>line.includes('目标墓藏等待诊断')&&line.includes('"turning":true')));
+  assert.deepEqual(f.closed,['PageTurning','MineOtherUI','Setting']);
+});
+
+test('tracking does not cancel PageTurning callbacks used outside tomb navigation',async()=>{
+  const f=tombTransitionFixture();let calls=0;
+  f.sandbox.createDailyRuntime=()=>({dispatch:async()=>true});
+  assert.equal((await f.runtime.dispatch('tomb_state',{kind:'sanshi'})).status,'ok');
+  const turn=new f.Turning();turn.onOpen(()=>{calls++;},()=>{calls++;});
+  turn.loadingCall();turn.finishCall();
+  assert.equal(calls,2);assert.equal(f.g.__e0e1TombTransitions.states.has(turn),false);
+});
+
+test('a cover created after a business request is never eligible for recovery',async()=>{
+  const f=tombTransitionFixture();let turn;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    await h.observe([f.roleService.sweepHangUp],()=>f.manager.service(f.roleService.sweepHangUp,{}),()=>true);
+    turn=new f.Turning();turn.view={};turn.onOpen(()=>{});
+    f.windows.set(f.cfg.PageTurning,turn);
+    await h.wait(()=>false,'business result transition pending');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.status,'uncertain');assert.equal(f.requests.length,1);
+  assert.equal(f.g.__e0e1TombTransitions.states.has(turn),false);assert.deepEqual(f.closed,[]);
+});
+
+test('gotoOtherMine cover without loadingCall is recoverable only after the exact target loaded',async()=>{
+  const f=tombTransitionFixture();
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.onOpen();
+    f.windows.set(f.cfg.PageTurning,turn);
+    await h.wait(()=>false,'native goto close animation stalled');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.recovered_home,true);assert.equal(f.closed[0],'PageTurning');
+});
+
+for (const loaded of [0,12]) test('external goto cover cannot be removed while expected target is missing: '+loaded,async()=>{
+  const f=tombTransitionFixture();f.page._loadedTargetId=loaded;
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.onOpen();
+    f.windows.set(f.cfg.PageTurning,turn);
+    await h.wait(()=>false,'target still loading');
+  }});
+  const result=await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11});
+  assert.equal(result.status,'uncertain');assert.match(result.message,/阻挡页面：PageTurning/);
+  assert.deepEqual(f.closed,[]);
+});
+
+test('hall recovery cancels playClose waiting for an animation that never started',async()=>{
+  const f=tombTransitionFixture();let turn,closePromise,nativeCalls=0,finished=0;
+  f.Turning.prototype.playClose=async()=>{nativeCalls++;};
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    turn=new f.Turning();turn.view={};turn.finishStart=false;turn.onOpen(()=>{},()=>{finished++;});
+    f.windows.set(f.cfg.PageTurning,turn);closePromise=turn.playClose(turn.finishCall);
+    await h.wait(()=>false,'start animation stalled');
+  }});
+  assert.equal((await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11})).recovered_home,true);
+  await closePromise;turn.finishStart=true;
+  assert.equal(nativeCalls,0);assert.equal(finished,0);
+});
+
+test('hall recovery releases a native close-animation Promise without running its late finish callback',async()=>{
+  const f=tombTransitionFixture();let closePromise,release,finished=0,nativeCalls=0;
+  f.Turning.prototype.playClose=function(finish){nativeCalls++;return new Promise(resolve=>{release=()=>{finish();resolve();};});};
+  f.sandbox.createDailyRuntime=(g,h)=>({async dispatch(){
+    f.windows.set(f.cfg.MineOtherUI,f.root);
+    const turn=new f.Turning();turn.view={};turn.finishStart=true;turn.onOpen(()=>{},()=>{finished++;});
+    f.windows.set(f.cfg.PageTurning,turn);closePromise=turn.playClose(turn.finishCall);
+    await h.wait(()=>false,'close animation stalled');
+  }});
+  assert.equal((await f.runtime.dispatch('tomb_fill',{kind:'sanshi',id:11})).recovered_home,true);
+  await closePromise;assert.equal(nativeCalls,1);
+  release();assert.equal(finished,0);
+});

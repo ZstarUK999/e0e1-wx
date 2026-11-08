@@ -16,7 +16,7 @@
 //   · 仅显示客户端已同步数据，不改角色状态；提前窗口允许请求，由服务端判定开战资格。
 
 await (async function () {
-  var g = globalThis, VERSION = '2026-10-31-js-runtime-v24', restored = null;
+  var g = globalThis, VERSION = '2026-11-07-bloodmoon-player-power-v27', restored = null;
   if (g.e0e1Season) {
     if (g.e0e1Season.version === VERSION) return;
     var previous = await g.e0e1Season.diagnose();
@@ -307,6 +307,29 @@ await (async function () {
       groups.push({ legionId: num(bTimeId), title: '本阴司报名（bTime ' + bTimeId + '）', power: 0, members: members });
     });
     return groups;
+  }
+
+  async function playerPower(args) {
+    var id = Number(args && args.roleId);
+    if (!Number.isSafeInteger(id) || id <= 0) return bad('玩家ID无效');
+    if (!lib.defs) lib.defs = await chunk('define-index.ts');
+    var service = lib.defs.GameService;
+    if (!service || typeof service.getRolePreviewInfo !== 'function') return bad('玩家资料接口尚未就绪');
+    // Read-only, bounded separately from attack/speed request state.
+    var reply = await new Promise(function(resolve, reject) {
+      var timer = setTimeout(function() { reject(new Error('玩家战力查询超时')); }, 8000);
+      Promise.resolve().then(function() { return service.getRolePreviewInfo({targetId:id}); })
+        .then(function(value) { clearTimeout(timer); resolve(value); },
+          function(error) { clearTimeout(timer); reject(error); });
+    });
+    if (!reply || reply.code !== 0 || typeof reply.getData !== 'function')
+      return bad('玩家战力查询失败：' + String(reply && (reply.error || reply.code)));
+    var preview = reply.getData().preview;
+    if (!preview || Number(preview.id) !== id) return bad('玩家资料ID不匹配');
+    var power = Number(preview.fightPower);
+    if (preview.fightPower == null || !Number.isFinite(power) || power < 0)
+      return bad('玩家资料未下发战力');
+    return done({roleId:id, power:power});
   }
 
   async function flags() {
@@ -643,9 +666,224 @@ await (async function () {
   }
 
   // Timers, selection and dispatch live entirely in the game context.
-  var automation = {stream:VERSION+':'+Date.now()+':'+Math.random().toString(36).slice(2),epoch:0, revision:-1, controller:null, controllers:{}, config:null, attackTimer:null, speedTimer:null,
+  var automation = {stream:VERSION+':'+Date.now()+':'+Math.random().toString(36).slice(2),enabled:false,epoch:0, revision:-1, controller:null, controllers:{}, config:null, attackTimer:null, speedTimer:null,
     lastAttack:-Infinity, wave:null, target:null, attackStatus:'未启用', speedStatus:'未启用',
     speedBusy:false, speedSeq:0, speedStopped:'', eventSeq:0, events:[], keys:{}, lastDebug:-Infinity};
+  var controls={seq:0,ack:0,patch:{}};
+  var retreat={active:false,epoch:0,timer:null,war:null,self:null,target:null,status:'未撤离',lastSend:-Infinity,seq:0,cache:null};
+  function stopRetreat(reason) {
+    retreat.epoch++;retreat.active=false;
+    if(retreat.timer!==null)clearTimeout(retreat.timer);
+    retreat.timer=null;retreat.cache=null;retreat.status=reason || '已停止撤离';
+  }
+  function mergeControls(args) {
+    if(num(args.control_ack)>=controls.seq){controls.ack=controls.seq;controls.patch={};}
+    var next=Object.assign({},args,{attack:Object.assign({},args.attack),speed_up:Object.assign({},args.speed_up)});
+    ['attack','speed_up'].forEach(function(key){Object.assign(next[key],controls.patch[key] || {});});
+    return next;
+  }
+  async function overlayControl(args) {
+    args=args || {};
+    if(!automation.enabled || !automation.config)return {ok:false,status:'unavailable',message:'血月总开关未开启'};
+    var section=args.control==='speed'?'speed_up':'attack', field=args.control==='mode'?'lowest_power_first':'enabled';
+    if(!['speed','attack','mode'].includes(args.control) || typeof args.value!=='boolean')
+      return {ok:false,status:'unavailable',message:'悬浮窗控制参数无效'};
+    if(args.control==='attack' && args.value) {
+      if(!retreat.active)retreat.target=null;
+    }
+    controls.seq++;controls.patch[section]=Object.assign({},controls.patch[section]);
+    controls.patch[section][field]=args.value;
+    automationEvent('overlay_control',{seq:controls.seq,control:args.control,value:args.value});
+    return await automationConfigure(Object.assign({},automation.config,{enabled:true,controller:automation.controller,
+      revision:automation.revision,control_ack:controls.ack}));
+  }
+  function retreatRoute(m,me) {
+    var data=mapData(), moving=num(me.state)===2 && data && data.moveInfos && data.moveInfos.get(me.id);
+    var origin=moving && moving.to || me.position, side=typeof m.getSeasonMapMySideId==='function'?num(m.getSeasonMapMySideId()):num(me.lId);
+    var scene=currentMarchScene(), source=scene && scene.sourceMap;
+    if(!origin || !side || !source || typeof source.navPath!=='function')return null;
+    var friendly=[],ownership=[];
+    each(data && data.buildings,function(building,key){
+      if(!building)return;
+      ownership.push([String(building.id || key),num(building.ownerId)]);
+      if(num(building.ownerId)!==side)return;
+      var parts=String(key).match(/^(-?\d+)_(-?\d+)$/) || String(building.id || '').match(/^(-?\d+)_(-?\d+)$/);
+      var p=building.position || (parts && {x:Number(parts[1]),y:Number(parts[2])});
+      if(p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y)))friendly.push({x:Number(p.x),y:Number(p.y)});
+    });
+    var signature=JSON.stringify([origin.x,origin.y,num(me.state)===3,ownership]);
+    if(retreat.cache && retreat.cache.signature===signature && retreat.cache.source===source &&
+      latencyNow()-retreat.cache.at<1000)return retreat.cache.route;
+    var best=null;
+    friendly.forEach(function(to){
+      try {
+      var same=Number(origin.x)===to.x && Number(origin.y)===to.y;
+      if(same && num(me.state)===3)return; // Being attacked at a friendly node still requires leaving that node.
+      var path=same?[to]:source.navPath(origin.x,origin.y,to.x,to.y);
+      if((!Array.isArray(path) || path.length<2) && !same && typeof source.searchProbabilityPath==='function')
+        path=source.searchProbabilityPath(origin.x,origin.y,to.x,to.y);
+      if(!Array.isArray(path) || !path.length || !same && path.length<2)return;
+      path=path.map(function(p){return {x:Number(p.x),y:Number(p.y)};});
+      if(path.some(function(p){return !Number.isFinite(p.x)||!Number.isFinite(p.y);}) ||
+        path[0].x!==Number(origin.x) || path[0].y!==Number(origin.y) || path[path.length-1].x!==to.x || path[path.length-1].y!==to.y)return;
+      var steps=path.length-1;
+      if(!best || steps<best.steps || steps===best.steps && (to.x<best.to.x || to.x===best.to.x && to.y<best.to.y))
+        best={from:{x:Number(origin.x),y:Number(origin.y)},to:to,path:path,steps:steps};
+      } catch(error){automationEvent('retreat_route_error',{to:to,message:String(error)},'WARNING');}
+    });
+    retreat.cache={signature:signature,source:source,route:best,at:latencyNow()};
+    return best;
+  }
+  function sendRetreat(m,route) {
+    var seq=++retreat.seq,finished=false;
+    state.outstanding++;
+    var timer=setTimeout(function(){if(!finished)automationEvent('retreat_timeout',{seq:seq,to:route.to,stopped:false},'WARNING');},8000);
+    function settled(value,error) {
+      if(finished)return;finished=true;clearTimeout(timer);state.outstanding--;
+      automationEvent('retreat_receipt',{seq:seq,to:route.to,error:error?String(error):value && value.err || null,
+        malformed:!error && (!value || !Object.prototype.hasOwnProperty.call(value,'err'))},error?'WARNING':'DEBUG');
+    }
+    try {Promise.resolve(m.startMove({warId:m.enteredMapId,to:{x:route.to.x,y:route.to.y},
+      path:route.path.map(function(p){return {x:p.x,y:p.y};})})).then(
+      function(value){settled(value,null);},function(error){settled(null,error);});}
+    catch(error){settled(null,error);}
+    automationEvent('retreat_sent',{seq:seq,to:route.to,steps:route.steps,interval_ms:automation.config.attack.interval_ms});
+  }
+  function retreatTick(epoch) {
+    if(epoch!==retreat.epoch || !retreat.active || !automation.config)return;
+    retreat.timer=null;
+    var delay=100;
+    try {
+      var m=module_(),me=myRole(),args=automation.config.attack;
+      if(!m || !me || String(m.enteredMapId)!==retreat.war || num(me.id)!==retreat.self || ![1,2,3].includes(num(me.state))) {
+        stopRetreat('已离开战场、阵亡或角色状态变化，停止撤离');return;
+      }
+      if(typeof m.startMove!=='function'){retreat.status='等待行军接口就绪';return;}
+      var route=retreatRoute(m,me);
+      if(!route){retreat.target=null;retreat.status='未找到可达的己方节点，持续查找';return;}
+      retreat.target=route.to;
+      if(route.steps===0){
+        if(num(me.state)===1){stopRetreat('已到达己方节点，撤离完成');automationEvent('retreat_arrived',{to:route.to});return;}
+        stopRetreat('已向己方节点行军，撤离完成');
+        automationEvent('retreat_marching',{to:route.to});return;
+      }
+      var context=attackContext(m,me,args,num(lib.clock && lib.clock.serverTime));
+      if(num(me.state)!==1 && !context.early){
+        retreat.status='等待'+stateName(me.state)+'结束的提前窗口';
+        var remaining=context.end-num(lib.clock && lib.clock.serverTime)-context.lead_ms;
+        if(remaining>0)delay=Math.min(delay,remaining);
+        return;
+      }
+      var due=retreat.lastSend+args.interval_ms-latencyNow();
+      if(due>0){delay=Math.min(delay,due);return;}
+      retreat.lastSend=latencyNow();sendRetreat(m,route);
+      retreat.status='撤往 '+route.to.x+','+route.to.y+'；间隔 '+args.interval_ms+'ms';
+      delay=Math.min(100,args.interval_ms);
+    } catch(error){retreat.status='撤离扫描异常，继续重试';automationEvent('retreat_error',{message:String(error),stopped:false},'WARNING');}
+    finally {if(epoch===retreat.epoch && retreat.active)retreat.timer=setTimeout(function(){retreatTick(epoch);},Math.max(1,Math.ceil(delay)));}
+  }
+  async function emergencyRetreat(args) {
+    if(args && args.on===false){stopRetreat('已手动停止撤离');return automationEvents({});}
+    if(!automation.enabled || !automation.config)return {ok:false,status:'unavailable',message:'请先开启血月功能'};
+    stopRetreat();retreat.active=true;retreat.target=null;retreat.status='正在准备撤离';
+    var epoch=retreat.epoch;
+    try {await libs();await serverNow(true);}
+    catch(error){if(epoch===retreat.epoch)stopRetreat('撤离初始化失败：'+String(error));throw error;}
+    if(!retreat.active || epoch!==retreat.epoch)return automationEvents({});
+    var m=module_(),me=myRole();
+    if(!m || !me){stopRetreat('战场角色尚未就绪');return automationEvents({});}
+    retreat.war=String(m.enteredMapId);retreat.self=num(me.id);retreat.lastSend=-Infinity;
+    retreatTick(epoch);
+    return automationEvents({});
+  }
+  var bloodmoonOverlay={timer:null,panel:null,host:null,position:null,widgets:[]};
+  function unmountBloodmoonOverlay() {
+    if(bloodmoonOverlay.panel && bloodmoonOverlay.panel.isValid!==false)bloodmoonOverlay.panel.destroy();
+    bloodmoonOverlay.panel=null;bloodmoonOverlay.host=null;bloodmoonOverlay.widgets=[];bloodmoonOverlay.detail=null;
+  }
+  function removeBloodmoonOverlay() {
+    if(bloodmoonOverlay.timer!==null)clearInterval(bloodmoonOverlay.timer);
+    bloodmoonOverlay.timer=null;unmountBloodmoonOverlay();
+  }
+  function renderBloodmoonOverlay() {
+    var cc=lib.cc,me=myRole(),host=g.UIManager && g.UIManager.ins && g.UIManager.ins.system;
+    if(!automation.enabled || g.__e0e1GameOverlaysEnabled===false || !me || ![1,2,3].includes(num(me.state)) ||
+      !module_() || !module_().enteredMapId || !host || host.isValid===false ||
+      !cc || !cc.Node || !cc.Graphics || !cc.Label || !cc.UITransform || !cc.view) {
+      unmountBloodmoonOverlay();return;
+    }
+    var visible=cc.view.getVisibleSize(), transform=host.getComponent(cc.UITransform);
+    var size={width:transform && transform.width || visible.width,height:transform && transform.height || visible.height};
+    var width=Math.min(310,size.width-16),height=250;
+    function place() {
+      var p=bloodmoonOverlay.position;
+      p.x=Math.max(-size.width/2+width/2,Math.min(size.width/2-width/2,p.x));
+      p.y=Math.max(-size.height/2+height/2,Math.min(size.height/2-height/2,p.y));
+      bloodmoonOverlay.panel.setPosition(p.x,p.y,0);
+    }
+    if(!bloodmoonOverlay.panel || bloodmoonOverlay.panel.isValid===false || bloodmoonOverlay.host!==host) {
+      unmountBloodmoonOverlay();bloodmoonOverlay.host=host;
+      function node(name,parent,w,h,x,y) {
+        var n=new cc.Node(name);n.layer=host.layer;n.addComponent(cc.UITransform).setContentSize(w,h);
+        parent.addChild(n);n.setPosition(x,y,0);return n;
+      }
+      function paint(n,w,h,color) {
+        var graph=n.getComponent(cc.Graphics) || n.addComponent(cc.Graphics);
+        graph.clear();graph.fillColor=new cc.Color(color[0],color[1],color[2],235);
+        graph.roundRect(-w/2,-h/2,w,h,8);graph.fill();
+      }
+      function label(parent,name,w,h,y,font) {
+        var n=node(name,parent,w,h,0,y),l=n.addComponent(cc.Label);
+        l.fontSize=font;l.lineHeight=font+4;l.enableWrapText=true;
+        l.color=new cc.Color(245,247,250,255);l.horizontalAlign=cc.HorizontalTextAlignment.CENTER;
+        l.overflow=cc.Label.Overflow.CLAMP;
+        if(cc.Label.CacheMode && cc.Label.CacheMode.CHAR!==undefined)l.cacheMode=cc.Label.CacheMode.CHAR;
+        n.getComponent(cc.UITransform).setContentSize(w,h);return l;
+      }
+      var panel=bloodmoonOverlay.panel=node('e0e1_bloodmoon_overlay',host,width,height,0,0);
+      paint(panel,width,height,[24,30,42]);if(cc.BlockInputEvents)panel.addComponent(cc.BlockInputEvents);
+      if(!bloodmoonOverlay.position)bloodmoonOverlay.position={x:size.width/2-width/2-12,y:size.height/2-310};
+      var title=label(panel,'血月控制（拖动）',width-16,30,102,19);title.string='血月控制（拖动）';
+      title.node.on(cc.Node.EventType.TOUCH_MOVE,function(event){
+        var delta=event.getUIDelta();bloodmoonOverlay.position.x+=delta.x;bloodmoonOverlay.position.y+=delta.y;
+        place();event.propagationStopped=true;
+      });
+      ['speed','attack','mode','retreat'].forEach(function(kind,index){
+        var button=node('bloodmoon_'+kind,panel,width-24,32,0,65-index*38);
+        var text=label(button,'文字',width-32,30,0,17);
+        button.on(cc.Node.EventType.TOUCH_END,function(event){
+          if(event)event.propagationStopped=true;
+          var config=automation.config;if(!config)return;
+          var job=kind==='retreat'?emergencyRetreat({on:!retreat.active}):overlayControl({control:kind,
+            value:kind==='speed'?!config.speed_up.enabled:kind==='attack'?!config.attack.enabled:!config.attack.lowest_power_first});
+          Promise.resolve(job).then(refreshBloodmoonOverlay,function(error){
+            retreat.status='操作失败：'+String(error);automationEvent('overlay_error',{message:String(error)},'WARNING');refreshBloodmoonOverlay();
+          });
+        });
+        bloodmoonOverlay.widgets.push({node:button,label:text,paint:function(color){paint(button,width-24,32,color);},signature:''});
+      });
+      bloodmoonOverlay.detail=label(panel,'状态',width-24,42,-98,14);
+    }
+    var config=automation.config;if(!config)return;
+    var texts=['行军加速：'+(config.speed_up.enabled?'开':'关'),'自动攻击：'+(config.attack.enabled?'开':'关'),
+      '攻击模式：'+(config.attack.lowest_power_first?'最低战力优先':'最高战力优先'),retreat.active?'停止撤离':'紧急撤离'];
+    bloodmoonOverlay.widgets.forEach(function(widget,index){
+      if(widget.label.string!==texts[index])widget.label.string=texts[index];
+      var signature=index===3?'retreat':String(index===0?config.speed_up.enabled:index===1?config.attack.enabled:config.attack.lowest_power_first);
+      if(widget.signature!==signature){widget.signature=signature;widget.paint(index===3?[166,57,57]:signature==='true'?[39,101,86]:[58,68,86]);}
+    });
+    var detail=retreat.active || retreat.target?retreat.status:automation.attackStatus;
+    if(bloodmoonOverlay.detail.string!==detail)bloodmoonOverlay.detail.string=detail;
+    place();
+  }
+  function refreshBloodmoonOverlay() {
+    try {renderBloodmoonOverlay();}
+    catch(error){unmountBloodmoonOverlay();automationEvent('overlay_render_error',{message:String(error)},'WARNING');}
+  }
+  function startBloodmoonOverlay() {
+    refreshBloodmoonOverlay();
+    if(automation.enabled && bloodmoonOverlay.timer===null)bloodmoonOverlay.timer=setInterval(refreshBloodmoonOverlay,300);
+  }
 
   function automationEvent(kind, detail, level) {
     var key=JSON.stringify(detail || {});
@@ -658,7 +896,7 @@ await (async function () {
     automation[channel+'Status']=status;
     automationEvent(channel+'_state',{status:status},/等待|剩余|道具不足/.test(status)?'DEBUG':'INFO');
   }
-  function stopAutomation(reason) {
+  function stopAutomation(reason, keepRetreat) {
     if(automation.config)automationEvent('automation_stopped',{reason:reason || '配置变更',attack:automation.config.attack.enabled,speed:automation.config.speed_up.enabled});
     automation.epoch++;
     if(automation.attackTimer!==null)clearTimeout(automation.attackTimer);
@@ -667,16 +905,19 @@ await (async function () {
     automation.config=null;
     automation.target=null;
     automationStatus('attack','未启用');automationStatus('speed','未启用');
+    if(!keepRetreat)stopRetreat(reason || '血月自动化已停止');
   }
   function automationEvents(args) {
     var after=args && args.stream_id && args.stream_id!==automation.stream?0:num(args && args.after_seq), config=automation.config;
     var batch=automation.events.filter(function(e){return e.seq>after;}).slice(0,512);
-    return done({stream_id:automation.stream,revision:automation.revision, running:!!(config && (config.attack.enabled || config.speed_up.enabled)),
+    return done({stream_id:automation.stream,revision:automation.revision, running:!!(retreat.active || config && (config.attack.enabled || config.speed_up.enabled)),
       events:batch, cursor:batch.length?batch[batch.length-1].seq:automation.eventSeq,
       dropped:automation.events.length?Math.max(0,automation.events[0].seq-after-1):0,
       attack_status:automation.attackStatus,speed_status:automation.speedStatus,
       battles:state.battles, speed_times:state.speedTimes,
-      attack_latency:attackLatencyStats(),effective_lead_ms:config?effectiveAttackLead(config.attack):0});
+      attack_latency:attackLatencyStats(),effective_lead_ms:config?effectiveAttackLead(config.attack):0,
+      overlay_controls:{seq:controls.seq,patch:JSON.parse(JSON.stringify(controls.patch))},
+      retreat:{active:retreat.active,status:retreat.status,target:retreat.target}});
   }
   function pickAttackTarget(snapshot, args) {
     var mine=num(snapshot.self_plan_power)||num(snapshot.self_power), limit=num(args.power_limit);
@@ -702,6 +943,9 @@ await (async function () {
     automation.attackTimer=null;
     var args=automation.config.attack, delay=Math.min(100,args.interval_ms);
     try {
+      // Retreat temporarily takes priority. Keep the configured switch and timer alive so normal
+      // attacks resume after marching is confirmed, without a second user action or config write.
+      if(retreat.active){automationStatus('attack','紧急撤离中，暂让行军请求优先');return;}
       // One synchronous local snapshot, selection and dispatch: no bridge or await.
       var snapshot=candidateSnapshot(Object.assign({compact:true},args));
       if(!snapshot.ok){automationStatus('attack','等待战场数据');return;}
@@ -792,22 +1036,27 @@ await (async function () {
       automation.controllers[controller]=true;automation.controller=controller;automation.revision=-1;
     }
     if(num(args.revision)<automation.revision)return automationEvents(args);
+    args=mergeControls(args);
     var a=args.attack || {},s=args.speed_up || {};
     var config={attack:{enabled:!!args.enabled && !!a.enabled,lead_ms:num(a.lead_ms,400),
       dynamic_lead:a.dynamic_lead===true,interval_ms:Math.max(1,Math.min(10000,num(a.interval_ms,200))),
       power_limit:num(a.power_limit),max_battles:num(a.max_battles),lowest_power_first:a.lowest_power_first===true},
       speed_up:{enabled:!!args.enabled && !!s.enabled,max_times:num(s.max_times),interval_seconds:num(s.interval_seconds)}};
     automation.revision=num(args.revision);
-    if(JSON.stringify(config)===JSON.stringify(automation.config))return automationEvents(args);
+    var masterChanged=automation.enabled!==!!args.enabled;
+    automation.enabled=!!args.enabled;
+    if(JSON.stringify(config)===JSON.stringify(automation.config) && !masterChanged)return automationEvents(args);
     var previousLast=automation.lastAttack;
-    stopAutomation();
+    stopAutomation('配置变更',!!args.enabled);
     var epoch=automation.epoch;
     automation.config=config;automation.lastAttack=previousLast;
     automationEvent('configured',{attack:config.attack,speed_up:config.speed_up});
-    if(!config.attack.enabled && !config.speed_up.enabled)return automationEvents(args);
+    if(!args.enabled){removeBloodmoonOverlay();return automationEvents(args);}
     try {await libs();await serverNow(true);}
     catch(error){if(epoch===automation.epoch){automationEvent('initialization_error',{message:String(error),stopped:true},'ERROR');stopAutomation('初始化异常');}throw error;}
     if(epoch!==automation.epoch)return automationEvents(args);
+    startBloodmoonOverlay();
+    if(config.attack.enabled && !retreat.active)retreat.target=null;
     if(config.attack.enabled)attackTick(epoch);
     if(config.speed_up.enabled)speedTick(epoch);
     return automationEvents(args);
@@ -992,6 +1241,7 @@ await (async function () {
 
   function stop() {
     stopAutomation('用户停用或会话关闭');
+    automation.enabled=false;removeBloodmoonOverlay();
     state.attackWave++;state.attackScope='';state.lastAttackRejection=null;
     ++marksEpoch;
     if (state.markTimer) { clearInterval(state.markTimer); state.markTimer = null; }
@@ -1011,8 +1261,9 @@ await (async function () {
   }
 
   g.e0e1Season = { ready: true, version: VERSION, detachBattleObserver: detachBattleObserver, pendingState: function(){return {pending:state.pending,uncertain:state.uncertain,outstanding:state.outstanding};} };
-  var methods = { flags: flags, march: march, speedUp: speedUp, candidates: candidates,
+  var methods = { flags: flags, playerPower: playerPower, march: march, speedUp: speedUp, candidates: candidates,
     automationConfigure:automationConfigure, automationEvents:automationEvents,
+    overlayControl:overlayControl, emergencyRetreat:emergencyRetreat,
     attack: attack, marks: marks, diagnose: diagnose, stop: stop, reset: reset };
   Object.keys(methods).forEach(function (name) { g.e0e1Season[name] = exportCall(name, methods[name]); });
   log('血月战场脚本已就绪：战旗探测/加速/挑战/隐匿状态标注');

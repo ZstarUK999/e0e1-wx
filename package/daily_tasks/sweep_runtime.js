@@ -184,6 +184,102 @@ function createEnergyRuntime(g, timing) {
   function idleCallbacks() {
     return !guard.pending && !guard.action_pending && !guard.callback_count && !guard.uncertain;
   }
+  // PageTurning starts loadingCall from a Spine event, outside the button's Promise.
+  // Track that native callback before allowing recovery to dismiss a tomb transition.
+  async function trackTombTransitions() {
+    if (g.__e0e1TombTransitions) return;
+    const {UIPageTurning}=await g.System.import('chunks:///_virtual/ui-page-turning.ts');
+    const prototype=UIPageTurning && UIPageTurning.prototype, original=prototype && prototype.onOpen;
+    if (typeof original!=='function') throw error('墓藏过场回调入口不可用');
+    const states=new WeakMap(), originalClose=prototype.playClose;
+    if (typeof originalClose==='function') prototype.playClose=async function(...args) {
+      const state=states.get(this);
+      if (!state) return await originalClose.apply(this,args);
+      if (state.cancelled) return;
+      // Native playClose polls finishStart indefinitely. Keep that wait cancellable so recovery
+      // does not leave a detached navigation coroutine polling a destroyed cover forever.
+      let timer;
+      const ready=new Promise(resolve=>{
+        const poll=()=>{if(this.finishStart || state.cancelled)resolve();else timer=setTimeout(poll,20);};
+        poll();
+      });
+      try {await Promise.race([ready,state.cancelSignal]);}
+      finally {clearTimeout(timer);}
+      if (state.cancelled) return;
+      return await Promise.race([originalClose.apply(this,args),state.cancelSignal]);
+    };
+    prototype.onOpen=function(...args) {
+      const result=original.apply(this,args);
+      if (!guard.tomb_navigation || guard.effect_started) {states.delete(this);return result;}
+      const state={active:0,cancelled:false,started:0,completed:0,
+        external:typeof this.loadingCall!=='function',target:guard.tomb_target,kind:guard.tomb_kind};
+      state.cancelSignal=new Promise(resolve=>{state.cancel=()=>{state.cancelled=true;resolve();};});
+      states.set(this,state);
+      for (const key of ['loadingCall','finishCall']) {
+        const callback=this[key];
+        if (typeof callback!=='function') continue;
+        this[key]=function(...params) {
+          if (state.cancelled) return;
+          state.active++;state.started++;
+          let result;
+          try {result=callback.apply(this,params);}
+          catch(e) {state.active--;state.completed++;throw e;}
+          if (result && typeof result.then==='function')
+            return Promise.resolve(result).finally(()=>{state.active--;state.completed++;});
+          state.active--;state.completed++;
+          return result;
+        };
+      }
+      return result;
+    };
+    g.__e0e1TombTransitions={states};
+  }
+  function recoveryDiagnostics() {
+    const states=g.__e0e1TombTransitions && g.__e0e1TombTransitions.states;
+    return {pending:!!guard.pending,action_pending:!!guard.action_pending,callbacks:guard.callback_count || 0,
+      effect_started:!!guard.effect_started,uncertain:!!guard.uncertain,
+      blockers:blockedViews().map(v=>v.cfg && v.cfg.id),
+      pages:Object.values(ui().viewParams || {}).map(v=>{
+        const screen=v.ui, state=states && screen && states.get(screen);
+        return {id:v.cfg && v.cfg.id,loading:!!v.loading,showing:!!v.showing,busy:!!screen?.busy,
+          busy_pages:(screen?.pages || []).filter(p=>p && p.busy).length,
+          transition:state && {active:state.active,started:state.started,completed:state.completed,
+            cancelled:state.cancelled,external:state.external,target:state.target},
+          tombs:[screen?.view?.mine_other_sanshi,screen?.view?.mine_other_magic_artifact].filter(Boolean).map(p=>
+            ({target:p._targetId,loaded:p._loadedTargetId,help_busy:!!p._helpBusy,active:p.node?.activeInHierarchy}))};
+      })};
+  }
+  function recoveryBlockers() {
+    const views=Object.values(ui().viewParams || {}), states=g.__e0e1TombTransitions?.states;
+    const isTransition=v=>{
+      const state=v.ui && states?.get(v.ui);
+      if (!guard.tomb_navigation || v.cfg!==cfg.PageTurning || !state) return false;
+      if (!state.external) return true;
+      // gotoOtherMine awaits its target UI outside loadingCall. Only its fully loaded target proves
+      // that the remaining work is the cover animation, rather than a late navigation to another player.
+      const retained=ui().find(cfg.MineOtherUI), root=retained && retained.ui;
+      const page=root?.view?.[state.kind==='artifact'?'mine_other_magic_artifact':'mine_other_sanshi'];
+      return state.target>0 && retained && retained.valid!==false && !retained.loading &&
+        page?._targetId===state.target && page?._loadedTargetId===state.target && page?._helpBusy===false;
+    };
+    const reasons=[];
+    if (!idleCallbacks() || guard.effect_started) reasons.push('未决请求或按钮回调');
+    for (const v of blockedViews()) if (!isTransition(v)) reasons.push('阻挡页面：'+String(v.cfg?.id));
+    for (const v of views) {
+      const screen=v.ui;
+      if (!screen) continue;
+      const transition=states && states.get(screen);
+      if (isTransition(v) && transition.active) reasons.push('墓藏过场回调仍在执行');
+      const mine=screen.view && [screen.view.mine_other_sanshi,screen.view.mine_other_magic_artifact].filter(Boolean);
+      if (mine?.some(p=>p._helpBusy)) reasons.push('墓藏数据或填土回调仍在加载');
+      if (screen.busy || (screen.pages || []).some(p=>p && p.busy)) {
+        const loadedTomb=guard.tomb_navigation && v.cfg===cfg.MineOtherUI && mine?.some(p=>
+          p._targetId>0 && p._loadedTargetId===p._targetId && p._helpBusy===false);
+        if (!loadedTomb) reasons.push('页面忙碌：'+String(v.cfg?.id));
+      }
+    }
+    return reasons;
+  }
   function pageInstance(which, ready) {
     const retained=ui().find(which), screen=ui().findOpen(which);
     if (!retained || retained.valid===false || retained.loading || !screen || screen.isValid===false ||
@@ -213,8 +309,15 @@ function createEnergyRuntime(g, timing) {
   }
   // Only ordinary pages are eligible; native closeUI retains onClose/onAfterClose cleanup.
   async function recoverHome() {
-    if (!idleCallbacks() || guard.effect_started || uiBusy() || blockedViews().length)
-      throw error('仍有未决请求、回调或阻挡页面，不能恢复大厅','uncertain');
+    const verify=()=>{
+      const reasons=recoveryBlockers();
+      if (reasons.length) {
+        const details=JSON.stringify(recoveryDiagnostics());
+        log('恢复大厅被阻止：'+reasons.join('、')+'；'+details);
+        throw error(reasons.join('、')+'；恢复诊断='+details,'uncertain');
+      }
+    };
+    verify();
     const hall=ui().find(cfg.MainUI), main=hall && hall.ui;
     // Full-screen pages may temporarily hide the existing hall node. It must become visible after cleanup.
     if (!hall || hall.valid===false || hall.loading || !main || main.isValid===false || !main.view ||
@@ -223,9 +326,13 @@ function createEnergyRuntime(g, timing) {
     const pages=normalPages();
     const rewardPending=()=>[cfg.Congrats,cfg.HeroLevelUp].filter(Boolean).some(which=>ui().find(which));
     for (let round=0;round<32;round++) {
-      if (!idleCallbacks() || uiBusy() || blockedViews().length || rewardPending())
-        throw error('恢复大厅期间出现未决操作或阻挡页面','uncertain');
-      const stack=Object.values(ui().viewParams || {}).filter(v=>pages.includes(v.cfg));
+      verify();
+      if (rewardPending()) throw error('奖励或升级页面尚未确认','uncertain');
+      const views=Object.values(ui().viewParams || {});
+      const transitions=guard.tomb_navigation ? views.filter(v=>v.cfg===cfg.PageTurning &&
+        v.ui && g.__e0e1TombTransitions?.states.has(v.ui)) : [];
+      // Cancel deferred native callbacks before closing the cover; never close an active callback.
+      const stack=transitions.length ? transitions : views.filter(v=>pages.includes(v.cfg));
       if (!stack.length) {
         await new Promise(resolve=>setTimeout(resolve,100));
         if (Object.values(ui().viewParams || {}).some(v=>pages.includes(v.cfg))) continue;
@@ -238,6 +345,11 @@ function createEnergyRuntime(g, timing) {
       const retained=stack[stack.length-1], screen=retained.ui;
       if (!screen || screen.isValid===false || !screen.view || typeof ui().closeUI!=='function')
         throw error('页面实例或原生关闭接口不可用，未强制销毁','uncertain');
+      const transition=g.__e0e1TombTransitions?.states.get(screen);
+      if (transition) {
+        transition.cancel();
+        log('墓藏过场回调已收尾，取消延迟回调并关闭残留过场');
+      }
       screen.isPlayCloseEffect=false;
       await bounded(ui().closeUI(retained),'原生关闭页面尚未完成');
       if (Object.values(ui().viewParams || {}).includes(retained))
@@ -1124,9 +1236,16 @@ function createEnergyRuntime(g, timing) {
     const readOnly=['inspect','capture','player_information','reward_info','desire_bag_stats','desire_compose_probe','identity','pet_fodder_state'].includes(op);
     if (guard.busy && !readOnly) return {status:'uncertain',message:'已有正常UI操作未完成'};
     if (guard.uncertain && !readOnly) return {status:'uncertain',message:'前次操作结果未知，需核对恢复记录'};
-    if (!readOnly) {guard.busy=true;guard.effect_started=false;}
+    if (!readOnly) {
+      guard.busy=true;guard.effect_started=false;guard.tomb_navigation=op.startsWith('tomb_');
+      guard.tomb_target=Number(args.id) || 0;guard.tomb_kind=args.kind;
+    }
     try {
       await initialize();
+      if (guard.tomb_navigation && !g.__e0e1TombTransitions) {
+        try {await trackTombTransitions();}
+        catch(e) {log('墓藏过场回调监测不可用，保持保守恢复：'+String(e.message || e));}
+      }
       let value;
       if (op==='inspect') value={...(await energyTiming()),energy:g.ROLE.energy.energyValue,maximum:roleHelper.getMaxEnergy(),safe:safe()&&!guard.busy&&!guard.uncertain,
         blockers:[...blockers(),...(guard.busy || guard.pending || guard.action_pending?['存在未完成操作']:[]),...(guard.uncertain?['前次操作结果未知']:[])]};
@@ -1180,7 +1299,7 @@ function createEnergyRuntime(g, timing) {
       if (g.console) g.console.error('[plugin.error]',String(e.message || e));
       return {status,message:String(e.message || e)};
     } finally {
-      if (!readOnly) guard.busy=false;
+      if (!readOnly) {guard.busy=false;guard.tomb_navigation=false;}
     }
   }};
 }

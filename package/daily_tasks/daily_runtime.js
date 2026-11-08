@@ -243,7 +243,7 @@ function createDailyRuntime(g,h) {
     });
     // The native list callback destroys the previous MineOtherUI before asynchronously creating its replacement.
     // Reacquire it on every observation; never retain the pre-transition component or dereference its released view.
-    return await h.wait(()=>{
+    try {return await h.wait(()=>{
       if(navigating())return false;
       const root=h.ui().findOpen(cfg.MineOtherUI),retained=h.ui().find(cfg.MineOtherUI);
       if(!root || root.isValid===false || !root.view || retained && (retained.loading || retained.showing===false))return false;
@@ -251,7 +251,16 @@ function createDailyRuntime(g,h) {
       return page && (!page.node || page.node.activeInHierarchy!==false) &&
         page._targetId===id && page._loadedTargetId===id && !page._helpBusy &&
         page.btn_help && page.btn_help.interactable!==false && page;
-    },'目标墓藏信息仍在加载、切换或目标不匹配');
+    },'目标墓藏信息仍在加载、切换或目标不匹配');}
+    catch(e) {
+      const root=h.ui().findOpen(cfg.MineOtherUI),page=otherPage(root,kind),turn=h.ui().findOpen(cfg.PageTurning);
+      const state=turn && g.__e0e1TombTransitions?.states.get(turn);
+      if(h.log)h.log('目标墓藏等待诊断：'+JSON.stringify({kind,expected:id,target:page?._targetId,
+        loaded:page?._loadedTargetId,help_busy:!!page?._helpBusy,active:page?.node?.activeInHierarchy,
+        button_interactable:page?.btn_help?.interactable,turning:navigating(),
+        transition:state && {active:state.active,started:state.started,completed:state.completed}}));
+      throw e;
+    }
   }
   async function other(kind,id,mode) {
     const {cfg}=config();const active=h.ui().findOpen(cfg.MineOtherUI);

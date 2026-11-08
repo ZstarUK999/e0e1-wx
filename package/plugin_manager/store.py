@@ -63,7 +63,7 @@ def default_config() -> dict:
     }
     tasks["arena"] = {
         "name": "最后两分钟斗法", "enabled": False, "priority": 10, "timeout_seconds": 30, "retry_seconds": 5,
-        "schedule": {"kind": "daily_window", "start": "10:28", "end": "10:30", "interval_seconds": 1},
+        "schedule": {"kind": "daily_window", "start": "22:28", "end": "22:30", "interval_seconds": 1},
         "params": {"excluded_player_ids": [], "continuous": True, "skip_battle": True},
     }
     tasks['free_summon'] = {

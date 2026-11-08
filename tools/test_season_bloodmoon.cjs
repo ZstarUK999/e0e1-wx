@@ -183,6 +183,26 @@ function fixture(options = {}) {
 
 async function test(name, fn) { await fn(); console.log('PASS',name); }
 (async()=>{
+  await test('flag power queries public player preview with verified target ID',async()=>{
+    const f=fixture();let params;
+    f.context.System.import=async name=>name.endsWith('define-index.ts')?{GameService:{getRolePreviewInfo:async p=>{
+      params=p;return {code:0,getData:()=>({preview:{id:2,fightPower:123456}})};
+    }}}:null;
+    const result=await f.run(f.api.playerPower({roleId:2}));
+    assert.equal(params.targetId,2);assert.equal(result.ok,true);assert.equal(result.power,123456);
+    assert.equal(f.sent.length,0);
+  });
+  for(const kind of ['mismatch','missing','negative','rejected','timeout']){
+    await test('flag player query isolates '+kind+' without poisoning attack state',async()=>{
+      const f=fixture();
+      f.context.System.import=async()=>({GameService:{getRolePreviewInfo:()=>kind==='timeout'?new Promise(()=>{}):
+        Promise.resolve({code:kind==='rejected'?1:0,getData:()=>({preview:{id:kind==='mismatch'?3:2,
+          fightPower:kind==='missing'?undefined:kind==='negative'?-1:100}})})}});
+      const result=await f.run(f.api.playerPower({roleId:2}));
+      assert.equal(result.ok,false);assert.equal(f.api.pendingState().uncertain,false);
+      assert.equal(f.api.pendingState().outstanding,0);
+    });
+  }
   await test('stop invalidates a marks activation awaiting module loading',async()=>{
     const f=fixture();const pending=f.api.marks({on:true});
     await f.api.stop();await f.run(pending);
@@ -314,7 +334,7 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     f.api.version='old-fixture';
     await f.run(vm.runInNewContext('(async()=>{'+source+'})()',f.context));
     const updated=f.context.e0e1Season;
-    assert.equal(updated.version,'2026-10-31-js-runtime-v24');assert.notEqual(updated,f.api);
+    assert.equal(updated.version,'2026-11-07-bloodmoon-player-power-v27');assert.notEqual(updated,f.api);
     assert.equal((await f.run(updated.march())).speed_up.times,1);
     assert.equal((await f.run(updated.speedUp({max_times:1}))).ok,false);
     assert.equal(f.sent.length,1);
@@ -924,6 +944,226 @@ async function test(name, fn) { await fn(); console.log('PASS',name); }
     f.module.getSeasonMapMyRole=()=>{if(armed){armed=false;f.api.stop();}return role();};
     await f.run(f.api.automationConfigure(autoConfig({enabled:false},{enabled:true})));
     await advance(f,1000);assert.equal(f.sent.length,0);
+  });
+
+  function retreatFixture(){
+    const f=controlledFixture(),moves=[];
+    f.data.buildings.set('1_1',Object.assign(f.data.buildings.get('1_1'),{ownerId:20}));
+    f.data.buildings.set('3_1',{id:'3_1',ownerId:10});
+    f.data.buildings.set('1_4',{id:'1_4',ownerId:10});
+    f.scene.sourceMap.navPath=(x,y,tx,ty)=>{
+      const rows=[{x,y}];while(x!==tx || y!==ty){if(x!==tx)x+=Math.sign(tx-x);else y+=Math.sign(ty-y);rows.push({x,y});}return rows;
+    };
+    f.module.startMove=params=>new Promise((resolve,reject)=>moves.push({params,resolve,reject,at:f.context.Date.now()}));
+    return {...f,moves};
+  }
+  await test('retreat pauses attack immediately and repeats move requests without waiting for replies',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig({interval_ms:200})));
+    assert.equal(f.packets.length,1);
+    const result=await f.run(f.api.emergencyRetreat({on:true}));
+    assert.equal(result.retreat.active,true);assert.equal(f.moves.length,1);assert.equal(f.moves[0].params.to.x,3);
+    await advance(f,400);assert.equal(f.moves.length,3);assert.equal(f.packets.length,1);
+    assert.deepEqual(f.moves.map(p=>p.at),[100000,100200,100400]);
+    f.moves[0].reject(Error('offline'));f.moves[1].resolve({err:{code:7},resp:{}});
+    await advance(f,200);assert.equal(f.moves.length,4);assert.equal(f.packets.length,1);
+    await f.run(f.api.stop());await advance(f,1000);assert.equal(f.moves.length,4);
+  });
+  await test('retreat chooses native shortest route instead of a geometrically nearer friendly node',async()=>{
+    const f=retreatFixture();f.data.buildings.delete('1_4');f.data.buildings.delete('3_1');
+    f.data.buildings.set('2_1',{ownerId:10});f.data.buildings.set('5_1',{ownerId:10});f.data.buildings.set('1_2',{ownerId:20});
+    const path=f.scene.sourceMap.navPath;
+    f.scene.sourceMap.navPath=(x,y,tx,ty)=>tx===2?[{x:1,y:1},{x:1,y:2},{x:1,y:3},{x:2,y:3},{x:2,y:2},{x:2,y:1}]:path(x,y,tx,ty);
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    await f.run(f.api.emergencyRetreat());assert.equal(f.moves[0].params.to.x,5);assert.equal(f.moves[0].params.path.length,5);
+  });
+  await test('march retreat uses arrival node and the shared lead window',async()=>{
+    const f=retreatFixture();f.me.state=2;f.move.to={x:2,y:1};f.move.arrive=101000;
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false,lead_ms:400,interval_ms:200})));
+    await f.run(f.api.emergencyRetreat());assert.equal(f.moves.length,0);
+    await advance(f,599);assert.equal(f.moves.length,0);
+    await advance(f,1);assert.equal(f.moves.length,1);assert.equal(f.moves[0].at,100600);
+    assert.equal(f.moves[0].params.path[0].x,2);assert.equal(f.moves[0].params.to.x,3);
+    await advance(f,400);assert.equal(f.moves.length,3);
+  });
+  await test('combat retreat shares attack lead timing and never waits for its first receipt',async()=>{
+    const f=retreatFixture();f.me.state=3;f.module.getTimerByRole=()=>({endTime:101000});
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false,lead_ms:400,interval_ms:100})));
+    await f.run(f.api.emergencyRetreat());await advance(f,599);assert.equal(f.moves.length,0);
+    await advance(f,201);assert.equal(f.moves.length,3);assert.equal(f.moves[0].at,100600);
+  });
+  await test('arrival sync ends retreat and late replies cannot prevent automatic attack resuming',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig()));
+    await f.run(f.api.emergencyRetreat());f.me.position={x:3,y:1};f.me.state=1;f.data.buildings.get('3_1').members=new Set([1,2]);
+    await advance(f,100);let status=await f.run(f.api.automationEvents());assert.equal(status.retreat.active,false);
+    assert.match(status.retreat.status,/撤离完成/);const count=f.moves.length,attacks=f.packets.length;
+    f.moves[0].resolve({err:null,resp:{}});await advance(f,1000);
+    assert.equal(f.moves.length,count);assert(f.packets.length>attacks);
+  });
+  await test('desktop configuration preserves the temporary retreat gate without changing attack preference',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig()));
+    const status=await f.run(f.api.emergencyRetreat());
+    assert.equal(status.overlay_controls.seq,0);assert.equal(Object.keys(status.overlay_controls.patch).length,0);
+    await f.run(f.api.automationConfigure(autoConfig({}, {}, {revision:2,control_ack:0})));
+    await advance(f,600);assert.equal(f.packets.length,1);assert(f.moves.length>=3);
+    assert.equal((await f.run(f.api.automationEvents())).retreat.active,true);
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false}, {}, {revision:3,control_ack:0})));
+    await f.run(f.api.emergencyRetreat({on:false}));await advance(f,400);assert.equal(f.packets.length,1);
+    await f.run(f.api.overlayControl({control:'attack',value:true}));assert(f.packets.length>1);
+  });
+  await test('ownership changes retarget retreat; leaving the map stops requests',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    await f.run(f.api.emergencyRetreat());f.data.buildings.get('3_1').ownerId=20;
+    await advance(f,200);assert.equal(f.moves[1].params.to.y,4);
+    f.module.enteredMapId=8;await advance(f,100);const count=f.moves.length;
+    assert.equal((await f.run(f.api.automationEvents())).retreat.active,false);
+    f.moves[0].resolve({err:null,resp:{}});await advance(f,500);assert.equal(f.moves.length,count);
+  });
+  await test('already friendly idle role does not send; fighting on a friendly node chooses another',async()=>{
+    const f=retreatFixture();f.data.buildings.get('1_1').ownerId=10;
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    assert.equal((await f.run(f.api.emergencyRetreat())).retreat.active,false);assert.equal(f.moves.length,0);
+    f.me.state=3;f.module.getTimerByRole=()=>({endTime:100100});
+    await f.run(f.api.emergencyRetreat());assert.equal(f.moves.length,1);assert.equal(f.moves[0].params.to.x,3);
+  });
+  await test('unreachable or neutral nodes never produce guessed move requests',async()=>{
+    const f=retreatFixture();f.scene.sourceMap.navPath=()=>[];
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    await f.run(f.api.emergencyRetreat());await advance(f,1000);assert.equal(f.moves.length,0);
+    assert.match((await f.run(f.api.automationEvents())).retreat.status,/未找到可达/);
+  });
+
+  function overlayFixture(){
+    const f=retreatFixture();
+    class Transform{setContentSize(w,h){this.width=w;this.height=h;}}
+    class Graphics{clear(){}roundRect(){}fill(){}}
+    class Label{static Overflow={CLAMP:1};static CacheMode={CHAR:1};}
+    class Node{
+      static EventType={TOUCH_MOVE:'move',TOUCH_END:'end'};
+      constructor(name){this.name=name;this.children=[];this.parts=new Map();this.handlers={};this.isValid=true;this.layer=1;}
+      addComponent(Type){if(Type===Graphics || Type===Label){assert(!this.renderer,'one renderer per Cocos node');this.renderer=Type;}const c=new Type();c.node=this;this.parts.set(Type,c);return c;}
+      getComponent(Type){return this.parts.get(Type);}
+      addChild(n){n.parent=this;this.children.push(n);}
+      setPosition(x,y){this.position={x,y};}
+      on(type,fn){this.handlers[type]=fn;}
+      destroy(){this.isValid=false;for(const n of [...this.children])n.destroy();if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}
+    }
+    const cc={Node,UITransform:Transform,Graphics,Label,Color:class{constructor(...a){this.values=a;}},BlockInputEvents:class{},
+      HorizontalTextAlignment:{CENTER:1},view:{getVisibleSize:()=>({width:900,height:700})}};
+    const host=new Node('system');host.addComponent(Transform).setContentSize(900,700);f.ui.system=host;
+    const originalImport=f.context.System.import;f.context.System.import=async uri=>uri==='cc'?cc:originalImport(uri);
+    const find=(name,n=host)=>n.name===name?n:n.children.map(c=>find(name,c)).find(Boolean);
+    return {...f,host,cc,find};
+  }
+  await test('Cocos bloodmoon controls mount, drag, toggle, sync labels and tear down',async()=>{
+    const f=overlayFixture();assert.equal((await f.run(f.api.automationConfigure(autoConfig({enabled:false,lowest_power_first:true})))).ok,true);
+    let panel=f.find('e0e1_bloodmoon_overlay');assert(panel);assert.equal(f.intervals.size,1);
+    const title=f.find('血月控制（拖动）');title.handlers.move({getUIDelta:()=>({x:1000,y:1000})});
+    assert(panel.position.x<=295 && panel.position.y<=225);
+    f.find('bloodmoon_speed').handlers.end({});await f.run(Promise.resolve());
+    f.find('bloodmoon_mode').handlers.end({});await f.run(Promise.resolve());
+    let result=await f.run(f.api.automationEvents());
+    assert.equal(result.overlay_controls.patch.speed_up.enabled,true);
+    assert.equal(result.overlay_controls.patch.attack.lowest_power_first,false);
+    assert.equal(f.find('bloodmoon_mode').children[0].getComponent(f.cc.Label).string,'攻击模式：最高战力优先');
+    f.find('bloodmoon_retreat').handlers.end({});await f.run(Promise.resolve());
+    result=await f.run(f.api.automationEvents());assert.equal(result.retreat.active,true);
+    assert.equal(f.find('bloodmoon_retreat').children[0].getComponent(f.cc.Label).string,'停止撤离');
+    f.find('bloodmoon_retreat').handlers.end({});await f.run(Promise.resolve());
+    assert.equal((await f.run(f.api.automationEvents())).retreat.active,false);
+    f.find('bloodmoon_attack').handlers.end({});await f.run(Promise.resolve());
+    assert.equal((await f.run(f.api.automationEvents())).overlay_controls.patch.attack.enabled,true);
+    assert(f.packets.length>0);
+    f.find('bloodmoon_attack').handlers.end({});await f.run(Promise.resolve());
+    assert.equal((await f.run(f.api.automationEvents())).overlay_controls.patch.attack.enabled,false);
+    f.context.__e0e1GameOverlaysEnabled=false;for(const fn of f.intervals.values())fn();
+    assert(!f.find('e0e1_bloodmoon_overlay'));
+    f.context.__e0e1GameOverlaysEnabled=true;for(const fn of f.intervals.values())fn();
+    assert(f.find('e0e1_bloodmoon_overlay'));
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false},{},{enabled:false,revision:2,control_ack:999})));
+    assert(!f.find('e0e1_bloodmoon_overlay'));assert.equal(f.intervals.size,0);
+  });
+  await test('overlay can mount after master is reenabled with both automatic actions off',async()=>{
+    const f=overlayFixture();await f.run(f.api.automationConfigure(autoConfig({enabled:false},{},{enabled:false,revision:1})));
+    assert(!f.find('e0e1_bloodmoon_overlay'));
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false},{},{enabled:true,revision:2})));
+    assert(f.find('e0e1_bloodmoon_overlay'));
+    f.me.state=0;for(const fn of f.intervals.values())fn();assert(!f.find('e0e1_bloodmoon_overlay'));
+    f.me.state=1;for(const fn of f.intervals.values())fn();assert(f.find('e0e1_bloodmoon_overlay'));
+    await f.run(f.api.stop());assert.equal(f.intervals.size,0);
+  });
+
+  await test('one broken native route does not block other reachable friendly nodes',async()=>{
+    const f=retreatFixture(),nav=f.scene.sourceMap.navPath;
+    f.scene.sourceMap.navPath=(x,y,tx,ty)=>{if(tx===3)throw Error('bad nav tile');return nav(x,y,tx,ty);};
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    await f.run(f.api.emergencyRetreat());assert.equal(f.moves[0].params.to.y,4);
+  });
+  await test('retreat follows authoritative side ownership rather than legacy legion identity',async()=>{
+    const f=retreatFixture();f.module.getSeasonMapMySideId=()=>42;f.data.buildings.get('3_1').ownerId=42;
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    await f.run(f.api.emergencyRetreat());assert.equal(f.moves[0].params.to.x,3);
+  });
+  await test('overlay rendering errors cannot prevent autonomous attacks from starting',async()=>{
+    const f=overlayFixture();f.ui.system.getComponent=()=>{throw Error('temporary Cocos layout failure');};
+    assert.equal((await f.run(f.api.automationConfigure(autoConfig()))).ok,true);
+    await advance(f,400);assert.equal(f.packets.length,3);
+    assert((await f.run(f.api.automationEvents())).events.some(e=>e.kind==='overlay_render_error'));
+    await f.run(f.api.stop());assert.equal(f.intervals.size,0);
+  });
+  await test('retreat packet timeout is diagnostic and never becomes a loop lock',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig({enabled:false,interval_ms:200})));
+    await f.run(f.api.emergencyRetreat());await advance(f,8200);
+    assert(f.moves.length>=42);
+    const status=await f.run(f.api.automationEvents());assert(status.retreat.active);
+    assert(status.events.some(e=>e.kind==='retreat_timeout'));
+    await f.run(f.api.emergencyRetreat({on:false}));const count=f.moves.length;
+    await advance(f,500);assert.equal(f.moves.length,count);
+  });
+
+  for(const enabled of [true,false])await test('march confirmation preserves automatic attack setting '+enabled+' without configuration edits',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig({enabled,lead_ms:400,interval_ms:200})));
+    const start=await f.run(f.api.emergencyRetreat());assert.equal(start.retreat.active,true);
+    assert.equal(start.overlay_controls.seq,0);assert.equal(Object.keys(start.overlay_controls.patch).length,0);
+    await advance(f,200);const moves=f.moves.length,attacks=f.packets.length;
+    f.me.state=2;f.move.to={x:3,y:1};f.move.arrive=f.context.Date.now()+1000;
+    f.data.buildings.get('3_1').members=new Set([1,2]);
+    await advance(f,100);
+    const status=await f.run(f.api.automationEvents());assert.equal(status.retreat.active,false);
+    assert.match(status.retreat.status,/已向己方节点行军/);
+    assert.equal(f.moves.length,moves);assert.equal(f.packets.length,attacks,'resume still respects march lead time');
+    assert.equal(status.overlay_controls.seq,0);assert.equal(Object.keys(status.overlay_controls.patch).length,0);
+    await advance(f,800);
+    assert.equal(f.moves.length,moves);
+    if(enabled)assert(f.packets.length>attacks);else assert.equal(f.packets.length,attacks);
+    for(const packet of f.moves)packet.resolve({err:null,resp:{}});
+    const count=f.packets.length;await advance(f,400);
+    assert.equal((await f.run(f.api.automationEvents())).retreat.active,false);
+    if(enabled)assert(f.packets.length>count);else assert.equal(f.packets.length,count);
+  });
+  await test('manual retreat cancellation resumes an enabled attack loop without touching its saved switch',async()=>{
+    const f=retreatFixture();await f.run(f.api.automationConfigure(autoConfig()));
+    await f.run(f.api.emergencyRetreat());await advance(f,200);const moves=f.moves.length;
+    const status=await f.run(f.api.emergencyRetreat({on:false}));assert.equal(status.overlay_controls.seq,0);
+    const attacks=f.packets.length;await advance(f,400);
+    assert(f.packets.length>attacks);assert.equal(f.moves.length,moves);
+  });
+  await test('already marching to a friendly node finishes retreat immediately and preserves disabled attack',async()=>{
+    const f=retreatFixture();f.me.state=2;f.move.to={x:3,y:1};f.move.arrive=101000;
+    await f.run(f.api.automationConfigure(autoConfig({enabled:false})));
+    const status=await f.run(f.api.emergencyRetreat());assert.equal(status.retreat.active,false);
+    assert.match(status.retreat.status,/已向己方节点行军/);
+    await advance(f,1000);assert.equal(f.moves.length,0);assert.equal(f.packets.length,0);
+    assert.equal(status.overlay_controls.seq,0);
+  });
+  await test('overlay continues to display the enabled attack preference throughout retreat',async()=>{
+    const f=overlayFixture();await f.run(f.api.automationConfigure(autoConfig()));
+    const label=()=>f.find('bloodmoon_attack').children[0].getComponent(f.cc.Label).string;
+    assert.equal(label(),'自动攻击：开');
+    await f.run(f.api.emergencyRetreat());for(const tick of f.intervals.values())tick();
+    assert.equal(label(),'自动攻击：开');
+    f.me.state=2;f.move.to={x:3,y:1};f.move.arrive=101000;
+    await advance(f,100);for(const tick of f.intervals.values())tick();assert.equal(label(),'自动攻击：开');
+    assert.equal((await f.run(f.api.automationEvents())).overlay_controls.seq,0);
   });
 
   console.log('Original UI eligibility source: '+(process.env.BLOODMOON_GAME_SOURCE || (originalSpeedCheck ? 'verified from output game.js' : 'not available; fallback fixture')));

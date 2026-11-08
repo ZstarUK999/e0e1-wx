@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import json
 import time
@@ -62,10 +63,16 @@ class SeasonFeature:
         self._controller_id = uuid.uuid4().hex
         self._event_stream = None
         self._event_cursor = 0
+        self._overlay_control_seq = 0
         self._next_events = 0.0
         self._config_task = None
         self._battles = 0
         self._snapshot = None
+        self._power_cache = {}
+        self._power_task = None
+        self._power_epoch = 0
+        self._power_last_id = None
+        self._next_power_query = 0.0
         self._config_epoch = 0
         self.store.changed.connect(self._configuration_changed)
 
@@ -138,8 +145,11 @@ class SeasonFeature:
         self._battles = 0
         self._automation_config = None
         self._next_events = 0.0
+        self._overlay_control_seq = 0
 
     def set_probing(self, on: bool) -> None:
+        if bool(on) != self._probing:
+            self._power_epoch += 1
         self._probing = bool(on)
         self.panel.set_probe_running(self._probing)
         if not self._probing:
@@ -166,9 +176,14 @@ class SeasonFeature:
         self._automation_config = None
         self._event_stream = None
         self._event_cursor = 0
+        self._overlay_control_seq = 0
         self._next_events = 0.0
         self._battles = 0
         self._snapshot = None
+        self._power_cache.clear()
+        self._power_epoch += 1
+        self._power_last_id = None
+        self._next_power_query = 0.0
         self.panel.set_probe_running(False)
 
     # ── 每秒轮询 ──
@@ -208,6 +223,7 @@ class SeasonFeature:
             if config_epoch != self._config_epoch or self.state.closing:
                 return
             await self._sync_marks(bloodmoon)
+            self._schedule_power_query()
             if self._probing and time.monotonic() >= self._next_probe:
                 interval = max(1, int((bloodmoon.get('flag_probe') or {}).get('refresh_seconds') or 5))
                 self._next_probe = time.monotonic() + interval
@@ -247,7 +263,55 @@ class SeasonFeature:
             LOG.warning('战旗读取失败：%r', result)
             self.panel.set_flags([], f"读取失败：{result.get('message') or '未知原因'}")
             return
+        if self._snapshot and self._snapshot.get('war_id') != result.get('war_id'):
+            self._power_epoch += 1
+            self._power_cache.clear()
+            self._power_last_id = None
+        self._snapshot = copy.deepcopy(result)
+        self._render_flags()
+        self._schedule_power_query()
+
+    def _schedule_power_query(self) -> None:
+        if (not self._probing or not self._snapshot or self.state.closing
+                or not self.state.installed or time.monotonic() < self._next_power_query
+                or (self._power_task is not None and not self._power_task.done())):
+            return
+        ids = sorted({int(member['roleId']) for group in self._snapshot.get('groups') or []
+                      for member in group.get('members') or [] if int(member.get('roleId') or 0) > 0})
+        if not ids:
+            return
+        role_id = next((i for i in ids if self._power_last_id is None or i > self._power_last_id), ids[0])
+        self._power_last_id = role_id
+        self._next_power_query = time.monotonic() + 5.0
+        self._power_task = asyncio.create_task(self._query_player_power(role_id, self._power_epoch))
+
+    async def _query_player_power(self, role_id: int, epoch: int) -> None:
+        try:
+            result = await self.transport.season_call('playerPower', {'roleId': role_id})
+            if epoch != self._power_epoch or not self._probing or self.state.closing:
+                return
+            if (not isinstance(result, dict) or result.get('ok') is not True
+                    or result.get('roleId') != role_id or isinstance(result.get('power'), bool)
+                    or not isinstance(result.get('power'), (int, float))
+                    or not 0 <= result['power'] < float('inf')):
+                LOG.warning('血月玩家战力查询失败，后续轮询重试：玩家=%s，回执=%r', role_id, result)
+                return
+            self._power_cache[role_id] = result['power']
+            self._render_flags()
+        except Exception as exc:
+            LOG.warning('血月玩家战力查询失败，后续轮询重试：玩家=%s，%s', role_id, exc)
+
+    def _render_flags(self) -> None:
+        if not self._snapshot:
+            return
+        result = copy.deepcopy(self._snapshot)
         groups = result.get('groups') or []
+        for group in groups:
+            for member in group.get('members') or []:
+                power = self._power_cache.get(int(member.get('roleId') or 0))
+                if power is not None:
+                    member['power'] = power
+                    member['power_source'] = '玩家资料'
         rows = []
         for group in groups:
             members = sorted(group.get('members') or [], key=lambda m: -(m.get('power') or 0))
@@ -265,7 +329,6 @@ class SeasonFeature:
         subject = (f"{SOURCE_TEXT.get(source, source)} · {len(rows)}个阴司 / {count}人 · {stamp}"
                    + ('' if source == 'season_map' else '（战旗要等进入战场后才会下发）'))
         self.panel.set_flags(rows, subject)
-        self._snapshot = result
 
     @staticmethod
     def _member_row(member: dict) -> dict:
@@ -273,6 +336,8 @@ class SeasonFeature:
         if member.get('flagLv'):
             flag = f"{flag} Lv{member['flagLv']}"
         notes = [n for n in (member.get('stateName') or '', member.get('note') or '') if n]
+        if member.get('power_source'):
+            notes.append('战力来源：' + member['power_source'])
         if member.get('stealth'):
             notes.append('隐身中')
         for key, label in (('season_power', '赛季战力'), ('total_power', '综合战力')):
@@ -317,6 +382,7 @@ class SeasonFeature:
     async def _sync_automation(self, bloodmoon: dict) -> None:
         epoch = self._config_epoch
         payload = {'enabled': bool(bloodmoon.get('enabled')),
+                   'control_ack': self._overlay_control_seq,
                    'attack': dict(bloodmoon.get('attack') or {}),
                    'speed_up': dict(bloodmoon.get('speed_up') or {})}
         # Legacy display-only fields are not sent to the game loop.
@@ -350,6 +416,25 @@ class SeasonFeature:
         if stream is not None and stream != self._event_stream:
             self._event_stream = stream
             self._event_cursor = 0
+            self._overlay_control_seq = 0
+        controls = result.get('overlay_controls') or {}
+        sequence = controls.get('seq')
+        if type(sequence) is int and sequence > self._overlay_control_seq:
+            patch = {}
+            for section, fields in (('attack', ('enabled', 'lowest_power_first')), ('speed_up', ('enabled',))):
+                source = (controls.get('patch') or {}).get(section) or {}
+                values = {key: source[key] for key in fields if type(source.get(key)) is bool}
+                if values:
+                    patch[section] = values
+            previous = self._overlay_control_seq
+            self._overlay_control_seq = sequence
+            try:
+                if patch:
+                    self.store.set_bloodmoon(patch)
+                    LOG.info('血月悬浮窗设置已同步：seq=%s，%s', sequence, patch)
+            except Exception:
+                self._overlay_control_seq = previous
+                raise
         for event in result.get('events') or []:
             if int(event.get('seq') or 0) > self._event_cursor:
                 level = {'DEBUG':logging.DEBUG,'INFO':logging.INFO,'WARNING':logging.WARNING,'ERROR':logging.ERROR}.get(event.get('level'),logging.INFO)
